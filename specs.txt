@@ -1,0 +1,52 @@
+What?
+AFL++ most frequently provides raw input bytes of fuzz inputs to a program, either via @<file> on the command line, or via the __AFL_FUZZ_TESTCASE_BUF variable, where the input bytes are mapped into program memory directly. However, not all programs operate only on memory-based inputs. There are plenty of projects aiming at solving this problem for programs using sockets as their input channel without rewriting (de-socketing), for example. We want to implement a similar solution for programs operating on filesystem-based inputs.
+Why?
+In practice, we ran into problems when trying to fuzz OCI runtimes. These require a config.json file specifying some metadata, which is a very well-suited case for the aforementioned byte-based @<file> inputs. Alongside this config.json, the runtimes also require a rootfs directory though, containing the file system layout of the container. We didn't want to rewrite the container runtime to stub all filesystem calls to redirect them to memory, and we also didn't want to re-initialize an actual (on-disk or virtual) filesystem for each invocation for performance reasons. What we needed is a performant solution that transforms the mutations created by AFL++ into a filesystem that is visible to unmodified COTS programs.
+How?
+Research:
+Clarify the following questions:
+Can this be performed entirely in userspace with reasonable performance? Check FUSE, BUSE
+If not, how to integrate this with e.g. QEMU, emulating a block(?) device?
+Is emulating the file system a proper solution? Other avenues to explore might be shimming the FS-related syscalls with eBPF or something similar.
+How to integrate with AFL++ / LibAFL?
+Implementation:
+Either use Rust or Go for memory-safe performance.
+Based on the aforementioned research, implement an academic prototype. Pay attention to writing proper tests, as this is a system-level component that should ideally not have significant bugs.
+Evaluation:
+Performance Measurements
+Real-world fuzzing campaigns to find bugs
+
+
+Operative plan
+We need to integrate with 2 sides: LibAFL and the Linux kernel.
+
+ExcaliDraw link
+
+From this, we get 2 separate tasks to start with. These are not ordered, so you could start with either one first:
+Integration with the fuzzer (LibAFL, AFL++, etc.): We'll need to be able to receive mutations from the fuzzer and work with them. Since our prototype use-case (fuzzing of container runtimes) is in LibAFL, it would probably make sense to start with that.
+Concrete tasks:
+Read the LibAFL source code to understand how to implement a custom mutator. See this example of a mutator working on integers for that.
+Think about what mutations make sense on (well-formed) files. Operations are create / update / delete, the touched data may include file content / size, file metadata (mtime,atime,...) and possibly also xattrs. Write down some kind of informal document with your ideas on that and show it to Flavio and Moritz.
+When we agree on the mutations to do, implement such a mutator for LibAFL. Depending on whether we write the actual file-providing component (i.e. the orange box) in Rust or another language, we could either directly compile it into LibAFL, or we'll need to implement some kind of message passing so the mutations computed by the LibAFL mutator get passed to our component.
+Integration with the Linux kernel: We'll need to provide our "emulated" file-system to the target program in a performant fashion.
+Concrete tasks:
+Write a simple FUSE (or BUSE, doesn't really matter, but FUSE is better-supported) filesystem that presents only a single file with only a single integer as its content to the user. This integer should be incremented by one at every read of the file. We'll use this exemplary model for benchmarking.
+Write a simple benchmark script that tries to open, read, and close the file as often as possible over the course of e.g. 60 seconds. From that, compute a per-second amount of open-read-close operations possible. We should aim for at least 1k / sec of these to not be a bottleneck for SOTA fuzzers.
+If the FUSE implementation doesn't live up to this requirement, it should first be profiled to identify performance issues. If the issues are in our FUSE implementation, we should fix them and re-test.
+If the issues are fundamental, e.g. most of the time is spent in the kernel's FUSE implementation, we should write the same increment-on-read example filesystem as an emulated QEMU drive and re-test the performance with that. If that also doesn't fulfill the requirements, re-evaluate with Flavio and Moritz what to try next.
+At this point, we'll need to have the LibAFL side finished. When we settled on an implementation for this side (i.e. FUSE, QEMU drive, …), implement the receiver side of the mutator here. We'll need to offer an API for the create / update / delete operations mentioned in step 2 of the first tasks.
+
+When these are both finished, we'll need to hook them together, verifying that they actually work for receiving mutations from LibAFL. To do so, we should:
+Write a simple example program that reads a "password" from a file provided by our FUSE / … FS. If the password is e.g. "foobar", the program should crash.
+Run this in a small LibAFL harness. The SUT should soon reach the crash from the mutated input file.
+
+This marks the first milestone of this project. At this point, we have a working implementation of providing file-based inputs to fuzzed programs.
+
+For an MVP (minimum viable product) / paper that's likely to be accepted, we should also do the following now:
+Enable snapshotting capabilities, i.e. a way to store-and-restore an initial input state of the emulated filesystem. For any meaningfgul real-world fuzzing, we'll likely not want to start with a completely empty directory the fuzzer starts to create some random files in, but a fixed starting point. For this, we should add an API to our work that allows to store a filesystem / directory to some sort of snapshot, and later restore from that. Perhaps just mounting a temporary ext4, moving all inputs to there once, and un-mounting it to be left with the raw ext4 filessytem as a single file could be enough.
+Test this in a "real-world" fuzzing campaign. For this, we'll use the container runtime fuzzing built in Moritz' thesis. Integrate this work with his LibAFL harness to provide the rootfs directory as a mutatable input to the container runtime. Run a real fuzzing campaign to try and find bugs.
+
+At this point, we should have enough meaningful contributions to have a good likelihood of being accepted at a good conference. (Of course, this is not a guarantee and may also depend on how many bugs we find, etc.)
+If there should be plenty of time left still, we may want to implement an advanced topic: 
+
+(Bonus) Feedback. Our work could take note of which files are accessed in an invocation by the fuzzer. Based on that, we could guide the mutator to make mutations on only said file. For example, if the SUT tries to open myspecialconfig.json all the time, but it doesn't exist, it might make sense for us to create this file in the next mutation. To start with this task, you should first consult Moritz and Flavio at this point.
