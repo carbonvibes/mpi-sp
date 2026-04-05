@@ -71,7 +71,7 @@ snapshot_nested
 invariants
 random_sequence
 
-All 375 checks passed.
+All 388 checks passed.
 ```
 
 Exit code is 0 on success, 1 if any check fails.

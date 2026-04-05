@@ -92,9 +92,11 @@ The filesystem is a container that holds:
 
 ### Read-only operations (called by FUSE layer or tests)
 
-**`lookup(parent_path, name) -> inode | ENOENT`**
-Returns the inode at `parent_path/name`. Returns `ENOENT` if the parent does
-not exist or does not contain `name`.
+**`lookup` (internal only)**
+Path resolution is implemented internally as `resolve_path()` in `vfs.c`. It
+is not exposed as a public API symbol. External callers (including the FUSE
+layer) should use `getattr` to check existence and kind, which is equivalent
+for all Week 3 use cases.
 
 **`getattr(path) -> stat | ENOENT`**
 Returns a stat-like structure for the node at `path`. For directories:
@@ -189,7 +191,7 @@ implement the following FUSE callbacks by calling into the VFS:
 |---------------|--------------------------|
 | `getattr`     | `getattr`                |
 | `readdir`     | `readdir`                |
-| `open`        | `lookup` + type check    |
+| `open`        | `getattr` + kind check   |
 | `read`        | `read`                   |
 
 The FUSE layer will not implement `write`, `unlink`, `mkdir`, `rmdir`, or

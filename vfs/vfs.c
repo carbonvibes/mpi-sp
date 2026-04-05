@@ -150,7 +150,11 @@ static vfs_node_t *resolve_path(vfs_t *vfs, const char *path)
         cur = child;
 
         /* Step over the '/' separator, if present. */
-        if (*p == '/') p++;
+        if (*p == '/') {
+            p++;
+            /* Trailing slash: nothing follows — reject. */
+            if (*p == '\0') { errno = EINVAL; return NULL; }
+        }
     }
 
     return cur;

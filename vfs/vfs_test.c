@@ -109,6 +109,10 @@ static void test_path_parsing(void)
     vfs_t *vfs = vfs_create();
     CHECK_NOTNULL(vfs);
 
+    /* Create nodes used by trailing-slash and ENAMETOOLONG tests below. */
+    CHECK_EQ(vfs_create_file(vfs, "/tfile", S("x"), 1), 0);
+    CHECK_EQ(vfs_mkdir(vfs, "/tdir"), 0);
+
     /* Root always resolves. */
     vfs_stat_t st;
     CHECK_EQ(vfs_getattr(vfs, "/", &st), 0);
@@ -127,6 +131,17 @@ static void test_path_parsing(void)
 
     /* Double slash → EINVAL. */
     CHECK_EQ(vfs_getattr(vfs, "//foo", &st), -EINVAL);
+
+    /* Trailing slash → EINVAL (requires an existing node to reach the slash). */
+    CHECK_EQ(vfs_getattr(vfs, "/tfile/", &st), -EINVAL);
+    CHECK_EQ(vfs_getattr(vfs, "/tdir/", &st), -EINVAL);
+
+    /* Name longer than VFS_MAX_NAME (255) → ENAMETOOLONG. */
+    char long_path[260];
+    long_path[0] = '/';
+    memset(long_path + 1, 'x', 256);
+    long_path[257] = '\0';
+    CHECK_EQ(vfs_getattr(vfs, long_path, &st), -ENAMETOOLONG);
 
     /* Non-existent path → ENOENT. */
     CHECK_EQ(vfs_getattr(vfs, "/nonexistent", &st), -ENOENT);
@@ -167,6 +182,17 @@ static void test_create_file(void)
     /* Path with a file used as a directory component returns ENOTDIR. */
     CHECK_EQ(vfs_create_file(vfs, "/a/child", S("x"), 1), -ENOTDIR);
 
+    /* Trailing slash in control path → EINVAL (empty final component). */
+    CHECK_EQ(vfs_create_file(vfs, "/a/", S("x"), 1), -EINVAL);
+
+    /* "." and ".." as final path component → EINVAL. */
+    CHECK_EQ(vfs_create_file(vfs, "/.", S("x"), 1), -EINVAL);
+    CHECK_EQ(vfs_create_file(vfs, "/..", S("x"), 1), -EINVAL);
+
+    /* Double slash in parent portion → EINVAL (parent path has trailing slash). */
+    CHECK_EQ(vfs_mkdir(vfs, "/mdir"), 0);
+    CHECK_EQ(vfs_create_file(vfs, "/mdir//f", S("x"), 1), -EINVAL);
+
     /* Empty content is allowed. */
     CHECK_EQ(vfs_create_file(vfs, "/empty", NULL, 0), 0);
     CHECK_EQ(vfs_getattr(vfs, "/empty", &st), 0);
@@ -205,6 +231,13 @@ static void test_mkdir(void)
     /* mkdir where a file with the same name exists → EEXIST. */
     CHECK_EQ(vfs_create_file(vfs, "/f", S("x"), 1), 0);
     CHECK_EQ(vfs_mkdir(vfs, "/f"), -EEXIST);
+
+    /* "." and ".." as final component → EINVAL. */
+    CHECK_EQ(vfs_mkdir(vfs, "/."), -EINVAL);
+    CHECK_EQ(vfs_mkdir(vfs, "/.."), -EINVAL);
+
+    /* Trailing slash → EINVAL. */
+    CHECK_EQ(vfs_mkdir(vfs, "/newdir/"), -EINVAL);
 
     vfs_destroy(vfs);
 }
