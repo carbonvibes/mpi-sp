@@ -3,10 +3,7 @@
 ## Purpose
 
 This document defines the scope, data model, and operation set for the first
-version of the in-memory virtual filesystem (VFS). It is written before
-implementation begins to prevent design drift and to make the Week 2 scope
-concrete. Nothing outside this document should be implemented in the VFS core
-until after the first end-to-end milestone is stable.
+version of the in-memory virtual filesystem (VFS). 
 
 ## Goals
 
