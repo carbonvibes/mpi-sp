@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 /* -------------------------------------------------------------------------
  * Types
@@ -32,12 +33,14 @@ struct vfs_dirent {
  * children is used only for VFS_DIR nodes.
  */
 struct vfs_node {
-    uint64_t      ino;
-    vfs_kind_t    kind;
-    uint8_t      *content;      /* VFS_FILE only */
-    size_t        content_len;  /* VFS_FILE only */
-    vfs_dirent_t *children;     /* VFS_DIR only  */
-    vfs_node_t   *parent;       /* NULL for root */
+    uint64_t        ino;
+    vfs_kind_t      kind;
+    uint8_t        *content;      /* VFS_FILE only */
+    size_t          content_len;  /* VFS_FILE only */
+    vfs_dirent_t   *children;     /* VFS_DIR only  */
+    vfs_node_t     *parent;       /* NULL for root */
+    struct timespec mtime;        /* last content modification time */
+    struct timespec atime;        /* last access time (not auto-updated on read) */
 };
 
 /* Top-level filesystem object. */
@@ -49,9 +52,11 @@ typedef struct {
 
 /* Result of vfs_getattr. */
 typedef struct {
-    uint64_t   ino;
-    vfs_kind_t kind;
-    size_t     size;   /* file byte count; 0 for directories */
+    uint64_t        ino;
+    vfs_kind_t      kind;
+    size_t          size;    /* file byte count; 0 for directories */
+    struct timespec mtime;
+    struct timespec atime;
 } vfs_stat_t;
 
 /*
@@ -139,6 +144,15 @@ int vfs_mkdir(vfs_t *vfs, const char *path);
  * Returns -ENOTEMPTY if the directory has children.
  */
 int vfs_rmdir(vfs_t *vfs, const char *path);
+
+/*
+ * Set mtime and/or atime on the node at path.
+ * Pass NULL for either pointer to leave that timestamp unchanged.
+ * Returns 0 on success, -ENOENT if path does not exist.
+ */
+int vfs_set_times(vfs_t *vfs, const char *path,
+                  const struct timespec *mtime,
+                  const struct timespec *atime);
 
 /* -------------------------------------------------------------------------
  * Snapshot and reset

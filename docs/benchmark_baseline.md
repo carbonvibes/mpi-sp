@@ -45,7 +45,7 @@ gcc optimization level applies.
 ```sh
 # mount the counter filesystem in the foreground, detached
 mkdir -p /tmp/testmount
-./counter_fs /tmp/testmount -f &
+./counter_fs /tmp/testmount
 
 # verify mount
 cat /tmp/testmount/counter   # should print 0

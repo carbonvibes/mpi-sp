@@ -3,6 +3,15 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/* Return the current wall-clock time. */
+static struct timespec ts_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ts;
+}
 
 /* -------------------------------------------------------------------------
  * Internal helpers
@@ -16,8 +25,10 @@ static vfs_node_t *node_alloc(vfs_t *vfs, vfs_kind_t kind)
 {
     vfs_node_t *n = calloc(1, sizeof(*n));
     if (!n) return NULL;
-    n->ino  = vfs->next_ino++;
-    n->kind = kind;
+    n->ino   = vfs->next_ino++;
+    n->kind  = kind;
+    n->mtime = ts_now();
+    n->atime = n->mtime;
     return n;
 }
 
@@ -65,6 +76,8 @@ static vfs_node_t *node_deepcopy(const vfs_node_t *src, vfs_node_t *parent_copy)
     dst->ino    = src->ino;
     dst->kind   = src->kind;
     dst->parent = parent_copy;
+    dst->mtime  = src->mtime;
+    dst->atime  = src->atime;
 
     if (src->kind == VFS_FILE) {
         if (src->content_len > 0) {
@@ -267,9 +280,11 @@ static vfs_node_t *dir_lookup_child(const vfs_node_t *dir, const char *name)
 
 static void fill_stat(const vfs_node_t *n, vfs_stat_t *st)
 {
-    st->ino  = n->ino;
-    st->kind = n->kind;
-    st->size = (n->kind == VFS_FILE) ? n->content_len : 0;
+    st->ino   = n->ino;
+    st->kind  = n->kind;
+    st->size  = (n->kind == VFS_FILE) ? n->content_len : 0;
+    st->mtime = n->mtime;
+    st->atime = n->atime;
 }
 
 /* -------------------------------------------------------------------------
@@ -409,6 +424,7 @@ int vfs_update_file(vfs_t *vfs, const char *path,
     free(n->content);
     n->content     = new_content;
     n->content_len = content_len;
+    n->mtime       = ts_now();
     return 0;
 }
 
@@ -462,6 +478,18 @@ int vfs_rmdir(vfs_t *vfs, const char *path)
 
     dir_remove_child(parent, name);
     node_free_deep(n);
+    return 0;
+}
+
+int vfs_set_times(vfs_t *vfs, const char *path,
+                  const struct timespec *mtime,
+                  const struct timespec *atime)
+{
+    errno = 0;
+    vfs_node_t *n = resolve_path(vfs, path);
+    if (!n) return -errno;
+    if (mtime) n->mtime = *mtime;
+    if (atime) n->atime = *atime;
     return 0;
 }
 

@@ -1,4 +1,4 @@
-// benchmark.c
+// benchmark.c for fuse counter filesystem
 #include <stdio.h>
 #include <time.h>
 #include <fcntl.h>
