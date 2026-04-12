@@ -16,14 +16,20 @@ This plan assumes:
 
 ## 2. Current Status
 
-The following phase is treated as completed, but it still needs to be preserved properly as a baseline:
+Weeks 1 through 3 are complete:
 
-- a simple FUSE filesystem has been built
-- a benchmark was written to perform repeated open-read-close cycles
-- the measured throughput is about `14k ops/sec`
-- the current result comfortably exceeds the minimum target from the spec
+- **Week 1**: benchmark baseline preserved (`~14k ops/sec`), `docs/vfs_design_v1.md` written, VFS v1 scope frozen
+- **Week 2**: standalone in-memory VFS core implemented with full unit test suite — path resolution (including trailing-slash and ENAMETOOLONG regression), create/update/delete/mkdir/rmdir, deep-copy snapshot and restore
+- **Week 3**: FUSE frontend wired to VFS core (`fuse_vfs/fuse_vfs.c`); read-only callbacks (`getattr`, `readdir`, `open`, `read`) and write callbacks (`create`, `write`, `truncate`, `mkdir`, `unlink`, `rmdir`, `utimens`) all implemented and tested; 40-check integration test suite passes; benchmark at `~13.8k ops/sec` (–6% vs counter baseline, well above floor)
 
-This means the next major effort should shift toward building the actual in-memory filesystem backend and then integrating it with the fuzzing side.
+The VFS already has the following mutation and reset primitives at the C API level:
+- `vfs_create_file`, `vfs_update_file`, `vfs_delete_file`, `vfs_mkdir`, `vfs_rmdir` — full control-path mutation API
+- `vfs_set_times` — mtime/atime set for fuzzer-controlled timestamp mutations
+- `vfs_save_snapshot` / `vfs_reset_to_snapshot` — deep-copy snapshot and per-iteration restore
+
+What does **not** yet exist is the external interface through which a fuzzer process sends mutation deltas to the VFS, the diff mechanism for capturing target-side writes, and the LibAFL integration layer.
+
+The next effort is therefore the **control plane** (Week 4/5): the IPC or in-process API that bridges the fuzzer to the live VFS.
 
 ## 3. Final Deliverables
 
@@ -170,7 +176,7 @@ Exit criteria:
 - reset is reliable
 - no FUSE-specific logic is mixed into the core
 
-### Week 3: Expose The VFS Through FUSE
+### Week 3: Expose The VFS Through FUSE ✅ COMPLETE
 
 Objectives:
 
@@ -178,93 +184,150 @@ Objectives:
 - get a mounted read-only VFS working cleanly
 - confirm the benchmark still stays in an acceptable range
 
-Concrete steps:
+Additional work completed beyond original scope:
 
-1. wire FUSE callbacks to the VFS core
-2. implement and validate:
-   - getattr
-   - readdir
-   - open
-   - read
-3. mount a filesystem with one directory and one file
-4. verify shell behavior using `ls`, `cat`, repeated opens, and nested directory reads
-5. rerun the benchmark against the VFS-backed implementation
+- full write support added: `create`, `write` (partial and append), `truncate`, `mkdir`, `unlink`, `rmdir`, `utimens` (real POSIX implementation with `UTIME_NOW`/`UTIME_OMIT`)
+- 40-check integration test suite in `fuse_vfs/test_mount.sh`
+- architecture and results documented in `fuse_vfs/WEEK3.md`
 
-Testing and validation:
+Results:
 
-- manual shell validation
-- one small C integration test for read correctness
-- negative tests for nonexistent paths
-- benchmark comparison against the counter version
+- benchmark: `~13.8k ops/sec` vs `~14.7k ops/sec` counter baseline (–6.2%, well above 1k floor)
+- all 40 integration checks pass
+- mounted filesystem is fully writable from the target's perspective
 
-Exit criteria:
+Exit criteria met:
 
-- mounted read-only VFS works reliably
+- VFS-backed FUSE mount works reliably for both reads and writes
 - benchmark remains practically usable for fuzzing
 
-### Week 4: Add Runtime Mutation And Reset Support
+### Week 4: Design The Mutation Model And Build The Control Plane
 
 Objectives:
 
-- make the mounted filesystem update without remounting
-- make per-iteration reset safe and deterministic
-- finish the minimal VFS feature set needed for fuzzing
+- define exactly what a "testcase" is in terms of a filesystem delta
+- build the generator that creates initial corpus entries from scratch
+- implement the control plane transport so the fuzzer can push deltas to the live VFS
+- validate the full mutate → run target → reset cycle end to end
+
+Context: the VFS already has all the low-level mutation primitives. What is missing is: (a) a defined data structure for a filesystem delta that LibAFL can generate and mutate, (b) the generator that creates initial valid deltas, and (c) the transport layer that delivers a delta to the running VFS.
+
+Delta-driven mutation model (the per-iteration loop):
+
+```
+1. Load a concrete baseline filesystem into the VFS once (e.g. a minimal rootfs)
+2. Save a snapshot of that baseline
+3. Per fuzzing iteration:
+   a. Fuzzer generator produces a delta: a list of typed ops
+      (create file at path P with content C, update file at P, delete file at P, mkdir at P, rmdir at P)
+   b. Control plane applies the delta to the live VFS via the existing VFS API
+   c. Run the target — it reads (and possibly writes) through the FUSE mount
+   d. Reset to the baseline snapshot for the next iteration
+```
+
+This model is more efficient than rebuilding the tree from scratch because reset cost is proportional to the delta size, not the full tree.
 
 Concrete steps:
 
-1. implement batch mutation application on the live VFS
-2. define atomicity semantics for a testcase update
-3. ensure mounted readers never observe half-applied state
-4. implement reset from baseline snapshot
-5. add multi-file support if the current VFS does not already support it
-6. build a tiny local driver that changes content and verifies the mounted filesystem updates
+1. design the delta data structure:
+   - define a `fs_delta_t` type: a list of `fs_op_t` entries, each being one of:
+     `{ kind: CREATE_FILE | UPDATE_FILE | DELETE_FILE | MKDIR | RMDIR, path: string, content: bytes }`
+   - this is the canonical "testcase" representation that LibAFL will generate and mutate
+   - document this in `docs/mutation_model.md`
+2. build the initial corpus generator:
+   - produces a minimal valid delta from a known baseline (e.g. one file with seed content)
+   - this is not LibAFL-specific; it is a C or Rust function that returns a valid `fs_delta_t`
+   - the generator must produce deltas that are syntactically valid (valid paths, non-empty content)
+3. decide the control plane transport:
+   - in-process shared-library API if the fuzzer and VFS run in the same process
+   - Unix domain socket with a simple binary or text message protocol if process separation is needed
+4. write `docs/control_plane.md` describing the transport choice and message wire format
+5. implement the control plane receiver on the VFS side:
+   - deserializes an incoming delta and applies each op via the VFS mutation API
+   - returns success/failure per op or for the batch
+6. build a minimal test driver that sends hand-crafted deltas and verifies the mounted filesystem updates correctly
+7. validate repeated mutate → reset cycles are deterministic and leave no residue
 
 Testing and validation:
 
-- batch update tests
-- conflicting operation tests
-- repeated mutate-read-reset cycles
-- stale-state regression tests
-- multi-file visibility tests
+- malformed delta rejection tests (invalid path, unknown op type)
+- delta apply and mounted read correctness verification
+- repeated mutate-reset cycles with stale-state checks
+- generator output validity tests (all generated deltas are well-formed)
 
 Exit criteria:
 
-- the mounted filesystem can be updated and reset safely without remounting
+- `fs_delta_t` type and generator are defined and documented
+- control plane transport works end to end from a test driver to the live mounted filesystem
+- delta apply and reset are reliable and deterministic
+- mutation model is stable enough to implement LibAFL stages against
 
-### Week 5: Build The Control Plane And Freeze The Mutation Model
+### Week 5: Build The LibAFL Mutator Stages And Close The Feedback Loop
 
 Objectives:
 
-- give the VFS a stable external mutation interface
-- finalize what a testcase means for the first LibAFL integration
-- avoid overdesigning the search space
+- implement the concrete LibAFL mutator stages that operate on `fs_delta_t`
+- implement `vfs_diff_snapshot` to capture target-side writes as feedback
+- wire the full per-iteration feedback loop: pre-snapshot → apply delta → run target → diff → promote → reset
+
+Context: a LibAFL mutator is not something that ships ready-made. Each mutator stage is a function that takes an existing `fs_delta_t` and returns a modified one. Multiple stages are composed into a mutation pipeline. The generator from Week 4 seeds the initial corpus; the mutator stages diversify it.
+
+Concrete mutator stages to build:
+
+- `ByteFlipFileContent` — pick a random `UPDATE_FILE` op in the delta, flip bytes in its content
+- `ReplaceFileContent` — replace a file's content entirely with a random or dictionary-based value
+- `AddFileOp` — append a new `CREATE_FILE` or `MKDIR` op with a random valid path
+- `RemoveOp` — drop a random op from the delta (shrinks the testcase)
+- `MutatePath` — change the path component of an existing op (tests path-sensitive behavior)
+- `SpliceDelta` — take ops from two different deltas and combine them (LibAFL splice analog)
+
+Feedback loop — full 5-step model per iteration:
+
+```
+1. Save a pre-run snapshot of the VFS (beyond the baseline snapshot)
+2. Apply the fuzzer's delta to the live VFS
+3. Run the target — it reads and possibly writes through the FUSE mount
+4. After the run, call vfs_diff_snapshot(current_state, pre_run_snapshot)
+   to produce the set of files the target created or modified
+5. If the diff is non-empty, promote the post-write state as a new seed
+   (the target told us what it expects the filesystem to look like)
+6. Reset to the baseline snapshot for the next iteration
+```
 
 Concrete steps:
 
-1. choose the control path:
-   - in-process API if feasible
-   - Unix domain socket if process separation is needed
-2. define the message format for:
-   - replace testcase state
+1. implement `vfs_diff_snapshot` in `vfs/vfs.c` and `vfs/vfs.h`:
+   - walks the current VFS tree and a saved snapshot in parallel
+   - produces a structured list of changes: file created, file modified (path + old + new content), file deleted, directory created, directory deleted
+   - add unit tests covering all change types
+2. decide and document the snapshot management strategy:
+   - the current `vfs_t` holds a single snapshot pointer
+   - the feedback loop needs two independent snapshots simultaneously (the baseline and the pre-run state)
+   - evaluate: add a second named snapshot slot to `vfs_t`, or manage two separate `vfs_t` instances at the caller level
+   - document the chosen approach in `docs/control_plane.md`
+3. implement each mutator stage listed above as a separate LibAFL `MutationStage`
+4. implement the full per-iteration harness loop:
+   - save pre-run snapshot
+   - apply delta via control plane
+   - fork/exec target
+   - collect diff
+   - if diff is non-empty, add post-write state to corpus
    - reset to baseline
-   - health/status
-3. write `mutation_model.md`
-4. freeze the first testcase model as:
-   - one fixed-path file with mutable bytes, or
-   - a small fixed set of files with mutable bytes
-5. explicitly postpone path-generation-heavy mutation unless it is clearly needed for the first milestone
+5. manually test each mutator stage in isolation before composing them
 
 Testing and validation:
 
-- malformed message tests
-- valid update plus mounted read verification
-- reset after several updates
-- review of the mutation model against the demo target
+- `vfs_diff_snapshot` unit tests: create/modify/delete cases, empty diff case, snapshot with no changes
+- mutator stage unit tests: verify each stage produces a valid `fs_delta_t` (well-formed paths, non-empty ops list)
+- end-to-end test: apply delta with a fake target that writes a file, verify diff captures the write and it is promoted to corpus
+- feedback loop integration test: run 10 iterations with reset between each, confirm no stale state
 
 Exit criteria:
 
-- external mutation interface works
-- mutation model is stable enough to implement in LibAFL
+- `vfs_diff_snapshot` is implemented and tested
+- all mutator stages produce valid deltas
+- the full per-iteration feedback loop runs without stale state
+- target-side writes are captured and visible to the fuzzer as new seeds
 
 ### Week 6: Build The Minimal End-To-End Demo Harness
 
@@ -319,32 +382,42 @@ Exit criteria:
 
 This week is the latest acceptable point for achieving the first major milestone. If it slips beyond Week 7, the project scope must be reduced immediately.
 
-### Week 8: Add Snapshotting And Begin Real-World Integration
+### Week 8: Scale Snapshotting And Begin Real-World Integration
 
 Objectives:
 
-- finish the MVP feature that realistic targets need
-- start integration with the container-runtime setup without waiting for perfect polish
+- replace the deep-copy snapshot restore with a journal/diff approach before scaling to real rootfs sizes
+- import a real baseline filesystem (e.g. a minimal container rootfs) into the VFS
+- begin integration with the container-runtime setup
+
+Context: the current `vfs_reset_to_snapshot` deep-copies the entire tree — cost is O(total filesystem size). For a full container rootfs this will be a bottleneck. The fix is to record, per mutating operation, a reverse entry (what it overwrote) so reset replays those entries in reverse — cost becomes O(delta size). This optimization is not needed for the toy demo (Week 6–7) but is essential before scaling to real targets.
 
 Concrete steps:
 
-1. implement snapshot import from a directory tree or internal serialized state
-2. implement restore into the live VFS
-3. measure restore speed
+1. implement journal-based snapshot restore:
+   - each VFS mutation op pushes a reverse entry onto a per-snapshot journal
+   - `vfs_reset_to_snapshot` replays the journal in reverse instead of deep-copying
+   - measure restore time before and after against a large synthetic tree to confirm the speedup
+2. implement snapshot import from a host directory tree:
+   - walk a real directory, create corresponding VFS nodes, set metadata (mode, mtime)
+   - this is how a container rootfs gets loaded as the concrete baseline
+3. measure restore speed against the imported rootfs baseline
 4. identify the integration point in Moritz's harness
-5. perform smoke tests with an unmutated baseline rootfs
-6. mutate one harmless file and verify the target sees it
+5. perform smoke tests with an unmutated baseline rootfs — the target must execute cleanly
+6. apply one small delta and verify the target sees the change
 
 Testing and validation:
 
-- snapshot-create and restore equivalence checks
-- repeated restore cycles
-- real-target smoke tests against the mounted filesystem
+- snapshot-create and journal restore equivalence checks (result must match deep-copy result)
+- repeated restore cycles with correctness assertions
+- restore time measurement before and after journal optimization
+- real-target smoke tests against the mounted baseline
 
 Exit criteria:
 
-- snapshotting works
-- the real target can at least execute against the mounted baseline
+- journal-based restore is implemented and benchmarked
+- a real rootfs baseline can be imported into the VFS
+- the real target executes cleanly against the mounted baseline
 
 ### Week 9: Real-World Campaign Bring-Up And Initial Evaluation
 
@@ -541,12 +614,27 @@ If time remains after that, do:
 
 ## 11. Immediate Next Actions
 
-Given the current status, the best immediate next sequence is:
+Weeks 1–3 are done. The immediate next sequence is:
 
-1. preserve the benchmark result in a short benchmark note
-2. write the VFS v1 design note
-3. implement the standalone in-memory VFS core with tests
-4. replace the toy counter backend with VFS-backed FUSE reads
-5. only then add mutation updates and LibAFL integration
+1. **Week 4 — mutation model + control plane**:
+   - design the `fs_delta_t` / `fs_op_t` data structures that represent a testcase
+   - build the initial corpus generator that produces minimal valid deltas
+   - implement the control plane transport (in-process or Unix socket)
+   - write `docs/mutation_model.md` and `docs/control_plane.md`
+   - validate mutate → reset cycles end to end
 
-That order gives the best chance of keeping the system correct while complexity rises.
+2. **Week 5 — mutator stages + feedback loop**:
+   - implement `vfs_diff_snapshot` for capturing target-side writes
+   - decide single vs multiple snapshot slots in `vfs_t`
+   - implement each LibAFL mutator stage (`ByteFlipFileContent`, `AddFileOp`, `RemoveOp`, `MutatePath`, `SpliceDelta`, etc.)
+   - wire the full per-iteration feedback loop: pre-snapshot → apply delta → run target → diff → promote → reset
+
+3. **Week 6 — demo harness**: minimal crash target, end-to-end harness run with seeded crashing input
+
+4. **Before Week 8**: replace deep-copy snapshot restore with journal-based restore so reset cost is O(delta size), not O(total tree size)
+
+Remaining VFS/FUSE work — non-blocking for Weeks 4–6 but needed before OCI integration (Week 8):
+
+- `vfs_rename` + `fvfs_rename` — OCI runtimes rename temp files into place
+- `chmod` / `mode` field on `vfs_node_t` — needed for permission-sensitive targets
+- `release` no-op callback — flush semantics correctness
