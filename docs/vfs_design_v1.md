@@ -2,223 +2,316 @@
 
 ## Purpose
 
-This document defines the scope, data model, and operation set for the first
-version of the in-memory virtual filesystem (VFS). 
+This document defines the scope, data model, and operation set for the
+in-memory virtual filesystem (VFS). It was written before Week 2 implementation
+began and is kept up to date as the implementation evolves.
+
+**Current status: Weeks 1–3 and the pre-Week 4 side quest are complete.**
+Sections that describe original design intent are annotated where the
+implementation diverged or expanded beyond the original scope.
+
+---
 
 ## Goals
 
-- Build a filesystem state model that lives entirely in memory.
+- Build a filesystem state model that lives entirely in memory — no disk I/O,
+  ever.
 - Keep the VFS core free of any FUSE or kernel dependency so it can be unit
   tested independently.
 - Cover exactly the operations needed to support the fuzzing loop: load a
   baseline state, apply mutations between iterations, reset to baseline between
-  iterations, and serve reads to a mounted target program.
+  iterations, and serve reads (and writes) to a mounted target program.
 - Keep the implementation small enough to be finished and fully tested in one
-  week.
+  week per phase.
 
-## Non-goals for v1
+---
 
-The following are explicitly deferred. They must not be added during Week 2
-unless the Week 2 scope is already complete with time to spare, and only after
-noting the addition here.
+## Originally Deferred — Current Status
 
-- Symlinks
-- Hard links
-- Extended attributes (xattrs)
-- Ownership, uid/gid, precise permission checking
-- Timestamps (mtime, atime, ctime) with real values — stat entries will carry
-  placeholder timestamps
-- File modes beyond a fixed default (regular: 0644, directory: 0755)
-- Arbitrary writes from the target program — the target is read-only; mutations
-  come through the control path only
-- In-memory inode numbers beyond a simple monotone counter
+The following were listed as non-goals in the original v1 design. Each is now
+annotated with its current status.
+
+| Originally deferred | Current status |
+|---------------------|----------------|
+| Symlinks | **Implemented** — `VFS_SYMLINK` kind, `vfs_symlink`, `vfs_readlink`, `fvfs_symlink`, `fvfs_readlink` |
+| Timestamps (mtime, atime) | **Implemented** — real `clock_gettime` values; auto-updated on write; `vfs_set_times` for fuzzer control; `fvfs_utimens` with `UTIME_NOW`/`UTIME_OMIT` |
+| Arbitrary writes from target | **Implemented** — FUSE mount is fully read-write from the target's perspective |
+| Hard links | Still deferred |
+| Extended attributes (xattrs) | Still deferred |
+| Ownership, uid/gid, permission checking | Still deferred (fixed defaults: `0644` / `0755` / `0777`) |
+| File modes beyond fixed defaults | Still deferred |
+| In-memory inode numbers beyond monotone counter | Still deferred (monotone counter is sufficient) |
+
+---
 
 ## Node Types
 
-v1 supports exactly two node types:
+v1 supports three node types:
 
-| Type      | Description                               |
-|-----------|-------------------------------------------|
-| Directory | Can contain files and other directories   |
-| Regular file | Has a byte-string content payload      |
+| Type         | Description                                               |
+|--------------|-----------------------------------------------------------|
+| `VFS_DIR`    | Can contain files, directories, and symlinks              |
+| `VFS_FILE`   | Has a mutable byte-string content payload                 |
+| `VFS_SYMLINK`| Stores a target path string; resolved by the kernel, not the VFS |
 
-The root node is always a directory. It is created automatically at
-initialization and cannot be deleted or replaced.
+The root node is always a `VFS_DIR`. It is created automatically at
+initialization and cannot be deleted, renamed, or replaced.
+
+---
 
 ## Path Model
 
 - Paths are POSIX-style absolute paths starting with `/`.
 - Path components are separated by `/`.
-- Empty components (double slash) are rejected.
-- `.` and `..` components are rejected — the VFS does not resolve them; the
-  caller must normalize paths before calling.
-- The maximum path depth is not artificially limited in v1, but the test suite
-  will cover at least three levels of nesting.
+- Empty components (double slash) are rejected with `EINVAL`.
+- Trailing slashes are rejected with `EINVAL`.
+- `.` and `..` components are rejected with `EINVAL` — the VFS does not resolve
+  them; callers must pass normalized paths.
+- Component names longer than 255 bytes are rejected with `ENAMETOOLONG`.
 - Node names are arbitrary non-empty byte strings that do not contain `/` or
   null bytes.
+- The maximum path depth is not artificially limited.
+
+**Note on symlink resolution:** The VFS path resolver (`resolve_path` in
+`vfs.c`) does NOT follow symlinks. It is the kernel's job to resolve symlinks
+before FUSE callbacks are invoked. A symlink node is treated as an opaque leaf
+by the resolver.
+
+---
 
 ## In-Memory Data Structures
 
-This section describes the logical structure. Implementation may choose any
-concrete representation (hash map, tree, flat map keyed by absolute path) as
-long as the observable behavior matches the spec below.
+### `vfs_node_t` — the inode
 
-### Inode
+Every node (directory, file, or symlink) is a `vfs_node_t`:
 
-Each node (directory or file) is an inode with:
+| Field          | Type              | Used by             | Notes                                      |
+|----------------|-------------------|---------------------|--------------------------------------------|
+| `ino`          | `uint64_t`        | all                 | Monotone counter, assigned at creation     |
+| `kind`         | `vfs_kind_t`      | all                 | `VFS_FILE`, `VFS_DIR`, or `VFS_SYMLINK`    |
+| `content`      | `uint8_t *`       | `VFS_FILE`          | Heap-allocated; NULL if file is empty      |
+| `content_len`  | `size_t`          | `VFS_FILE`          | Number of valid bytes in `content`         |
+| `children`     | `vfs_dirent_t *`  | `VFS_DIR`           | Singly-linked list of `(name, node)` pairs |
+| `link_target`  | `char *`          | `VFS_SYMLINK`       | Heap-allocated, NUL-terminated target path |
+| `parent`       | `vfs_node_t *`    | all                 | NULL only for the root node                |
+| `mtime`        | `struct timespec` | all                 | Last content modification time             |
+| `atime`        | `struct timespec` | all                 | Last access time (set at creation; not auto-updated on read — noatime behaviour) |
 
-| Field    | Type               | Notes                                         |
-|----------|--------------------|-----------------------------------------------|
-| `ino`    | `uint64`           | monotone counter, assigned at creation        |
-| `kind`   | `NodeKind`         | `Directory` or `RegularFile`                  |
-| `content`| `Vec<u8>` or `[]`  | meaningful only for `RegularFile`; empty for dirs |
+### `vfs_dirent_t` — directory entry
 
-### Directory
+Each directory child is a `vfs_dirent_t` in a singly-linked list:
 
-A directory inode additionally maintains an ordered map from name to child inode
-reference. The map must not contain `.` or `..`.
+| Field  | Type             | Notes                              |
+|--------|------------------|------------------------------------|
+| `name` | `char *`         | Heap-allocated, NUL-terminated     |
+| `node` | `vfs_node_t *`   | Pointer to the child node          |
+| `next` | `vfs_dirent_t *` | Next sibling in insertion order    |
 
-### Filesystem
+### `vfs_stat_t` — stat result
 
-The filesystem is a container that holds:
+Returned by `vfs_getattr` and used by the FUSE layer to fill `struct stat`:
 
-- a reference to the root inode
-- a snapshot slot (described below)
+| Field   | Type              | Notes                                              |
+|---------|-------------------|----------------------------------------------------|
+| `ino`   | `uint64_t`        |                                                    |
+| `kind`  | `vfs_kind_t`      |                                                    |
+| `size`  | `size_t`          | `content_len` for files; `strlen(link_target)` for symlinks; 0 for dirs |
+| `mtime` | `struct timespec` |                                                    |
+| `atime` | `struct timespec` |                                                    |
 
-## Supported v1 Operations
+### `vfs_t` — the filesystem container
 
-### Read-only operations (called by FUSE layer or tests)
+| Field       | Type           | Notes                                                         |
+|-------------|----------------|---------------------------------------------------------------|
+| `root`      | `vfs_node_t *` | Always a `VFS_DIR`; never NULL after `vfs_create()`           |
+| `snapshot`  | `vfs_node_t *` | Deep-copy root saved by `vfs_save_snapshot`; NULL if no snapshot |
+| `next_ino`  | `uint64_t`     | Counter for the next inode number                             |
 
-**`lookup` (internal only)**
-Path resolution is implemented internally as `resolve_path()` in `vfs.c`. It
-is not exposed as a public API symbol. External callers (including the FUSE
-layer) should use `getattr` to check existence and kind, which is equivalent
-for all Week 3 use cases.
+---
 
-**`getattr(path) -> stat | ENOENT`**
-Returns a stat-like structure for the node at `path`. For directories:
-`st_mode = S_IFDIR | 0755`, `st_nlink = 2`, `st_size = 0`. For regular files:
-`st_mode = S_IFREG | 0644`, `st_nlink = 1`, `st_size = len(content)`.
-Timestamps are set to a fixed epoch value (0).
+## Public API
 
-**`readdir(path) -> [(name, inode)] | ENOENT | ENOTDIR`**
-Returns the list of `(name, inode)` pairs in the directory at `path`. Always
-includes `.` (the directory itself) and `..` (the parent, or itself for root).
-Returns `ENOTDIR` if `path` exists but is a regular file.
+### Lifecycle
 
-**`read(path, offset, size) -> bytes | ENOENT | EISDIR`**
-Returns up to `size` bytes from the file at `path` starting at `offset`. If
-`offset >= len(content)`, returns an empty slice (not an error). Returns
-`EISDIR` if `path` is a directory.
+```c
+vfs_t *vfs_create(void);
+void   vfs_destroy(vfs_t *vfs);
+```
 
-### Control-path mutating operations (not exposed to the target program)
+### Read-only operations
 
-These operations change the VFS state and are only reachable through the
-mutation/control path, not through the FUSE read interface.
+```c
+int vfs_getattr(vfs_t *vfs, const char *path, vfs_stat_t *out);
+int vfs_readdir(vfs_t *vfs, const char *path, vfs_readdir_cb_t cb, void *ctx);
+int vfs_read(vfs_t *vfs, const char *path, size_t offset, size_t size,
+             uint8_t *buf, size_t *out_len);
+int vfs_readlink(vfs_t *vfs, const char *path, char *buf, size_t bufsz);
+```
 
-**`create_file(path, content) -> () | EEXIST | ENOENT | ENOTDIR`**
-Creates a regular file at `path` with the given content. The parent directory
-must already exist. Returns `EEXIST` if `path` already exists. Returns `ENOENT`
-if the parent directory does not exist. Returns `ENOTDIR` if a component in the
-path is a file, not a directory.
+`vfs_readlink` returns the number of bytes written (not NUL-terminated, per
+POSIX `readlink` semantics). Returns `-EINVAL` if the path is not a symlink.
 
-**`update_file(path, content) -> () | ENOENT | EISDIR`**
-Replaces the content of the existing file at `path`. Returns `ENOENT` if the
-path does not exist. Returns `EISDIR` if the path is a directory.
+### Control-path mutating operations
 
-**`delete_file(path) -> () | ENOENT | EISDIR`**
-Deletes the regular file at `path`. Returns `ENOENT` if it does not exist.
-Returns `EISDIR` if the path is a directory (use `rmdir` for directories).
+These are called by the fuzzer control plane and by the FUSE write callbacks.
 
-**`mkdir(path) -> () | EEXIST | ENOENT | ENOTDIR`**
-Creates a directory at `path`. The parent must exist. Returns `EEXIST` if
-`path` already exists (as either a file or directory).
+```c
+int vfs_create_file(vfs_t *vfs, const char *path,
+                    const uint8_t *content, size_t content_len);
+int vfs_update_file(vfs_t *vfs, const char *path,
+                    const uint8_t *content, size_t content_len);
+int vfs_delete_file(vfs_t *vfs, const char *path);
+int vfs_mkdir(vfs_t *vfs, const char *path);
+int vfs_rmdir(vfs_t *vfs, const char *path);
+int vfs_rename(vfs_t *vfs, const char *oldpath, const char *newpath);
+int vfs_symlink(vfs_t *vfs, const char *path, const char *target);
+int vfs_set_times(vfs_t *vfs, const char *path,
+                  const struct timespec *mtime, const struct timespec *atime);
+```
 
-**`rmdir(path) -> () | ENOENT | ENOTDIR | ENOTEMPTY`**
-Deletes the empty directory at `path`. Returns `ENOTEMPTY` if the directory has
-any children. The root directory cannot be deleted.
+`vfs_update_file` automatically updates `mtime` on the node.
 
-### Snapshot and reset operations
+`vfs_set_times` accepts NULL for either pointer to leave that timestamp
+unchanged. Used by `fvfs_utimens` and by the fuzzer to control metadata
+mutations.
 
-**`save_snapshot() -> ()`**
-Saves a deep copy of the current filesystem state as the baseline snapshot.
-This overwrites any previously saved snapshot.
+`vfs_rename` supports:
+- Same-inode no-op (src == dst → returns 0)
+- Atomic overwrite of an existing regular file at the destination
+- Replacement of an existing empty directory at the destination
+- Moving a directory with its entire subtree intact
+- Cycle detection: rejects moving a directory into its own subtree (`-EINVAL`)
 
-**`reset_to_snapshot() -> () | (no snapshot)`**
-Replaces the current filesystem state with the saved snapshot. After this call,
-reads and mutations see the snapshotted state as if no mutations had occurred
-since the snapshot was taken. If no snapshot has been saved, returns an error
-(or panics — the caller must not call this without a prior `save_snapshot`).
+`vfs_delete_file` also works on symlinks (symlinks are deleted via `unlink`,
+not `rmdir`).
 
-## Invariants
+### Snapshot and reset
 
-The following invariants must hold at all times. The implementation should
-enforce them by returning errors, not by silently breaking them.
+```c
+int vfs_save_snapshot(vfs_t *vfs);
+int vfs_reset_to_snapshot(vfs_t *vfs);
+```
 
-1. The root directory always exists and is always a directory.
-2. Every non-root node has exactly one parent directory that contains it.
-3. No directory contains two children with the same name.
-4. A path component that resolves to a regular file cannot be used as a
-   directory prefix (no file can have children).
-5. After `reset_to_snapshot()`, the state is identical to the state at the time
-   `save_snapshot()` was called. This is a deep equality: same structure, same
-   file contents, same inode assignments are NOT required (ino values may
-   differ), but the observable tree structure and file content must match.
+`vfs_save_snapshot` deep-copies the entire current tree (including timestamps
+and symlink targets) into `vfs->snapshot`. Overwrites any prior snapshot.
+
+`vfs_reset_to_snapshot` deep-copies the snapshot back into `vfs->root`.
+The snapshot is preserved so reset can be called repeatedly. Returns `-EINVAL`
+if no snapshot exists.
+
+**Known scalability note:** deep-copy is O(total tree size). For large rootfs
+layouts this will become a bottleneck. A journal/diff approach (O(delta size))
+is planned for Week 8 before real-world rootfs integration.
+
+---
 
 ## Error Model
 
-The VFS returns typed errors (or errno-compatible integer codes when needed by
-FUSE). The canonical error codes for v1 are:
+| Code           | Meaning                                                        |
+|----------------|----------------------------------------------------------------|
+| `ENOENT`       | Path or name does not exist                                    |
+| `EEXIST`       | Path already exists                                            |
+| `ENOTDIR`      | Expected a directory, found a file or symlink                  |
+| `EISDIR`       | Expected a file, found a directory                             |
+| `ENOTEMPTY`    | Directory is not empty                                         |
+| `EINVAL`       | Invalid argument (empty name, `.`/`..` component, trailing slash, rename into own subtree, readlink on non-symlink) |
+| `ENAMETOOLONG` | Path component exceeds 255 bytes                               |
+| `ENOMEM`       | Allocation failure                                             |
 
-| Code       | Meaning                                               |
-|------------|-------------------------------------------------------|
-| `ENOENT`   | Path or name does not exist                           |
-| `EEXIST`   | Path already exists                                   |
-| `ENOTDIR`  | Expected a directory, found a file                    |
-| `EISDIR`   | Expected a file, found a directory                    |
-| `ENOTEMPTY`| Directory is not empty                               |
-| `EINVAL`   | Invalid argument (e.g. empty name, path contains `..`) |
+All public functions return 0 on success or a negative errno value on failure.
+The FUSE layer passes these values directly to the kernel.
 
-## What the FUSE Layer Will Do (preview)
+---
 
-The FUSE layer (implemented in Week 3) will hold a reference to the VFS and
-implement the following FUSE callbacks by calling into the VFS:
+## FUSE Layer (`fuse_vfs/fuse_vfs.c`)
 
-| FUSE callback | VFS operation            |
-|---------------|--------------------------|
-| `getattr`     | `getattr`                |
-| `readdir`     | `readdir`                |
-| `open`        | `getattr` + kind check   |
-| `read`        | `read`                   |
+The FUSE frontend holds a single global `vfs_t *g_vfs` and implements the
+following callbacks:
 
-The FUSE layer will not implement `write`, `unlink`, `mkdir`, `rmdir`, or
-`rename` — those operations come through the control path, not through FUSE.
-This keeps the mounted view strictly read-only from the target program's
-perspective.
+| FUSE callback | VFS call(s)                        | Notes |
+|---------------|------------------------------------|-------|
+| `getattr`     | `vfs_getattr`                      | Converts `vfs_stat_t` → `struct stat`; sets `S_IFLNK` for symlinks |
+| `readdir`     | `vfs_readdir`                      | Bridges `vfs_readdir_cb_t` → FUSE filler via `readdir_ctx_t` |
+| `open`        | `vfs_getattr`                      | Rejects directories; allows any flags on files |
+| `read`        | `vfs_read`                         |       |
+| `readlink`    | `vfs_readlink`                     |       |
+| `create`      | `vfs_create_file`                  | Called by kernel for `O_CREAT` on a new path |
+| `write`       | `vfs_read` + `vfs_update_file`     | Read-modify-write; handles partial writes and appends; gaps zero-filled |
+| `truncate`    | `vfs_read` + `vfs_update_file`     | Shrink or extend; zeros on extension |
+| `mkdir`       | `vfs_mkdir`                        |       |
+| `unlink`      | `vfs_delete_file`                  | Works for both files and symlinks |
+| `rmdir`       | `vfs_rmdir`                        |       |
+| `rename`      | `vfs_rename`                       | `flags` (RENAME_NOREPLACE etc.) ignored |
+| `symlink`     | `vfs_symlink`                      | FUSE arg order is `(target, linkpath)`; swapped before calling VFS |
+| `utimens`     | `vfs_set_times`                    | Handles `UTIME_NOW` and `UTIME_OMIT` per POSIX |
 
-## What the Control Path Will Do (preview)
+The FUSE process is single-threaded (no `-o clone_fd`). No locking is required
+in the VFS core.
 
-The control path (Week 5) will accept mutation batches from the fuzzer and
-apply them to the VFS using `create_file`, `update_file`, `delete_file`,
-`mkdir`, and `rmdir`. It will also call `reset_to_snapshot` between fuzzing
-iterations.
+---
 
-## Implementation Language
+## Test Coverage
 
-The VFS core will be implemented in C (matching the existing counter_fs.c
-baseline). A Makefile or build script will compile it and its tests. No
-external runtime dependencies beyond the C standard library are required for
-the core. FUSE is only linked in the `fuse_vfs` binary, not in the VFS core
-library or its test suite.
+**`vfs/vfs_test.c`** — 439 checks across 16 test suites:
 
-## Assumptions Recorded
+| Suite | What it covers |
+|-------|---------------|
+| `path_parsing` | Root, missing slash, `.`/`..`, double slash, trailing slash, `ENAMETOOLONG`, ENOENT, NULL |
+| `create_file` | Success, content, nested, EEXIST, ENOENT parent, trailing slash, `.`/`..` as name |
+| `mkdir` | Success, EEXIST, ENOENT parent, `.`/`..` as name, trailing slash |
+| `readdir` | `.` and `..` entries, all children listed, ENOENT, ENOTDIR |
+| `read` | Full read, partial, offset, offset past end, EISDIR, ENOENT, empty file |
+| `update_file` | New content, empty content, ENOENT, EISDIR |
+| `delete_file` | Success, ENOENT, EISDIR |
+| `rmdir` | Success, ENOENT, ENOTDIR, ENOTEMPTY, root rejected |
+| `nested` | Three-level tree, reads and deletes at depth |
+| `mutation_sequence` | Interleaved create/update/delete/mkdir/rmdir sequences |
+| `snapshot_reset` | Save, mutate, reset, verify; repeated resets |
+| `snapshot_nested` | Multi-level tree preserved across reset |
+| `invariants` | Root always exists, duplicate rejection, ENOTEMPTY enforcement |
+| `random_sequence` | 200-step randomized create/update/delete/mkdir/rmdir + snapshot/reset |
+| `rename` | Same-dir, cross-dir, overwrite, directory move with children, same-path no-op, ENOENT/ENOTEMPTY/EISDIR/ENOTDIR/EINVAL, cycle detection |
+| `symlink` | Create/readlink roundtrip, getattr kind+size, error cases, delete, snapshot/restore, bufsz truncation |
 
-- The VFS is single-threaded for v1. No locking is required in the core. The
-  FUSE layer serializes all callbacks through the single-threaded FUSE dispatch
-  loop (no `-o clone_fd` or multithreading enabled).
-- File content is stored as a raw byte array. No encoding, compression, or lazy
-  loading is needed.
-- The baseline snapshot is a full in-memory deep copy. For the file sizes
-  expected in fuzzing (kilobytes to low megabytes), this is acceptable.
-- inode numbers need not be stable across snapshot/restore cycles. The FUSE
-  layer will not use `lookup` caching that depends on stable inodes.
+**`fuse_vfs/test_mount.sh`** — 40 integration checks on a live FUSE mount:
+root listing, nested dirs, file content and sizes, repeated opens, negative
+cases, write (overwrite, create, append), mkdir/rmdir, unlink, touch (utimens).
+
+---
+
+## Invariants
+
+1. The root directory always exists and is always a `VFS_DIR`.
+2. Every non-root node has exactly one parent directory that contains it.
+3. No directory contains two children with the same name.
+4. A path component that resolves to a file or symlink cannot be used as a
+   directory prefix.
+5. After `vfs_reset_to_snapshot()`, the observable tree structure, file
+   contents, symlink targets, and timestamps match those at the time
+   `vfs_save_snapshot()` was called. Inode numbers need not be stable.
+
+---
+
+## Assumptions
+
+- Single-threaded for v1. No locking in the VFS core.
+- File content is stored as a raw byte array. No encoding or lazy loading.
+- The baseline snapshot is a full in-memory deep copy. Acceptable for
+  kilobyte-to-low-megabyte filesystems; a journal approach is planned for
+  Week 8 when scaling to real rootfs sizes.
+- Inode numbers need not be stable across snapshot/restore. The FUSE layer
+  does not use lookup caching that depends on stable inodes.
+- Symlink resolution is the kernel's responsibility. The VFS resolver treats
+  symlink nodes as opaque leaves and never follows them.
+
+---
+
+## What Comes Next
+
+- **Week 4**: Define the `fs_delta_t` mutation model and build the control
+  plane interface so the fuzzer can push delta operations to the live VFS.
+- **Week 5**: Implement LibAFL mutator stages and `vfs_diff_snapshot` to close
+  the feedback loop (capture target-side writes as new seeds).
+- **Week 8**: Replace deep-copy snapshot restore with a journal-based approach
+  before importing a real container rootfs.
+- **Still deferred**: hard links, xattrs, uid/gid, `chmod`, `release` callback.

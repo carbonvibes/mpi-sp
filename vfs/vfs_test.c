@@ -876,6 +876,158 @@ static void test_random_sequence(void)
 }
 
 /* -------------------------------------------------------------------------
+ * rename
+ * ---------------------------------------------------------------------- */
+
+static void test_rename(void)
+{
+    SUITE("rename");
+
+    vfs_t *vfs = vfs_create();
+    CHECK_NOTNULL(vfs);
+
+    vfs_create_file(vfs, "/a", S("hello"), SL("hello"));
+    vfs_mkdir(vfs, "/d");
+    vfs_create_file(vfs, "/d/x", S("inner"), SL("inner"));
+
+    /* Basic rename within same directory. */
+    CHECK_EQ(vfs_rename(vfs, "/a", "/b"), 0);
+    vfs_stat_t st;
+    CHECK_EQ(vfs_getattr(vfs, "/a", &st), -ENOENT);
+    CHECK_EQ(vfs_getattr(vfs, "/b", &st), 0);
+    CHECK_EQ(st.kind, VFS_FILE);
+    char *got = read_all(vfs, "/b");
+    CHECK_NOTNULL(got);
+    CHECK_EQ(strcmp(got, "hello"), 0);
+    free(got);
+
+    /* Move file into a subdirectory. */
+    CHECK_EQ(vfs_rename(vfs, "/b", "/d/b"), 0);
+    CHECK_EQ(vfs_getattr(vfs, "/b", &st), -ENOENT);
+    CHECK_EQ(vfs_getattr(vfs, "/d/b", &st), 0);
+    CHECK_EQ(st.kind, VFS_FILE);
+
+    /* Rename overwrites an existing file at destination. */
+    vfs_create_file(vfs, "/src", S("new"), SL("new"));
+    vfs_create_file(vfs, "/dst", S("old"), SL("old"));
+    CHECK_EQ(vfs_rename(vfs, "/src", "/dst"), 0);
+    CHECK_EQ(vfs_getattr(vfs, "/src", &st), -ENOENT);
+    got = read_all(vfs, "/dst");
+    CHECK_NOTNULL(got);
+    CHECK_EQ(strcmp(got, "new"), 0);
+    free(got);
+
+    /* Rename a directory. */
+    vfs_mkdir(vfs, "/dira");
+    vfs_create_file(vfs, "/dira/f", S("x"), 1);
+    CHECK_EQ(vfs_rename(vfs, "/dira", "/dirb"), 0);
+    CHECK_EQ(vfs_getattr(vfs, "/dira", &st), -ENOENT);
+    CHECK_EQ(vfs_getattr(vfs, "/dirb", &st), 0);
+    CHECK_EQ(st.kind, VFS_DIR);
+    CHECK_EQ(vfs_getattr(vfs, "/dirb/f", &st), 0);   /* children survive */
+
+    /* Same src and dst: no-op, returns 0. */
+    CHECK_EQ(vfs_rename(vfs, "/dst", "/dst"), 0);
+
+    /* src does not exist. */
+    CHECK_EQ(vfs_rename(vfs, "/nope", "/x"), -ENOENT);
+
+    /* dst is non-empty directory → ENOTEMPTY. */
+    CHECK_EQ(vfs_rename(vfs, "/d/x", "/d"), -EISDIR);   /* file vs dir */
+
+    vfs_mkdir(vfs, "/nonempty");
+    vfs_create_file(vfs, "/nonempty/child", S("x"), 1);
+    vfs_mkdir(vfs, "/emptydir");
+    CHECK_EQ(vfs_rename(vfs, "/emptydir", "/nonempty"), -ENOTEMPTY);
+
+    /* dst is directory, src is file → EISDIR. */
+    vfs_mkdir(vfs, "/edir");
+    vfs_create_file(vfs, "/ffile", S("x"), 1);
+    CHECK_EQ(vfs_rename(vfs, "/ffile", "/edir"), -EISDIR);
+
+    /* dst is file, src is directory → ENOTDIR. */
+    vfs_mkdir(vfs, "/sdir");
+    vfs_create_file(vfs, "/tfile2", S("x"), 1);
+    CHECK_EQ(vfs_rename(vfs, "/sdir", "/tfile2"), -ENOTDIR);
+
+    /* Rename root → EINVAL. */
+    CHECK_EQ(vfs_rename(vfs, "/", "/x"), -EINVAL);
+
+    /* Move directory into its own subtree → EINVAL. */
+    vfs_mkdir(vfs, "/p");
+    vfs_mkdir(vfs, "/p/q");
+    CHECK_EQ(vfs_rename(vfs, "/p", "/p/q/p"), -EINVAL);
+
+    vfs_destroy(vfs);
+}
+
+/* -------------------------------------------------------------------------
+ * symlink
+ * ---------------------------------------------------------------------- */
+
+static void test_symlink(void)
+{
+    SUITE("symlink");
+
+    vfs_t *vfs = vfs_create();
+    CHECK_NOTNULL(vfs);
+
+    /* Create a symlink and read it back. */
+    CHECK_EQ(vfs_symlink(vfs, "/link", "/some/target"), 0);
+    char buf[256];
+    int n = vfs_readlink(vfs, "/link", buf, sizeof(buf));
+    CHECK_EQ(n, (int)strlen("/some/target"));
+    buf[n] = '\0';
+    CHECK_EQ(strcmp(buf, "/some/target"), 0);
+
+    /* getattr returns VFS_SYMLINK kind and correct size. */
+    vfs_stat_t st;
+    CHECK_EQ(vfs_getattr(vfs, "/link", &st), 0);
+    CHECK_EQ(st.kind, VFS_SYMLINK);
+    CHECK_EQ(st.size, strlen("/some/target"));
+
+    /* readlink on a regular file → EINVAL. */
+    vfs_create_file(vfs, "/f", S("x"), 1);
+    CHECK_EQ(vfs_readlink(vfs, "/f", buf, sizeof(buf)), -EINVAL);
+
+    /* readlink on a directory → EINVAL. */
+    vfs_mkdir(vfs, "/dir");
+    CHECK_EQ(vfs_readlink(vfs, "/dir", buf, sizeof(buf)), -EINVAL);
+
+    /* readlink on non-existent path → ENOENT. */
+    CHECK_EQ(vfs_readlink(vfs, "/nope", buf, sizeof(buf)), -ENOENT);
+
+    /* Duplicate symlink at same path → EEXIST. */
+    CHECK_EQ(vfs_symlink(vfs, "/link", "/other"), -EEXIST);
+
+    /* Symlink parent must exist. */
+    CHECK_EQ(vfs_symlink(vfs, "/missing/link", "/t"), -ENOENT);
+
+    /* Delete symlink via vfs_delete_file (goes through unlink). */
+    CHECK_EQ(vfs_delete_file(vfs, "/link"), 0);
+    CHECK_EQ(vfs_getattr(vfs, "/link", &st), -ENOENT);
+
+    /* Symlink is preserved across snapshot/restore. */
+    CHECK_EQ(vfs_symlink(vfs, "/snap_link", "snap_target"), 0);
+    CHECK_EQ(vfs_save_snapshot(vfs), 0);
+    CHECK_EQ(vfs_delete_file(vfs, "/snap_link"), 0);   /* delete after snap */
+    CHECK_EQ(vfs_reset_to_snapshot(vfs), 0);
+    n = vfs_readlink(vfs, "/snap_link", buf, sizeof(buf));
+    CHECK_EQ(n, (int)strlen("snap_target"));
+    buf[n] = '\0';
+    CHECK_EQ(strcmp(buf, "snap_target"), 0);
+
+    /* readlink respects bufsz truncation (no NUL appended). */
+    CHECK_EQ(vfs_symlink(vfs, "/long_link", "abcdefghij"), 0);
+    char small[4];
+    n = vfs_readlink(vfs, "/long_link", small, 4);
+    CHECK_EQ(n, 4);
+    CHECK_EQ(memcmp(small, "abcd", 4), 0);
+
+    vfs_destroy(vfs);
+}
+
+/* -------------------------------------------------------------------------
  * main
  * ---------------------------------------------------------------------- */
 
@@ -895,6 +1047,8 @@ int main(void)
     test_snapshot_nested();
     test_invariants();
     test_random_sequence();
+    test_rename();
+    test_symlink();
 
     printf("\n");
     if (g_fail == 0) {

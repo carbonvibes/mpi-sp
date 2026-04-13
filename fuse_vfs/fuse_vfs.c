@@ -46,6 +46,10 @@ static void vfs_stat_to_stat(const vfs_stat_t *vs, struct stat *st)
     if (vs->kind == VFS_DIR) {
         st->st_mode  = S_IFDIR | 0755;
         st->st_nlink = 2;
+    } else if (vs->kind == VFS_SYMLINK) {
+        st->st_mode  = S_IFLNK | 0777;
+        st->st_nlink = 1;
+        st->st_size  = (off_t)vs->size;   /* strlen(target) */
     } else {
         st->st_mode  = S_IFREG | 0644;
         st->st_nlink = 1;
@@ -217,6 +221,33 @@ static int fvfs_rmdir(const char *path)
 }
 
 /*
+ * rename: FUSE passes (oldpath, newpath, flags).
+ * flags (RENAME_NOREPLACE, RENAME_EXCHANGE) are not supported; we ignore them
+ * and fall through to standard POSIX replace semantics.
+ */
+static int fvfs_rename(const char *oldpath, const char *newpath,
+                       unsigned int flags)
+{
+    (void)flags;
+    return vfs_rename(g_vfs, oldpath, newpath);
+}
+
+/*
+ * symlink: note that FUSE's argument order is (target, linkpath) —
+ * the reverse of the intuitive order.  vfs_symlink takes (vfs, linkpath, target).
+ */
+static int fvfs_symlink(const char *target, const char *linkpath)
+{
+    return vfs_symlink(g_vfs, linkpath, target);
+}
+
+static int fvfs_readlink(const char *path, char *buf, size_t size)
+{
+    int r = vfs_readlink(g_vfs, path, buf, size);
+    return (r >= 0) ? 0 : r;
+}
+
+/*
  * Set atime (tv[0]) and mtime (tv[1]) on the node at path.
  * Handles UTIME_NOW (set to current time) and UTIME_OMIT (leave unchanged)
  * as required by POSIX utimensat(2).
@@ -243,6 +274,7 @@ static const struct fuse_operations fvfs_ops = {
     .readdir  = fvfs_readdir,
     .open     = fvfs_open,
     .read     = fvfs_read,
+    .readlink = fvfs_readlink,
     /* write path */
     .create   = fvfs_create,
     .write    = fvfs_write,
@@ -250,6 +282,8 @@ static const struct fuse_operations fvfs_ops = {
     .mkdir    = fvfs_mkdir,
     .unlink   = fvfs_unlink,
     .rmdir    = fvfs_rmdir,
+    .rename   = fvfs_rename,
+    .symlink  = fvfs_symlink,
     .utimens  = fvfs_utimens,
 };
 

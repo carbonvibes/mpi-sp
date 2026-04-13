@@ -12,6 +12,7 @@
 typedef enum {
     VFS_FILE,
     VFS_DIR,
+    VFS_SYMLINK,
 } vfs_kind_t;
 
 typedef struct vfs_dirent vfs_dirent_t;
@@ -38,6 +39,7 @@ struct vfs_node {
     uint8_t        *content;      /* VFS_FILE only */
     size_t          content_len;  /* VFS_FILE only */
     vfs_dirent_t   *children;     /* VFS_DIR only  */
+    char           *link_target;  /* VFS_SYMLINK only; heap-allocated, NUL-terminated */
     vfs_node_t     *parent;       /* NULL for root */
     struct timespec mtime;        /* last content modification time */
     struct timespec atime;        /* last access time (not auto-updated on read) */
@@ -54,7 +56,7 @@ typedef struct {
 typedef struct {
     uint64_t        ino;
     vfs_kind_t      kind;
-    size_t          size;    /* file byte count; 0 for directories */
+    size_t          size;    /* file byte count; symlink target length; 0 for directories */
     struct timespec mtime;
     struct timespec atime;
 } vfs_stat_t;
@@ -144,6 +146,31 @@ int vfs_mkdir(vfs_t *vfs, const char *path);
  * Returns -ENOTEMPTY if the directory has children.
  */
 int vfs_rmdir(vfs_t *vfs, const char *path);
+
+/*
+ * Rename (move) oldpath to newpath.
+ * - If newpath exists and is a regular file, it is atomically replaced.
+ * - If newpath exists and is an empty directory, it is replaced.
+ * - Moving a directory into its own subtree returns -EINVAL.
+ * - Root cannot be renamed.
+ * Returns 0 on success, negative errno on error.
+ */
+int vfs_rename(vfs_t *vfs, const char *oldpath, const char *newpath);
+
+/*
+ * Create a symlink at path pointing to target.
+ * The parent directory must already exist.
+ * Returns -EEXIST if path already exists, -ENOENT if the parent does not.
+ */
+int vfs_symlink(vfs_t *vfs, const char *path, const char *target);
+
+/*
+ * Copy the symlink target at path into buf (up to bufsz bytes).
+ * NOT NUL-terminated (POSIX readlink semantics).
+ * Returns the number of bytes written on success, negative errno on error.
+ * Returns -EINVAL if path is not a symlink.
+ */
+int vfs_readlink(vfs_t *vfs, const char *path, char *buf, size_t bufsz);
 
 /*
  * Set mtime and/or atime on the node at path.

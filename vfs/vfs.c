@@ -13,10 +13,6 @@ static struct timespec ts_now(void)
     return ts;
 }
 
-/* -------------------------------------------------------------------------
- * Internal helpers
- * ---------------------------------------------------------------------- */
-
 /* Maximum allowed length for a single path component (name). */
 #define VFS_MAX_NAME 255
 
@@ -40,6 +36,7 @@ static void node_free_self(vfs_node_t *n)
 {
     if (!n) return;
     free(n->content);
+    free(n->link_target);
     free(n);
 }
 
@@ -86,6 +83,9 @@ static vfs_node_t *node_deepcopy(const vfs_node_t *src, vfs_node_t *parent_copy)
             memcpy(dst->content, src->content, src->content_len);
         }
         dst->content_len = src->content_len;
+    } else if (src->kind == VFS_SYMLINK) {
+        dst->link_target = strdup(src->link_target);
+        if (!dst->link_target) { free(dst); return NULL; }
     } else {
         /* Copy children, keeping the same insertion order. */
         vfs_dirent_t **tail = &dst->children;
@@ -282,7 +282,12 @@ static void fill_stat(const vfs_node_t *n, vfs_stat_t *st)
 {
     st->ino   = n->ino;
     st->kind  = n->kind;
-    st->size  = (n->kind == VFS_FILE) ? n->content_len : 0;
+    if (n->kind == VFS_FILE)
+        st->size = n->content_len;
+    else if (n->kind == VFS_SYMLINK)
+        st->size = strlen(n->link_target);
+    else
+        st->size = 0;
     st->mtime = n->mtime;
     st->atime = n->atime;
 }
@@ -479,6 +484,100 @@ int vfs_rmdir(vfs_t *vfs, const char *path)
     dir_remove_child(parent, name);
     node_free_deep(n);
     return 0;
+}
+
+int vfs_rename(vfs_t *vfs, const char *oldpath, const char *newpath)
+{
+    if (strcmp(oldpath, "/") == 0) return -EINVAL;
+    if (strcmp(newpath, "/") == 0) return -EINVAL;
+
+    char oldname[VFS_MAX_NAME + 1];
+    char newname[VFS_MAX_NAME + 1];
+
+    errno = 0;
+    vfs_node_t *old_parent = resolve_parent(vfs, oldpath, oldname);
+    if (!old_parent) return -errno;
+
+    errno = 0;
+    vfs_node_t *new_parent = resolve_parent(vfs, newpath, newname);
+    if (!new_parent) return -errno;
+
+    if (new_parent->kind != VFS_DIR) return -ENOTDIR;
+
+    vfs_node_t *src = dir_lookup_child(old_parent, oldname);
+    if (!src) return -ENOENT;
+
+    vfs_node_t *dst = dir_lookup_child(new_parent, newname);
+
+    /* Same inode: no-op. */
+    if (src == dst) return 0;
+
+    /* Prevent moving a directory into its own subtree. */
+    if (src->kind == VFS_DIR) {
+        for (vfs_node_t *p = new_parent; p; p = p->parent) {
+            if (p == src) return -EINVAL;
+        }
+    }
+
+    if (dst) {
+        if (dst->kind == VFS_DIR && src->kind != VFS_DIR) return -EISDIR;
+        if (dst->kind != VFS_DIR && src->kind == VFS_DIR) return -ENOTDIR;
+        if (dst->kind == VFS_DIR && dst->children != NULL) return -ENOTEMPTY;
+
+        dir_remove_child(new_parent, newname);
+        node_free_deep(dst);
+    }
+
+    /* Detach src from its current parent. */
+    dir_remove_child(old_parent, oldname);
+
+    /* Attach under the new name. */
+    src->parent = new_parent;
+    int r = dir_add_child(new_parent, newname, src);
+    if (r < 0) {
+        /* Reattach to old parent to avoid losing the node. */
+        src->parent = old_parent;
+        dir_add_child(old_parent, oldname, src);
+        return r;
+    }
+
+    return 0;
+}
+
+int vfs_symlink(vfs_t *vfs, const char *path, const char *target)
+{
+    if (!target || target[0] == '\0') return -EINVAL;
+
+    char name[VFS_MAX_NAME + 1];
+    errno = 0;
+    vfs_node_t *parent = resolve_parent(vfs, path, name);
+    if (!parent) return -errno;
+    if (parent->kind != VFS_DIR) return -ENOTDIR;
+    if (dir_lookup_child(parent, name)) return -EEXIST;
+
+    vfs_node_t *node = node_alloc(vfs, VFS_SYMLINK);
+    if (!node) return -ENOMEM;
+
+    node->link_target = strdup(target);
+    if (!node->link_target) { node_free_self(node); return -ENOMEM; }
+    node->parent = parent;
+
+    int r = dir_add_child(parent, name, node);
+    if (r < 0) { node_free_self(node); return r; }
+    return 0;
+}
+
+int vfs_readlink(vfs_t *vfs, const char *path, char *buf, size_t bufsz)
+{
+    errno = 0;
+    vfs_node_t *n = resolve_path(vfs, path);
+    if (!n) return -errno;
+    if (n->kind != VFS_SYMLINK) return -EINVAL;
+
+    size_t len = strlen(n->link_target);
+    size_t copy = (len < bufsz) ? len : bufsz;
+    memcpy(buf, n->link_target, copy);
+    return (int)copy;
 }
 
 int vfs_set_times(vfs_t *vfs, const char *path,
