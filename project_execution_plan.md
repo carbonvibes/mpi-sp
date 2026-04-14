@@ -379,7 +379,14 @@ Concrete steps:
    - reset to baseline
 5. manually test each mutator stage in isolation before composing them
 
-6. **measure reset cost and FUSE overhead:**
+6. **clean up the serialization format now that dumb byte mutation is no longer the primary path:**
+   - remove the magic number (`DELTA_MAGIC`, bytes 0–3) from the wire format and from `delta_serialize` / `delta_deserialize` — with custom mutators always re-serializing from a valid `fs_delta_t`, the magic check never fires and wastes 4 bytes of every corpus entry
+   - remove the always-present timestamp fields from ops that are not `SET_TIMES` — currently every op carries 32 bytes of zeros for mtime/atime regardless of kind; replace with a presence flag byte so only `SET_TIMES` ops pay the timestamp cost; for a delta with 20 ops this removes ~608 bytes of zeros per corpus entry
+   - remove or retire the `rejection_rate` test suite — it measured viability of dumb byte mutation as a floor; with semantic mutators the rejection rate on the actual mutation path is zero by construction; keep the result documented in `docs/mutation_model.md` as a historical rationale but stop running it as a live test
+   - update `DELTA_OP_FIXED` and any size calculations to match the new compact layout
+   - verify the serialize/deserialize roundtrip tests still pass after the format change
+
+7. **measure reset cost and FUSE overhead:**
    - instrument `vfs_reset_to_snapshot` with a timer in the iteration loop; record per-reset cost
    - if reset cost exceeds 1ms for the demo tree size, evaluate pulling the journal/CoW optimisation forward from Week 8
    - write a small benchmark calling `vfs_read` in a tight loop with no FUSE mount (direct C API only); compare to the existing 13.8k ops/sec FUSE number — this ratio quantifies the kernel FUSE overhead tax and goes directly in the paper
