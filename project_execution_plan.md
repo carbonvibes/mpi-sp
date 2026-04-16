@@ -331,8 +331,8 @@ Exit criteria met:
 Objectives:
 
 - implement the concrete LibAFL mutator stages that operate on `fs_delta_t`
-- implement `vfs_diff_snapshot` to capture target-side writes as feedback
-- wire the full per-iteration feedback loop: pre-snapshot → apply delta → run target → diff → promote → reset
+- implement per-iteration write logging in the FUSE callbacks to capture target-side filesystem activity
+- wire the full per-iteration feedback loop: apply delta → run target → read log → act on signals → reset
 
 Context: a LibAFL mutator is not something that ships ready-made. Each mutator stage is a function that takes an existing `fs_delta_t` and returns a modified one. Multiple stages are composed into a mutation pipeline. The generator from Week 4 seeds the initial corpus; the mutator stages diversify it.
 
@@ -345,39 +345,58 @@ Concrete mutator stages to build:
 - `MutatePath` — change the path component of an existing op (tests path-sensitive behavior)
 - `SpliceDelta` — take ops from two different deltas and combine them (LibAFL splice analog)
 
-Feedback loop — full 5-step model per iteration:
+Feedback loop — per-iteration model:
 
 ```
-1. Save a pre-run snapshot of the VFS (beyond the baseline snapshot)
-2. Apply the fuzzer's delta to the live VFS
-3. Run the target — it reads and possibly writes through the FUSE mount
-4. After the run, call vfs_diff_snapshot(current_state, pre_run_snapshot)
-   to produce the set of files the target created or modified
-5. If the diff is non-empty, promote the post-write state as a new seed
-   (the target told us what it expects the filesystem to look like)
-6. Reset to the baseline snapshot for the next iteration
+1. Clear the iteration log
+2. Set target_running = true (enables write logging in FUSE callbacks)
+3. Apply the fuzzer's delta to the live VFS
+   (direct C API — bypasses FUSE entirely, so these writes are never logged)
+4. Run the target — FUSE callbacks log events into the iteration log:
+   - CREATE / WRITE       : target created or wrote to a file
+   - MKDIR                : target created a directory
+   - RENAME_FROM / RENAME_TO : both sides of a rename
+   - UNLINK / RMDIR       : target deleted a path
+   - ENOENT               : target requested a path that did not exist
+5. Set target_running = false
+6. Process the log:
+   - Write-set (CREATE / WRITE / RENAME_TO / MKDIR) paths:
+     read final content from the VFS and promote as a new corpus seed
+   - UNLINK / RENAME_FROM paths:
+     record as "recreate these paths" guidance for future mutations
+     (the target reached code that acts on these paths — they are interesting)
+   - ENOENT paths:
+     bias the mutator toward creating these paths in the next iteration
+7. Reset to the baseline snapshot for the next iteration
 ```
 
 Concrete steps:
 
-1. implement `vfs_diff_snapshot` in `vfs/vfs.c` and `vfs/vfs.h`:
-   - walks the current VFS tree and a saved snapshot in parallel
-   - produces a structured list of changes: file created, file modified (path + old + new content), file deleted, directory created, directory deleted
-   - add unit tests covering all change types
-2. decide and document the snapshot management strategy:
-   - the current `vfs_t` holds a single snapshot pointer
-   - the feedback loop needs two independent snapshots simultaneously (the baseline and the pre-run state)
-   - evaluate: add a second named snapshot slot to `vfs_t`, or manage two separate `vfs_t` instances at the caller level
-   - document the chosen approach in `docs/control_plane.md`
-3. implement each mutator stage listed above as a separate LibAFL `MutationStage`
-4. implement the full per-iteration harness loop:
-   - save pre-run snapshot
-   - apply delta via control plane
+1. add a per-iteration write log to the FUSE layer:
+   - define `fuse_iter_log_t`: a fixed-capacity array of
+     `{char path[VFS_PATH_MAX], event_t kind}` entries where
+     `event_t` is `LOG_CREATE | LOG_WRITE | LOG_MKDIR | LOG_RENAME_FROM | LOG_RENAME_TO | LOG_UNLINK | LOG_RMDIR | LOG_ENOENT`
+   - add a global `bool g_target_running` flag (false by default)
+   - add logging calls in `fvfs_create`, `fvfs_write`, `fvfs_mkdir`,
+     `fvfs_rename` (emits both RENAME_FROM and RENAME_TO), `fvfs_unlink`,
+     `fvfs_rmdir` — only when `g_target_running` is true
+   - add ENOENT logging in `fvfs_getattr` when `g_target_running` is true
+     and the return value is `-ENOENT`
+   - deduplicate WRITE entries: multiple write calls to the same path collapse
+     to a single LOG_WRITE entry (content is read from the VFS after the run,
+     not copied per-callback)
+   - expose `fuse_log_clear()`, `fuse_log_set_active(bool)`, and
+     `fuse_log_get()` as the control interface
+2. implement each mutator stage listed above as a separate LibAFL `MutationStage`
+3. implement the full per-iteration harness loop:
+   - call `fuse_log_clear()` and `fuse_log_set_active(true)`
+   - apply delta via control plane (direct VFS API — not logged)
    - fork/exec target
-   - collect diff
-   - if diff is non-empty, add post-write state to corpus
+   - call `fuse_log_set_active(false)`
+   - read the log: promote write-set paths, queue UNLINK/RENAME_FROM paths
+     as creation guidance, queue ENOENT paths as missing-path signal
    - reset to baseline
-5. manually test each mutator stage in isolation before composing them
+4. manually test each mutator stage in isolation before composing them
 
 6. **clean up the serialization format now that dumb byte mutation is no longer the primary path:**
    - remove the magic number (`DELTA_MAGIC`, bytes 0–3) from the wire format and from `delta_serialize` / `delta_deserialize` — with custom mutators always re-serializing from a valid `fs_delta_t`, the magic check never fires and wastes 4 bytes of every corpus entry
@@ -393,19 +412,25 @@ Concrete steps:
 
 Testing and validation:
 
-- `vfs_diff_snapshot` unit tests: create/modify/delete cases, empty diff case, snapshot with no changes
+- write-log unit tests: verify each event kind (CREATE, WRITE, MKDIR, RENAME_FROM,
+  RENAME_TO, UNLINK, RMDIR, ENOENT) is logged correctly when `g_target_running` is true
+- suppression test: apply a delta with `g_target_running = false` and confirm no
+  entries appear in the log (fuzzer writes via direct VFS API must never be logged)
+- deduplication test: two writes to the same path produce exactly one LOG_WRITE entry
 - mutator stage unit tests: verify each stage produces a valid `fs_delta_t` (well-formed paths, non-empty ops list)
-- end-to-end test: apply delta with a fake target that writes a file, verify diff captures the write and it is promoted to corpus
+- end-to-end test: run a fake target that creates a file, writes to it, deletes another,
+  and requests a missing path; verify the log captures all four event types correctly
 - feedback loop integration test: run 10 iterations with reset between each, confirm no stale state
 - reset cost recorded in `docs/benchmark_baseline.md`
 - direct VFS vs FUSE overhead ratio recorded
 
 Exit criteria:
 
-- `vfs_diff_snapshot` is implemented and tested
+- per-iteration write log is implemented in FUSE callbacks and tested
+- fuzzer writes (via direct VFS API) are confirmed absent from the log
 - all mutator stages produce valid deltas
 - the full per-iteration feedback loop runs without stale state
-- target-side writes are captured and visible to the fuzzer as new seeds
+- target-side write-set and ENOENT paths are captured and usable by the mutator
 - reset cost and FUSE overhead ratio measured and documented
 
 ### Week 6: Build The Minimal End-To-End Demo Harness
@@ -584,24 +609,34 @@ Exit criteria:
 
 The bonus direction should only begin after the main pipeline is stable, reproducible, and evaluated.
 
-### Bonus Week 1: Observe File Access Behavior
+### Bonus Week 1: Extend Logging To Read-Side Access Patterns
 
 Objectives:
 
-- record which files are accessed by the target during execution
-- understand whether this information is useful for mutation guidance
+- add read-side signals to the iteration log (write-side and ENOENT are already
+  in the main plan; this extends to successful reads and directory listings)
+- understand whether read-frequency data improves mutation guidance beyond what
+  ENOENT alone provides
+
+Context: the main plan logs what the target *wrote* and what paths it *requested
+but missed*. This bonus adds what it *successfully read*, which lets the mutator
+bias content mutations toward files the target actually consumed (hot-file
+weighting) rather than treating all files in the delta equally.
 
 Concrete steps:
 
-1. instrument the FUSE layer to log lookups, opens, reads, and failures
-2. record missing-path accesses as well as successful accesses
-3. aggregate access counts per execution
-4. inspect whether targets repeatedly request specific files that do not exist
+1. add LOG_READ and LOG_READDIR event kinds to `fuse_iter_log_t`
+2. instrument `fvfs_read` to emit LOG_READ (deduplicated per path, with a hit counter)
+3. instrument `fvfs_readdir` to emit LOG_READDIR for each directory listed
+4. expose per-path read counts alongside the existing write-set and ENOENT sets
+5. inspect whether targets repeatedly read the same files across iterations
+   (high-count paths are prime content-mutation targets)
 
 Validation:
 
-- logs are correct and do not corrupt normal execution
-- overhead introduced by observation is measured
+- read-log entries are correct and do not corrupt normal execution
+- additional overhead of read logging is measured and documented
+- at least one example showing a hot file that ENOENT alone would not have identified
 
 ### Bonus Week 2: Design Feedback-Guided Mutation
 
@@ -720,10 +755,11 @@ If time remains after that, do:
 Weeks 1–3, the pre-Week 4 side quest, and Week 4 are done. The immediate next sequence is:
 
 1. **Week 5 — mutator stages + feedback loop + measurements**:
-   - implement `vfs_diff_snapshot` for capturing target-side writes
-   - decide single vs multiple snapshot slots in `vfs_t`
+   - implement per-iteration write log in FUSE callbacks (`fvfs_create`, `fvfs_write`,
+     `fvfs_mkdir`, `fvfs_rename`, `fvfs_unlink`, `fvfs_rmdir`, ENOENT in `fvfs_getattr`)
+     with `g_target_running` flag gating all logging
    - implement LibAFL mutator stages (`ByteFlipFileContent`, `AddFileOp`, `RemoveOp`, `MutatePath`, `SpliceDelta`, `ReplaceFileContent`)
-   - wire the full per-iteration feedback loop: pre-snapshot → apply delta → run target → diff → promote → reset
+   - wire the full per-iteration feedback loop: clear log → set active → apply delta → run target → deactivate → process log → reset
    - instrument `vfs_reset_to_snapshot` with a timer; record per-reset cost
    - run direct VFS API benchmark (no FUSE) and record FUSE overhead ratio
 
