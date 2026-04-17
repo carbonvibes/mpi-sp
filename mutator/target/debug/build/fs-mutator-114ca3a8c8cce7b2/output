@@ -1,0 +1,9 @@
+ar rcs libcontrol_plane.a delta.o control_plane.o vfs.o
+cargo:rustc-link-search=native=../control_plane
+cargo:rustc-link-lib=static=control_plane
+cargo:rerun-if-changed=../vfs/vfs.c
+cargo:rerun-if-changed=../vfs/vfs.h
+cargo:rerun-if-changed=../control_plane/delta.c
+cargo:rerun-if-changed=../control_plane/delta.h
+cargo:rerun-if-changed=../control_plane/control_plane.c
+cargo:rerun-if-changed=../control_plane/control_plane.h

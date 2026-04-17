@@ -16,7 +16,6 @@
  *   apply_dry_run         — dry_run=1 shows tree; VFS unchanged after
  *   apply_mutate_reset    — 10 iterations of apply + vfs_reset_to_snapshot
  *   vfs_checksum          — identical tree → same hash; mutation changes hash
- *   rejection_rate        — 10 000 random byte-flip mutations; reports rate
  *
  * Build: see control_plane/Makefile
  * Run:   ./cp_test
@@ -128,7 +127,7 @@ static void test_delta_serialize(void)
     size_t len = 0;
     uint8_t *buf = delta_serialize(orig, &len);
     CHECK(buf != NULL);
-    CHECK(len > 8);  /* at least header */
+    CHECK(len > 4);  /* at least header (n_ops u32) */
 
     int err = 0;
     fs_delta_t *copy = delta_deserialize(buf, len, &err);
@@ -197,22 +196,22 @@ static void test_delta_deser_errors(void)
     int err;
     fs_delta_t *d;
 
-    /* Buffer too short for header. */
-    uint8_t tiny[] = { 0x46, 0x53, 0x44 };
+    /* Buffer too short for header (need 4 bytes for n_ops). */
+    uint8_t tiny[] = { 0x00, 0x00, 0x00 };
     d = delta_deserialize(tiny, 3, &err);
     CHECK(d == NULL && err < 0);
 
-    /* Wrong magic. */
-    uint8_t bad_magic[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0,0,0,1,
-                             1, 0,5, '/','h','e','l','o', 0,0,0,0, 0,0,0,0,
-                             0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
-                             0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0 };
-    d = delta_deserialize(bad_magic, sizeof bad_magic, &err);
-    CHECK(d == NULL && err < 0);
+    /* n_ops claims far more ops than the buffer could possibly hold. */
+    {
+        /* Header says 0x00FFFFFF ops but buffer is only 4 bytes — too small. */
+        uint8_t huge_ops[4] = { 0x00, 0xFF, 0xFF, 0xFF };
+        d = delta_deserialize(huge_ops, 4, &err);
+        CHECK(d == NULL && err < 0);
+    }
 
     /* Zero n_ops (invalid). */
-    uint8_t zero_ops[8] = { 0x46,0x53,0x44,0x00, 0,0,0,0 };
-    d = delta_deserialize(zero_ops, 8, &err);
+    uint8_t zero_ops[4] = { 0, 0, 0, 0 };
+    d = delta_deserialize(zero_ops, 4, &err);
     CHECK(d == NULL && err < 0);
 
     /* Invalid op kind (0 is reserved). */
@@ -224,7 +223,7 @@ static void test_delta_deser_errors(void)
         uint8_t *buf = delta_serialize(src, &len);
         delta_free(src);
         CHECK(buf != NULL);
-        buf[8] = 0;  /* kind byte → 0 (reserved/invalid) */
+        buf[4] = 0;  /* kind byte → 0 (reserved/invalid); header is 4 bytes */
         d = delta_deserialize(buf, len, &err);
         CHECK(d == NULL && err < 0);
         free(buf);
@@ -238,8 +237,8 @@ static void test_delta_deser_errors(void)
         uint8_t *buf = delta_serialize(src, &len);
         delta_free(src);
         CHECK(buf != NULL);
-        /* Path starts at byte 11 (header 8 + kind 1 + path_len 2). */
-        buf[11] = 'x';  /* change '/' to 'x' */
+        /* Path starts at byte 7 (header 4 + kind 1 + path_len 2). */
+        buf[7] = 'x';  /* change '/' to 'x' */
         d = delta_deserialize(buf, len, &err);
         CHECK(d == NULL && err < 0);
         free(buf);
@@ -254,8 +253,9 @@ static void test_delta_deser_errors(void)
         uint8_t *buf = delta_serialize(src, &len);
         delta_free(src);
         CHECK(buf != NULL);
-        /* Truncate to just past the path_len field. */
-        d = delta_deserialize(buf, 12, &err);
+        /* Truncate to just past the path_len field (header 4 + kind 1 + path_len 2 = 7,
+         * +1 so path_len bytes are present but path data is missing). */
+        d = delta_deserialize(buf, 8, &err);
         CHECK(d == NULL && err < 0);
         free(buf);
     }
@@ -803,86 +803,6 @@ static void test_vfs_checksum(void)
 }
 
 /* -------------------------------------------------------------------------
- * 15. rejection_rate — measure how many random byte mutations parse OK
- *
- * Creates a small valid delta, serializes it, then applies 10 000 random
- * single-byte overwrites and measures the fraction that delta_deserialize
- * accepts.  Prints the result with a recommendation.
- *
- * This test is informational; it does not assert a specific pass/fail
- * threshold (the result is documented in docs/mutation_model.md).
- * ---------------------------------------------------------------------- */
-
-static void test_rejection_rate(void)
-{
-    printf("  rejection_rate (10 000 trials — informational)\n");
-
-    /* Build a representative 3-op delta. */
-    fs_delta_t *seed = delta_create();
-    delta_add_create_file(seed, "/fuzz/input.bin",
-                          (const uint8_t *)"\x41\x42\x43\x44\x45", 5);
-    delta_add_update_file(seed, "/fuzz/input.bin",
-                          (const uint8_t *)"\xff\x00\x7f", 3);
-    delta_add_set_times(seed, "/fuzz/input.bin", NULL, NULL);
-
-    size_t seed_len = 0;
-    uint8_t *seed_buf = delta_serialize(seed, &seed_len);
-    delta_free(seed);
-
-    if (!seed_buf) {
-        printf("    SKIP: could not serialize seed delta\n");
-        return;
-    }
-
-    /* Simple LCG PRNG for reproducibility (seed = 0xdeadbeef). */
-    uint64_t rng_state = 0xdeadbeefULL;
-    #define LCG_NEXT() \
-        (rng_state = rng_state * 6364136223846793005ULL + 1442695040888963407ULL)
-
-    const int TRIALS = 10000;
-    int accepted = 0;
-
-    for (int t = 0; t < TRIALS; t++) {
-        /* Copy the seed buffer. */
-        uint8_t *mut = malloc(seed_len);
-        if (!mut) continue;
-        memcpy(mut, seed_buf, seed_len);
-
-        /* Random single-byte overwrite at a random position. */
-        size_t pos   = (size_t)(LCG_NEXT() % seed_len);
-        uint8_t val  = (uint8_t)(LCG_NEXT() & 0xff);
-        mut[pos] = val;
-
-        int err = 0;
-        fs_delta_t *d = delta_deserialize(mut, seed_len, &err);
-        if (d != NULL) { accepted++; delta_free(d); }
-        free(mut);
-    }
-
-    #undef LCG_NEXT
-
-    free(seed_buf);
-
-    double rejected_pct = 100.0 * (TRIALS - accepted) / TRIALS;
-    printf("    %d / %d mutations accepted  (rejection rate: %.1f%%)\n",
-           TRIALS - accepted, TRIALS, rejected_pct);
-
-    if (rejected_pct < 70.0) {
-        printf("    Recommendation: rejection rate < 70%% → "
-               "byte-buffer Input is viable for LibAFL\n");
-    } else {
-        printf("    Recommendation: rejection rate >= 70%% → "
-               "use structured fs_delta_t with custom mutator stages\n");
-    }
-
-    /*
-     * Bump check counter to confirm the test ran (it always passes).
-     * The actual measurement is printed above for the human reader.
-     */
-    g_checks++;   /* count as one check: the trial completed without crash */
-}
-
-/* -------------------------------------------------------------------------
  * Entry point
  * ---------------------------------------------------------------------- */
 
@@ -905,7 +825,6 @@ int main(void)
     test_apply_dry_run();
     test_apply_mutate_reset();
     test_vfs_checksum();
-    test_rejection_rate();
 
     printf("\n========================\n");
     if (g_failures == 0) {

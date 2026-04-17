@@ -114,3 +114,101 @@ environment.
 Future benchmarks must exceed **10,000 ops/sec** in this environment to be
 considered acceptable. A result below this threshold requires investigation
 before proceeding.
+
+---
+
+# Week 5 — In-Memory VFS Baseline (Phase A)
+
+## Purpose
+
+Establishes the raw cost of `vfs_reset_to_snapshot` and `cp_apply_delta` with no
+FUSE layer, no mutator overhead, and no target execution.  These numbers set the
+budget for the full fuzzing loop once the FUSE target is wired in (Phase B /
+Week 6).
+
+## Method
+
+Binary: `mutator/src/bin/vfs_bench.rs`
+Build:  `cargo build --release --bin vfs_bench`
+Run:    `cargo run --release --bin vfs_bench -- 2000`
+
+Baseline VFS tree: `/input` (4 B), `/etc/`, `/etc/config` (20 B),
+`/data/`, `/data/a.bin` (4 B).  Snapshot saved once; all iterations restore
+to this snapshot.
+
+## Machine
+
+| Property    | Value                                             |
+|-------------|---------------------------------------------------|
+| OS          | Linux 6.8.0-90-generic x86_64 (Ubuntu)           |
+| Rust        | 1.95.0 (stable, rustup)                           |
+| Build       | `--release` (`opt-level = 3`, no debug info)      |
+| Iterations  | 2000 per benchmark                                |
+
+## Results (April 2026)
+
+### Benchmark 1 — `vfs_reset_to_snapshot` only (no prior apply)
+
+| Metric | Value     |
+|--------|-----------|
+| mean   | 321 ns    |
+| min    | 300 ns    |
+| max    | 7 351 ns  |
+| rate   | 3.1 M/s   |
+
+The max spike (7 µs) is a Linux scheduler jitter event, not a VFS pathology.
+The mean is the number to track.
+
+### Benchmark 2 — `apply_delta` + reset (small delta, 1 op)
+
+| Stage          | mean   | min    | max    | rate        |
+|----------------|--------|--------|--------|-------------|
+| apply (1 op)   | 182 ns | 160 ns | 6.2 µs | 5.5 M/s    |
+| reset          | 322 ns | 300 ns | 490 ns | 3.1 M/s    |
+| **combined**   | ~504 ns |       |        | **~2.0 M/s** |
+
+### Benchmark 3 — `apply_delta` + reset (medium delta, 3 ops)
+
+| Stage          | mean   | min    | max    | rate        |
+|----------------|--------|--------|--------|-------------|
+| apply (3 ops)  | 646 ns | 590 ns | 2.2 µs | 1.5 M/s    |
+| reset          | 405 ns | 369 ns | 6.0 µs | 2.5 M/s    |
+| **combined**   | ~1.1 µs |       |        | **~950 K/s** |
+
+### Benchmark 4 — `apply_delta` + reset (large delta, 10 ops)
+
+| Stage           | mean   | min    | max     | rate       |
+|-----------------|--------|--------|---------|------------|
+| apply (10 ops)  | 3.2 µs | 2.6 µs | 20.2 µs | 311 K/s   |
+| reset           | 1.1 µs | 760 ns | 7.8 µs  | 945 K/s   |
+| **combined**    | ~4.3 µs |        |         | **~235 K/s** |
+
+### Dumb loop (fuzz harness, 200 iterations, all 6 mutators, mixed deltas)
+
+| Metric                        | Value  |
+|-------------------------------|--------|
+| apply ok / total              | 200/200 |
+| reset ok / total              | 200/200 |
+| reset mean                    | 261 ns |
+| reset min                     | 210 ns |
+| reset max                     | 640 ns |
+
+## Interpretation
+
+- A typical fuzzing delta (1–3 ops) costs **500 ns – 1.1 µs** for the full
+  apply + reset cycle.  At 1 µs/iter the VFS alone supports **~1 M iters/s**.
+- Once FUSE target execution is added, each iteration will dominate at
+  milliseconds — the VFS overhead is entirely negligible.
+- Reset scales linearly with the number of nodes dirtied: the baseline tree
+  (5 nodes) resets in ~320 ns; a 10-op apply that creates 8 new files resets
+  in ~1.1 µs.
+
+## Regression Threshold (Week 5)
+
+A future change is a regression if:
+
+| Scenario                   | Threshold   |
+|----------------------------|-------------|
+| reset (baseline tree only) | > 2 µs mean |
+| apply + reset (1 op)       | > 3 µs mean |
+| apply + reset (3 ops)      | > 5 µs mean |

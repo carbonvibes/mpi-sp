@@ -1,0 +1,25 @@
+[package]
+name = "fs-mutator"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "fs_mutator"
+
+[[bin]]
+name = "fuzz"
+path = "src/bin/fuzz.rs"
+
+[[bin]]
+name = "vfs_bench"
+path = "src/bin/vfs_bench.rs"
+
+[dependencies]
+libafl        = "0.15"
+libafl_bolts  = "0.15"
+serde         = { version = "1", features = ["derive"] }
+libc          = "0.2"
+
+[profile.release]
+opt-level     = 3
+debug         = false

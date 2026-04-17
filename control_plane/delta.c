@@ -2,12 +2,14 @@
  * delta.c — fs_delta_t implementation: lifecycle, convenience constructors,
  *            serialization, deserialization, checksum, and dump utilities.
  *
+ * Wire format header:  n_ops(4)
  * Wire format per op:
  *   kind(1) | path_len(2) | path(path_len) |
  *   size(4) | data_len(4) | data(data_len) |
- *   mtime_sec(8) | mtime_nsec(8) | atime_sec(8) | atime_nsec(8)
+ *   has_ts(1) | [if has_ts: mtime_sec(8) | mtime_nsec(8) | atime_sec(8) | atime_nsec(8)]
  *
- * Total fixed overhead per op: 1+2+4+4+8+8+8+8 = 43 bytes.
+ * Minimum fixed overhead per op (no timestamps): 1+2+4+4+1 = 12 bytes.
+ * SET_TIMES ops additionally carry 32 bytes of timestamp data.
  */
 
 #include "delta.h"
@@ -192,7 +194,7 @@ uint8_t *delta_serialize(const fs_delta_t *d, size_t *out_len)
     if (!d || d->n_ops == 0) return NULL;
 
     /* Calculate total buffer size. */
-    size_t total = 8; /* magic(4) + n_ops(4) */
+    size_t total = 4; /* n_ops(4) */
     for (size_t i = 0; i < d->n_ops; i++) {
         const fs_op_t *op = &d->ops[i];
         size_t path_len = op->path ? strlen(op->path) : 0;
@@ -204,16 +206,17 @@ uint8_t *delta_serialize(const fs_delta_t *d, size_t *out_len)
                           ? op->content_len : 0;
 
         total += DELTA_OP_FIXED + path_len + data_len;
+        if (op->kind == FS_OP_SET_TIMES)
+            total += DELTA_TS_SIZE;  /* timestamps only for SET_TIMES */
     }
 
-    uint8_t *buf = calloc(1, total);  /* calloc zeros; unused fields stay 0 */
+    uint8_t *buf = calloc(1, total);
     if (!buf) return NULL;
 
-    /* Header */
-    w32be(buf + 0, DELTA_MAGIC);
-    w32be(buf + 4, (uint32_t)d->n_ops);
+    /* Header: just n_ops */
+    w32be(buf + 0, (uint32_t)d->n_ops);
 
-    size_t pos = 8;
+    size_t pos = 4;
     for (size_t i = 0; i < d->n_ops; i++) {
         const fs_op_t *op = &d->ops[i];
         size_t path_len = op->path ? strlen(op->path) : 0;
@@ -238,10 +241,16 @@ uint8_t *delta_serialize(const fs_delta_t *d, size_t *out_len)
         }
         pos += data_len;
 
-        w64be(buf + pos, (int64_t)op->mtime.tv_sec);  pos += 8;
-        w64be(buf + pos, (int64_t)op->mtime.tv_nsec); pos += 8;
-        w64be(buf + pos, (int64_t)op->atime.tv_sec);  pos += 8;
-        w64be(buf + pos, (int64_t)op->atime.tv_nsec); pos += 8;
+        /* has_ts flag: 1 only for SET_TIMES, 0 for all other kinds */
+        if (op->kind == FS_OP_SET_TIMES) {
+            buf[pos++] = 1;
+            w64be(buf + pos, (int64_t)op->mtime.tv_sec);  pos += 8;
+            w64be(buf + pos, (int64_t)op->mtime.tv_nsec); pos += 8;
+            w64be(buf + pos, (int64_t)op->atime.tv_sec);  pos += 8;
+            w64be(buf + pos, (int64_t)op->atime.tv_nsec); pos += 8;
+        } else {
+            buf[pos++] = 0;  /* no timestamps */
+        }
     }
 
     *out_len = total;
@@ -264,17 +273,16 @@ fs_delta_t *delta_deserialize(const uint8_t *buf, size_t len, int *err_out)
 {
     *err_out = 0;
 
-    /* Minimum: magic(4) + n_ops(4) */
-    if (len < 8) { *err_out = -EINVAL; return NULL; }
-    if (r32be(buf) != DELTA_MAGIC) { *err_out = -EINVAL; return NULL; }
+    /* Minimum: n_ops(4) */
+    if (len < 4) { *err_out = -EINVAL; return NULL; }
 
-    uint32_t n_ops = r32be(buf + 4);
+    uint32_t n_ops = r32be(buf + 0);
     if (n_ops == 0 || n_ops > 65535u) { *err_out = -EINVAL; return NULL; }
 
     fs_delta_t *d = delta_create();
     if (!d) { *err_out = -ENOMEM; return NULL; }
 
-    size_t pos = 8;
+    size_t pos = 4;
 
     for (uint32_t i = 0; i < n_ops; i++) {
         int      err     = 0;
@@ -314,12 +322,18 @@ fs_delta_t *delta_deserialize(const uint8_t *buf, size_t len, int *err_out)
         }
         pos += data_len;
 
-        /* timestamps */
-        NEED(32);
-        int64_t mtime_sec  = r64be(buf + pos); pos += 8;
-        int64_t mtime_nsec = r64be(buf + pos); pos += 8;
-        int64_t atime_sec  = r64be(buf + pos); pos += 8;
-        int64_t atime_nsec = r64be(buf + pos); pos += 8;
+        /* has_ts flag: timestamps follow only for SET_TIMES ops */
+        NEED(1);
+        uint8_t has_ts = buf[pos++];
+
+        int64_t mtime_sec = 0, mtime_nsec = 0, atime_sec = 0, atime_nsec = 0;
+        if (has_ts) {
+            NEED(32);
+            mtime_sec  = r64be(buf + pos); pos += 8;
+            mtime_nsec = r64be(buf + pos); pos += 8;
+            atime_sec  = r64be(buf + pos); pos += 8;
+            atime_nsec = r64be(buf + pos); pos += 8;
+        }
 
         /*
          * content_len semantics:

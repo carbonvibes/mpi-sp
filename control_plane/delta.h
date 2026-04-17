@@ -3,11 +3,11 @@
  *
  * A delta (fs_delta_t) is an ordered list of typed filesystem operations
  * (fs_op_t).  It is the canonical testcase representation: the fuzzer
- * produces deltas, and the control plane applies them to the live VFS.
+ * produces deltas via Rust mutator stages, and the control plane applies
+ * them to the live VFS via cp_apply_delta().
  *
- * Wire format (compact binary, designed for AFL byte-mutation):
+ * Wire format (compact binary):
  *
- *   [magic  u32 BE]            — 0x46534400 ("FSD\0")
  *   [n_ops  u32 BE]            — number of ops; 0 is invalid
  *   per op:
  *     [kind      u8   ]        — fs_op_kind_t value (1–7); 0 reserved
@@ -21,15 +21,18 @@
  *                                  CREATE_FILE/UPDATE_FILE: == size
  *                                  all others:             0
  *     [data      bytes]        — data_len bytes of content
- *     [mtime_sec  s64 BE]      — SET_TIMES only; 0 otherwise
- *     [mtime_nsec s64 BE]
- *     [atime_sec  s64 BE]
- *     [atime_nsec s64 BE]
+ *     [has_ts    u8   ]        — 1 if timestamps follow; 0 otherwise
+ *                                  only SET_TIMES ops set this to 1
+ *     if has_ts:
+ *       [mtime_sec  s64 BE]
+ *       [mtime_nsec s64 BE]
+ *       [atime_sec  s64 BE]
+ *       [atime_nsec s64 BE]
  *
- * Keeping all fields present for every op (unused ones zeroed) means AFL
- * can flip timestamp bytes or size bytes without invalidating the parse.
- * Only the magic, n_ops, kind, path_len, path, data_len, and data bytes
- * are structurally load-bearing for the deserializer.
+ * The Rust mutator stages always re-serialize from a valid fs_delta_t so
+ * the format is never byte-flipped by the fuzzer.  Timestamps are therefore
+ * only stored when they carry real data (SET_TIMES ops), saving 32 bytes per
+ * op on all other kinds.
  */
 
 #ifndef DELTA_H
@@ -82,11 +85,12 @@ typedef struct {
     size_t   cap;    /* allocated capacity (internal) */
 } fs_delta_t;
 
-/* Wire format magic ("FSD\0" big-endian u32). */
-#define DELTA_MAGIC 0x46534400u
+/* Per-op minimum fixed overhead in the wire format (bytes),
+ * excluding path, data, and conditional timestamps. */
+#define DELTA_OP_FIXED 12u   /* 1(kind)+2(path_len)+4(size)+4(data_len)+1(has_ts) */
 
-/* Per-op fixed overhead in the wire format (bytes), excluding path and data. */
-#define DELTA_OP_FIXED 43u   /* 1+2+4+4+8+8+8+8 */
+/* Timestamp block size — only present when has_ts == 1 (SET_TIMES ops). */
+#define DELTA_TS_SIZE  32u   /* 4 × s64: mtime_sec, mtime_nsec, atime_sec, atime_nsec */
 
 /* -------------------------------------------------------------------------
  * Lifecycle

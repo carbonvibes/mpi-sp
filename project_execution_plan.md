@@ -328,13 +328,15 @@ Exit criteria met:
 
 ### Week 5: Build The LibAFL Mutator Stages And Close The Feedback Loop
 
-Objectives:
+This week is split into two explicit phases. **Phase A is the priority and must
+finish.** Phase B is best-effort and can slip into Week 6 without touching the
+Week 7 milestone, because the demo harness only needs a working mutator and
+dumb loop — not guidance.
 
-- implement the concrete LibAFL mutator stages that operate on `fs_delta_t`
-- implement per-iteration write logging in the FUSE callbacks to capture target-side filesystem activity
-- wire the full per-iteration feedback loop: apply delta → run target → read log → act on signals → reset
-
-Context: a LibAFL mutator is not something that ships ready-made. Each mutator stage is a function that takes an existing `fs_delta_t` and returns a modified one. Multiple stages are composed into a mutation pipeline. The generator from Week 4 seeds the initial corpus; the mutator stages diversify it.
+Context: a LibAFL mutator is not something that ships ready-made. Each mutator
+stage is a function that takes an existing `fs_delta_t` and returns a modified
+one. Multiple stages are composed into a mutation pipeline. The generator from
+Week 4 seeds the initial corpus; the mutator stages diversify it.
 
 Concrete mutator stages to build:
 
@@ -345,7 +347,7 @@ Concrete mutator stages to build:
 - `MutatePath` — change the path component of an existing op (tests path-sensitive behavior)
 - `SpliceDelta` — take ops from two different deltas and combine them (LibAFL splice analog)
 
-Feedback loop — per-iteration model:
+Feedback loop — per-iteration model (implemented in Phase B):
 
 ```
 1. Clear the iteration log
@@ -370,12 +372,98 @@ Feedback loop — per-iteration model:
 7. Reset to the baseline snapshot for the next iteration
 ```
 
+---
+
+#### Phase A — Must Finish (Mutator Stages, Generator, Dumb Loop)
+
+Objectives:
+
+- implement all mutator stages with the guidance interface stubbed out
+- clean up the serialization format
+- run a working dumb loop: apply delta → run target → reset, no feedback
+
+The mutator stages accept a `mutation_guidance_t *` parameter from the start
+(so Phase B is pure wiring, not a refactor), but pass `NULL` for now:
+
+```c
+typedef struct {
+    const char **enoent_paths;  /* bias AddFileOp toward these */
+    size_t       n_enoent;
+    const char **recreate_paths; /* UNLINK/RENAME_FROM signal */
+    size_t       n_recreate;
+} mutation_guidance_t;
+
+fs_delta_t *mutate(const fs_delta_t *in, const mutation_guidance_t *guidance);
+/*                                        ^ NULL during Phase A */
+```
+
 Concrete steps:
 
-1. add a per-iteration write log to the FUSE layer:
+1. implement each mutator stage listed above as a separate LibAFL `MutationStage`,
+   accepting `mutation_guidance_t *` (ignored when NULL)
+2. manually test each mutator stage in isolation before composing them
+3. implement the dumb per-iteration harness loop:
+   - apply delta via control plane (direct VFS API)
+   - fork/exec target
+   - reset to baseline
+   - no logging, no guidance — confirm the loop is stable over 10+ iterations
+4. **clean up the serialization format:**
+   - remove the magic number (`DELTA_MAGIC`, bytes 0–3) from the wire format
+     and from `delta_serialize` / `delta_deserialize` — with custom mutators
+     always re-serializing from a valid `fs_delta_t`, the magic check never
+     fires and wastes 4 bytes of every corpus entry
+   - remove the always-present timestamp fields from ops that are not `SET_TIMES`
+     — currently every op carries 32 bytes of zeros for mtime/atime regardless
+     of kind; replace with a presence flag byte so only `SET_TIMES` ops pay the
+     timestamp cost; for a delta with 20 ops this removes ~608 bytes of zeros
+     per corpus entry
+   - remove or retire the `rejection_rate` test suite — keep the result
+     documented in `docs/mutation_model.md` as historical rationale but stop
+     running it as a live test
+   - update `DELTA_OP_FIXED` and any size calculations; verify roundtrip tests pass
+5. **measure reset cost and FUSE overhead:**
+   - instrument `vfs_reset_to_snapshot` with a timer; record per-reset cost
+   - if reset cost exceeds 1ms for the demo tree size, evaluate pulling the
+     journal/CoW optimisation forward from Week 8
+   - benchmark `vfs_read` in a tight loop with no FUSE mount (direct C API only);
+     compare to the 13.8k ops/sec FUSE number — this ratio is the kernel FUSE
+     overhead tax and goes directly in the paper
+
+Phase A testing and validation:
+
+- mutator stage unit tests: each stage produces a valid `fs_delta_t`
+  (well-formed paths, non-empty ops list) with `guidance = NULL`
+- dumb loop integration test: run 10 iterations with reset between each,
+  confirm no stale state and the loop is deterministic
+- serialization roundtrip tests still pass after format change
+- reset cost and direct VFS vs FUSE overhead ratio recorded in
+  `docs/benchmark_baseline.md`
+
+Phase A exit criteria:
+
+- all mutator stages produce valid deltas
+- dumb loop runs stably over multiple iterations with reset
+- serialization format cleaned up and roundtrip tests pass
+- reset cost and FUSE overhead ratio measured and documented
+
+---
+
+#### Phase B — Best Effort (FUSE Logging, Guidance Wiring)
+
+Objectives:
+
+- add per-iteration write logging to FUSE callbacks
+- wire log output into `mutation_guidance_t` so the closed feedback loop is live
+
+If Phase A runs long, Phase B slips to Week 6. The Week 6 demo and Week 7
+milestone do not depend on it.
+
+Concrete steps:
+
+1. add the per-iteration write log to the FUSE layer:
    - define `fuse_iter_log_t`: a fixed-capacity array of
-     `{char path[VFS_PATH_MAX], event_t kind}` entries where
-     `event_t` is `LOG_CREATE | LOG_WRITE | LOG_MKDIR | LOG_RENAME_FROM | LOG_RENAME_TO | LOG_UNLINK | LOG_RMDIR | LOG_ENOENT`
+     `{char path[VFS_PATH_MAX], event_t kind}` entries where `event_t` is
+     `LOG_CREATE | LOG_WRITE | LOG_MKDIR | LOG_RENAME_FROM | LOG_RENAME_TO | LOG_UNLINK | LOG_RMDIR | LOG_ENOENT`
    - add a global `bool g_target_running` flag (false by default)
    - add logging calls in `fvfs_create`, `fvfs_write`, `fvfs_mkdir`,
      `fvfs_rename` (emits both RENAME_FROM and RENAME_TO), `fvfs_unlink`,
@@ -387,51 +475,30 @@ Concrete steps:
      not copied per-callback)
    - expose `fuse_log_clear()`, `fuse_log_set_active(bool)`, and
      `fuse_log_get()` as the control interface
-2. implement each mutator stage listed above as a separate LibAFL `MutationStage`
-3. implement the full per-iteration harness loop:
-   - call `fuse_log_clear()` and `fuse_log_set_active(true)`
-   - apply delta via control plane (direct VFS API — not logged)
-   - fork/exec target
-   - call `fuse_log_set_active(false)`
-   - read the log: promote write-set paths, queue UNLINK/RENAME_FROM paths
-     as creation guidance, queue ENOENT paths as missing-path signal
+2. upgrade the harness loop from dumb to guided:
+   - call `fuse_log_clear()` and `fuse_log_set_active(true)` before the target
+   - call `fuse_log_set_active(false)` after the target exits
+   - populate `mutation_guidance_t` from the log and pass it to the next mutate call
+   - promote write-set paths as new corpus seeds
    - reset to baseline
-4. manually test each mutator stage in isolation before composing them
 
-6. **clean up the serialization format now that dumb byte mutation is no longer the primary path:**
-   - remove the magic number (`DELTA_MAGIC`, bytes 0–3) from the wire format and from `delta_serialize` / `delta_deserialize` — with custom mutators always re-serializing from a valid `fs_delta_t`, the magic check never fires and wastes 4 bytes of every corpus entry
-   - remove the always-present timestamp fields from ops that are not `SET_TIMES` — currently every op carries 32 bytes of zeros for mtime/atime regardless of kind; replace with a presence flag byte so only `SET_TIMES` ops pay the timestamp cost; for a delta with 20 ops this removes ~608 bytes of zeros per corpus entry
-   - remove or retire the `rejection_rate` test suite — it measured viability of dumb byte mutation as a floor; with semantic mutators the rejection rate on the actual mutation path is zero by construction; keep the result documented in `docs/mutation_model.md` as a historical rationale but stop running it as a live test
-   - update `DELTA_OP_FIXED` and any size calculations to match the new compact layout
-   - verify the serialize/deserialize roundtrip tests still pass after the format change
+Phase B testing and validation:
 
-7. **measure reset cost and FUSE overhead:**
-   - instrument `vfs_reset_to_snapshot` with a timer in the iteration loop; record per-reset cost
-   - if reset cost exceeds 1ms for the demo tree size, evaluate pulling the journal/CoW optimisation forward from Week 8
-   - write a small benchmark calling `vfs_read` in a tight loop with no FUSE mount (direct C API only); compare to the existing 13.8k ops/sec FUSE number — this ratio quantifies the kernel FUSE overhead tax and goes directly in the paper
-
-Testing and validation:
-
-- write-log unit tests: verify each event kind (CREATE, WRITE, MKDIR, RENAME_FROM,
-  RENAME_TO, UNLINK, RMDIR, ENOENT) is logged correctly when `g_target_running` is true
-- suppression test: apply a delta with `g_target_running = false` and confirm no
-  entries appear in the log (fuzzer writes via direct VFS API must never be logged)
+- write-log unit tests: verify each event kind is logged correctly when
+  `g_target_running` is true
+- suppression test: apply a delta with `g_target_running = false` and confirm
+  no entries appear (fuzzer writes via direct VFS API must never be logged)
 - deduplication test: two writes to the same path produce exactly one LOG_WRITE entry
-- mutator stage unit tests: verify each stage produces a valid `fs_delta_t` (well-formed paths, non-empty ops list)
-- end-to-end test: run a fake target that creates a file, writes to it, deletes another,
-  and requests a missing path; verify the log captures all four event types correctly
-- feedback loop integration test: run 10 iterations with reset between each, confirm no stale state
-- reset cost recorded in `docs/benchmark_baseline.md`
-- direct VFS vs FUSE overhead ratio recorded
+- end-to-end test: fake target creates a file, writes to it, deletes another,
+  and requests a missing path; verify the log captures all four event types
+- feedback loop integration test: 10 guided iterations with reset, no stale state
 
-Exit criteria:
+Phase B exit criteria:
 
-- per-iteration write log is implemented in FUSE callbacks and tested
-- fuzzer writes (via direct VFS API) are confirmed absent from the log
-- all mutator stages produce valid deltas
-- the full per-iteration feedback loop runs without stale state
-- target-side write-set and ENOENT paths are captured and usable by the mutator
-- reset cost and FUSE overhead ratio measured and documented
+- per-iteration write log implemented in FUSE callbacks and tested
+- fuzzer writes (via direct VFS API) confirmed absent from the log
+- `mutation_guidance_t` populated from log and consumed by mutator stages
+- closed feedback loop runs without stale state
 
 ### Week 6: Build The Minimal End-To-End Demo Harness
 
@@ -754,14 +821,18 @@ If time remains after that, do:
 
 Weeks 1–3, the pre-Week 4 side quest, and Week 4 are done. The immediate next sequence is:
 
-1. **Week 5 — mutator stages + feedback loop + measurements**:
+1. **Week 5 Phase A — mutator stages + dumb loop + measurements (must finish)**:
+   - implement LibAFL mutator stages (`ByteFlipFileContent`, `AddFileOp`, `RemoveOp`, `MutatePath`, `SpliceDelta`, `ReplaceFileContent`) with `mutation_guidance_t *` stubbed as `NULL`
+   - run the dumb loop: apply delta → run target → reset, no feedback
+   - clean up serialization format (remove magic number and always-present timestamps)
+   - instrument `vfs_reset_to_snapshot` with a timer; record per-reset cost
+   - run direct VFS API benchmark (no FUSE) and record FUSE overhead ratio
+
+2. **Week 5 Phase B — FUSE logging + guidance wiring (best effort, can slip to Week 6)**:
    - implement per-iteration write log in FUSE callbacks (`fvfs_create`, `fvfs_write`,
      `fvfs_mkdir`, `fvfs_rename`, `fvfs_unlink`, `fvfs_rmdir`, ENOENT in `fvfs_getattr`)
      with `g_target_running` flag gating all logging
-   - implement LibAFL mutator stages (`ByteFlipFileContent`, `AddFileOp`, `RemoveOp`, `MutatePath`, `SpliceDelta`, `ReplaceFileContent`)
-   - wire the full per-iteration feedback loop: clear log → set active → apply delta → run target → deactivate → process log → reset
-   - instrument `vfs_reset_to_snapshot` with a timer; record per-reset cost
-   - run direct VFS API benchmark (no FUSE) and record FUSE overhead ratio
+   - wire log output into `mutation_guidance_t` and enable the closed feedback loop
 
 2. **Week 6 — demo harness**: minimal crash target, end-to-end harness run with seeded crashing input
 
