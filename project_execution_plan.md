@@ -707,53 +707,182 @@ Exit criteria:
 
 This week is the latest acceptable point for achieving the first major milestone. If it slips beyond Week 7, the project scope must be reduced immediately.
 
-### Week 8: Scale Snapshotting And Begin Real-World Integration
+### Week 8: Op Vocabulary Expansion + Scale Snapshotting + Real-World Integration Begin
 
 Objectives:
 
-- replace the deep-copy snapshot restore with a journal/diff approach before scaling to real rootfs sizes
-- import a real baseline filesystem (e.g. a minimal container rootfs) into the VFS
-- begin integration with the container-runtime setup
+- expand `FsOpKind` to cover the full attack surface of OCI container
+  runtimes (symlinks, xattrs, permissions, ownership) — the current 7
+  ops are insufficient for real-world targets
+- replace the deep-copy snapshot restore with a journal/diff approach
+  before scaling to real rootfs sizes
+- import a real baseline filesystem (e.g. a minimal container rootfs)
+  into the VFS and begin integration with the container-runtime setup
 
-Context: the current `vfs_reset_to_snapshot` deep-copies the entire tree — O(total filesystem size). For a full container rootfs this will be a bottleneck and must be replaced before real-world integration.
+Context: the Week 6 demo proves the framework works end-to-end against a
+trivial `foobar` target.  Week 8 is the bridge to the real target.  Two
+blockers exist before any meaningful campaign against an OCI runtime:
+(1) the op vocabulary is missing the operations that matter most for
+container security — symlinks, xattrs, permissions, ownership; (2) the
+deep-copy snapshot restore is O(total filesystem size) and will be a
+bottleneck on a full rootfs.  Both must be resolved in Week 8.
+
+#### Part A — Op Vocabulary Expansion
+
+The current 7 `FsOpKind` variants cover the basic filesystem surface.
+Container runtimes validate rootfs structures that depend critically on
+four additional op classes:
+
+| New op | Why it matters | Container runtime bug class |
+|---|---|---|
+| `CreateSymlink(path, target)` | Symlink traversal attacks are the primary container escape vector. Runtimes must validate symlinks before exposing them to containerised processes. Without this op the entire symlink attack surface is unreachable. | Container escape via path traversal (CVE class) |
+| `SetXattr(path, name, value)` / `RemoveXattr(path, name)` | File capabilities (`security.capability`), SELinux labels, AppArmor labels are stored as xattrs. Runtimes parse and apply these during container setup. The spec explicitly lists xattrs as a target op. | Privilege escalation via capability xattr manipulation |
+| `Chmod(path, mode)` | Permission bits — setuid, setgid, sticky — are security-critical in a rootfs. Runtimes check and strip dangerous modes. Without this op the permission-handling code paths are never exercised. | setuid binary escapes, sticky-dir mishandling |
+| `Chown(path, uid, gid)` | uid/gid ownership — containers run processes as specific uids mapped through the user namespace. Bugs here can produce privilege escalation inside the container or across the namespace boundary. | uid-mapping bypass, chown-to-root mishandling |
+
+**Concrete implementation steps for each new op:**
+
+For every new op kind the change is mechanical and self-contained:
+
+1. Add variant to `FsOpKind` enum in `mutator/src/delta.rs`
+2. Add fields to `FsOp` struct (e.g. `symlink_target: String` for
+   `CreateSymlink`; `xattr_name/value: Vec<u8>` for xattr ops;
+   `mode: u32` for Chmod; `uid/gid: u32` for Chown)
+3. Add constructor to `FsOp` (e.g. `FsOp::create_symlink(path, target)`)
+4. Add VFS operation to `vfs/vfs.c` if not already present
+   (`vfs_symlink`, `vfs_setxattr`, `vfs_removexattr`, `vfs_chmod`,
+   `vfs_chown`)
+5. Add C FFI in `control_plane/delta.h` / `delta.c`:
+   `delta_add_symlink`, `delta_add_set_xattr`, `delta_add_remove_xattr`,
+   `delta_add_chmod`, `delta_add_chown`
+6. Add Rust FFI binding in `mutator/src/ffi.rs` and wire into
+   `apply_delta()` match arm
+7. Expose the FUSE callback in `vfs/fvfs.c` so the mounted filesystem
+   actually honours the new op
+8. Extend the mutators that generate ops:
+   - `AddFileOp`: can now emit `CreateSymlink` (30% when guidance
+     provides a path the target tried to dereference)
+   - `DestructiveMutator`: can now emit `Chmod` (strip or set dangerous
+     mode bits) and `RemoveXattr`
+   - New `XattrMutator` stage (9th stage): targets existing files with
+     `SetXattr` — draws capability / label names from a dictionary
+     (`security.capability`, `security.selinux`, `user.overlay.*`)
+9. Add seeds to `generate_seed_corpus` and `initial_corpus_pool` that
+   exercise the new ops
+
+**Op vocabulary priority order** (implement in this order; stop if time
+runs short):
+
+1. `CreateSymlink` — highest priority, largest unreachable attack surface
+2. `SetXattr` / `RemoveXattr` — explicitly in the spec, capability bugs
+3. `Chmod` — setuid/setgid mishandling
+4. `Chown` — uid/gid mapping bugs (lowest priority, revisit in Week 9)
+
+**Dictionary additions for new ops:**
+
+```rust
+// Xattr names of interest to container runtimes
+static XATTR_DICTIONARY: &[&str] = &[
+    "security.capability",
+    "security.selinux",
+    "security.apparmor",
+    "user.overlay.opaque",
+    "user.overlay.redirect",
+    "trusted.overlay.opaque",
+];
+
+// Interesting mode bits for Chmod
+static MODE_DICTIONARY: &[u32] = &[
+    0o4755,   // setuid + rwxr-xr-x
+    0o2755,   // setgid + rwxr-xr-x
+    0o1777,   // sticky + rwxrwxrwx (world-writable sticky dir)
+    0o0000,   // no permissions
+    0o0777,   // world-writable
+    0o0755,   // normal executable
+];
+```
+
+Testing for new ops:
+- unit test per new op constructor: verify fields set correctly
+- E2E FFI test per new op: apply through full FFI bridge, confirm VFS
+  state updated correctly
+- `FuseLogObserver` extended to log `SYMLINK`, `SETXATTR` events so the
+  feedback loop can see when the target chases these paths
+
+#### Part B — Scale Snapshotting
+
+Context: the current `vfs_reset_to_snapshot` deep-copies the entire tree
+— O(total filesystem size). For a full container rootfs this will be a
+bottleneck and must be replaced before real-world integration.
 
 **[Evaluate before implementing] write a journal vs CoW design comparison first:**
 
-Two approaches exist and both have real tradeoffs. Decide before writing any restore code:
+Two approaches exist and both have real tradeoffs. Decide before writing
+any restore code:
 
-- **Journal**: each VFS mutation pushes a reverse entry; restore replays in reverse — O(delta size). Incremental change to existing code. Risk: a single wrong reverse entry produces silently corrupted state after reset, which is extremely hard to debug.
-- **Copy-on-Write tree**: each mutation creates new nodes up the path to root; unchanged subtrees are shared. Save snapshot = keep root pointer O(1). Restore = swap root pointer O(1). Mutation cost = O(tree depth, typically <15). No journal to get wrong. Risk: reference counting in C requires discipline; it is a full VFS core refactor.
+- **Journal**: each VFS mutation pushes a reverse entry; restore replays
+  in reverse — O(delta size). Incremental change to existing code.
+  Risk: a single wrong reverse entry produces silently corrupted state
+  after reset, which is extremely hard to debug.
+- **Copy-on-Write tree**: each mutation creates new nodes up the path to
+  root; unchanged subtrees are shared. Save snapshot = keep root pointer
+  O(1). Restore = swap root pointer O(1). Mutation cost = O(tree depth,
+  typically <15). No journal to get wrong. Risk: reference counting in C
+  requires discipline; it is a full VFS core refactor.
 
-Write the comparison in `docs/vfs_design_v2.md` before implementing either. If journal is chosen, add comprehensive journal-correctness tests (random mutation sequences, verify post-restore state matches a known-good deep copy). If CoW is chosen, prototype the refcounted node structure first.
+Write the comparison in `docs/vfs_design_v2.md` before implementing
+either. If journal is chosen, add comprehensive journal-correctness tests
+(random mutation sequences, verify post-restore state matches a known-good
+deep copy). If CoW is chosen, prototype the refcounted node structure
+first.
 
-**Large file design rule (enforce whichever approach is chosen):** only record a journal entry or create a new CoW node for files that are actually mutated. Never proactively copy unchanged content during tree walks. A rootfs has 50MB+ binaries — the cost of accidentally deep-copying them on every iteration is catastrophic.
+**Large file design rule (enforce whichever approach is chosen):** only
+record a journal entry or create a new CoW node for files that are
+actually mutated. Never proactively copy unchanged content during tree
+walks. A rootfs has 50MB+ binaries — the cost of accidentally
+deep-copying them on every iteration is catastrophic.
 
 Concrete steps:
 
-1. write journal vs CoW design comparison in `docs/vfs_design_v2.md`; decide and implement the chosen approach:
-   - measure restore time before and after against a large synthetic tree (1000 files) to confirm the speedup
+1. write journal vs CoW design comparison in `docs/vfs_design_v2.md`;
+   decide and implement the chosen approach:
+   - measure restore time before and after against a large synthetic tree
+     (1000 files) to confirm the speedup
    - verify post-restore state matches deep-copy result for correctness
 2. implement snapshot import from a host directory tree:
-   - walk a real directory, create corresponding VFS nodes, set metadata (mode, mtime)
-   - this is how a container rootfs gets loaded as the concrete baseline
+   - walk a real directory, create corresponding VFS nodes, set metadata
+     (mode, mtime, xattrs, symlink targets)
+   - this is how a container rootfs gets loaded as the concrete baseline;
+     must handle all new op kinds from Part A
 3. measure restore speed against the imported rootfs baseline
 4. identify the integration point in Moritz's harness
-5. perform smoke tests with an unmutated baseline rootfs — the target must execute cleanly
-6. apply one small delta and verify the target sees the change
+5. perform smoke tests with an unmutated baseline rootfs — the target
+   must execute cleanly
+6. apply one small delta (including at least one symlink and one xattr
+   op) and verify the target sees the change
 
 Testing and validation:
 
-- snapshot-create and journal restore equivalence checks (result must match deep-copy result)
+- snapshot-create and restore equivalence checks (result must match
+  deep-copy result) for all 11+ op kinds including new ones
 - repeated restore cycles with correctness assertions
-- restore time measurement before and after journal optimization
+- restore time measurement before and after optimisation
 - real-target smoke tests against the mounted baseline
+- new-op E2E FFI tests (one per new op kind, all passing before
+  integration begins)
 
 Exit criteria:
 
-- journal vs CoW comparison written in `docs/vfs_design_v2.md`; approach chosen and implemented
+- all new `FsOpKind` variants (at minimum `CreateSymlink` and xattr ops)
+  implemented through the full stack: enum → VFS → FFI → FUSE → mutator
+  → test
+- journal vs CoW comparison written in `docs/vfs_design_v2.md`; approach
+  chosen and implemented
 - restore time measured before and after against a large synthetic tree
-- a real rootfs baseline can be imported into the VFS
+- a real rootfs baseline (including symlinks and xattrs) can be imported
+  into the VFS
 - the real target executes cleanly against the mounted baseline
+- `FuseLogObserver` extended to capture symlink and xattr access events
 
 ### Week 9: Real-World Campaign Bring-Up And Initial Evaluation
 
