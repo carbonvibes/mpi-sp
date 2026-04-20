@@ -282,65 +282,105 @@ static void fnv_mix(uint64_t *h, const void *data, size_t len)
         *h = (*h ^ p[i]) * 0x100000001b3ULL;
 }
 
-typedef struct {
-    vfs_t      *vfs;
-    const char *parent_path;
-    uint64_t   *h;
-} cksum_ctx_t;
+/*
+ * Sorted checksum implementation.
+ *
+ * Children are collected into a flat array, sorted alphabetically by name,
+ * then hashed in sorted order.  This makes the checksum insertion-order
+ * independent: two VFS instances with the same files in different creation
+ * orders produce the same hash.
+ */
 
-static int cksum_readdir_cb(void *ctx, const char *name, const vfs_stat_t *vs)
+typedef struct {
+    char       *name;        /* heap-allocated entry name              */
+    char       *child_path;  /* heap-allocated absolute path           */
+    vfs_stat_t  vs;          /* stat snapshot (kind, size, timestamps) */
+} cksum_entry_t;
+
+typedef struct {
+    cksum_entry_t *entries;
+    size_t         n;
+    size_t         cap;
+    const char    *parent_path;
+} cksum_coll_ctx_t;
+
+static int cksum_coll_cb(void *ctx, const char *name, const vfs_stat_t *vs)
 {
-    cksum_ctx_t *c = ctx;
+    cksum_coll_ctx_t *c = ctx;
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 0;
 
-    /* Build absolute path of this child. */
-    size_t plen = strlen(c->parent_path);
-    size_t nlen = strlen(name);
-    /* +2: possible '/' separator and NUL terminator */
-    char *child_path = malloc(plen + nlen + 2);
-    if (!child_path) return 0;  /* skip on OOM; checksum will still be useful */
-
-    if (strcmp(c->parent_path, "/") == 0)
-        snprintf(child_path, plen + nlen + 2, "/%s", name);
-    else
-        snprintf(child_path, plen + nlen + 2, "%s/%s", c->parent_path, name);
-
-    /* Hash the absolute path. */
-    fnv_mix(c->h, child_path, strlen(child_path));
-
-    /* Hash timestamps (deterministic across identical populations). */
-    fnv_mix(c->h, &vs->mtime.tv_sec,  sizeof(vs->mtime.tv_sec));
-    fnv_mix(c->h, &vs->mtime.tv_nsec, sizeof(vs->mtime.tv_nsec));
-    fnv_mix(c->h, &vs->atime.tv_sec,  sizeof(vs->atime.tv_sec));
-    fnv_mix(c->h, &vs->atime.tv_nsec, sizeof(vs->atime.tv_nsec));
-
-    if (vs->kind == VFS_FILE && vs->size > 0) {
-        /* Hash file content. */
-        uint8_t *buf = malloc(vs->size);
-        if (buf) {
-            size_t got = 0;
-            vfs_read(c->vfs, child_path, 0, vs->size, buf, &got);
-            fnv_mix(c->h, buf, got);
-            free(buf);
-        }
-    } else if (vs->kind == VFS_SYMLINK) {
-        /* Hash symlink target. */
-        char target[4096];
-        int r = vfs_readlink(c->vfs, child_path, target, sizeof(target) - 1);
-        if (r > 0) { target[r] = '\0'; fnv_mix(c->h, target, (size_t)r); }
-    } else if (vs->kind == VFS_DIR) {
-        /* Recurse. */
-        checksum_dir(c->vfs, child_path, c->h);
+    if (c->n >= c->cap) {
+        size_t nc = c->cap ? c->cap * 2 : 8;
+        cksum_entry_t *p = realloc(c->entries, nc * sizeof(*p));
+        if (!p) return 0;   /* skip on OOM; checksum still useful */
+        c->entries = p;
+        c->cap = nc;
     }
 
-    free(child_path);
+    size_t plen = strlen(c->parent_path);
+    size_t nlen = strlen(name);
+    char *child = malloc(plen + nlen + 2);
+    if (!child) return 0;
+
+    if (strcmp(c->parent_path, "/") == 0)
+        snprintf(child, plen + nlen + 2, "/%s", name);
+    else
+        snprintf(child, plen + nlen + 2, "%s/%s", c->parent_path, name);
+
+    c->entries[c->n++] = (cksum_entry_t){
+        .name       = strdup(name),
+        .child_path = child,
+        .vs         = *vs,
+    };
     return 0;
+}
+
+static int cmp_cksum_entry(const void *a, const void *b)
+{
+    return strcmp(((const cksum_entry_t *)a)->name,
+                  ((const cksum_entry_t *)b)->name);
 }
 
 static void checksum_dir(vfs_t *vfs, const char *path, uint64_t *h)
 {
-    cksum_ctx_t ctx = { .vfs = vfs, .parent_path = path, .h = h };
-    vfs_readdir(vfs, path, cksum_readdir_cb, &ctx);
+    /* Phase 1: collect all children. */
+    cksum_coll_ctx_t coll = { .parent_path = path };
+    vfs_readdir(vfs, path, cksum_coll_cb, &coll);
+
+    /* Phase 2: sort alphabetically — insertion-order independent. */
+    if (coll.n > 1)
+        qsort(coll.entries, coll.n, sizeof(cksum_entry_t), cmp_cksum_entry);
+
+    /* Phase 3: hash in sorted order. */
+    for (size_t i = 0; i < coll.n; i++) {
+        cksum_entry_t *e = &coll.entries[i];
+
+        fnv_mix(h, e->child_path, strlen(e->child_path));
+        fnv_mix(h, &e->vs.mtime.tv_sec,  sizeof(e->vs.mtime.tv_sec));
+        fnv_mix(h, &e->vs.mtime.tv_nsec, sizeof(e->vs.mtime.tv_nsec));
+        fnv_mix(h, &e->vs.atime.tv_sec,  sizeof(e->vs.atime.tv_sec));
+        fnv_mix(h, &e->vs.atime.tv_nsec, sizeof(e->vs.atime.tv_nsec));
+
+        if (e->vs.kind == VFS_FILE && e->vs.size > 0) {
+            uint8_t *buf = malloc(e->vs.size);
+            if (buf) {
+                size_t got = 0;
+                vfs_read(vfs, e->child_path, 0, e->vs.size, buf, &got);
+                fnv_mix(h, buf, got);
+                free(buf);
+            }
+        } else if (e->vs.kind == VFS_SYMLINK) {
+            char target[4096];
+            int r = vfs_readlink(vfs, e->child_path, target, sizeof(target) - 1);
+            if (r > 0) { target[r] = '\0'; fnv_mix(h, target, (size_t)r); }
+        } else if (e->vs.kind == VFS_DIR) {
+            checksum_dir(vfs, e->child_path, h);
+        }
+
+        free(e->name);
+        free(e->child_path);
+    }
+    free(coll.entries);
 }
 
 uint64_t cp_vfs_checksum(vfs_t *vfs)
@@ -350,6 +390,91 @@ uint64_t cp_vfs_checksum(vfs_t *vfs)
     fnv_mix(&h, "/", 1);
     checksum_dir(vfs, "/", &h);
     return h;
+}
+
+/* -------------------------------------------------------------------------
+ * cp_enumerate_paths — collect all VFS paths filtered by kind
+ * ---------------------------------------------------------------------- */
+
+/* Flat path list built across recursive calls. */
+typedef struct {
+    char  **paths;
+    size_t  n;
+    size_t  cap;
+    int     filter;   /* 0=all, 1=files, 2=dirs */
+} enum_list_t;
+
+/* Per-readdir-call context (stack-allocated, not shared). */
+typedef struct {
+    vfs_t       *vfs;
+    const char  *parent_path;
+    enum_list_t *list;
+} enum_cb_ctx_t;
+
+/* Forward declaration. */
+static void enum_dir(vfs_t *vfs, const char *parent, enum_list_t *list);
+
+static int enum_list_push(enum_list_t *l, const char *path)
+{
+    if (l->n >= l->cap) {
+        size_t nc = l->cap ? l->cap * 2 : 16;
+        char **p  = realloc(l->paths, nc * sizeof(char *));
+        if (!p) return -ENOMEM;
+        l->paths = p;
+        l->cap   = nc;
+    }
+    l->paths[l->n] = strdup(path);
+    if (!l->paths[l->n]) return -ENOMEM;
+    l->n++;
+    return 0;
+}
+
+static int enum_readdir_cb(void *raw, const char *name, const vfs_stat_t *vs)
+{
+    enum_cb_ctx_t *rc = raw;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 0;
+
+    size_t plen = strlen(rc->parent_path);
+    size_t nlen = strlen(name);
+    char *child = malloc(plen + nlen + 2);
+    if (!child) return 0;
+
+    if (strcmp(rc->parent_path, "/") == 0)
+        snprintf(child, plen + nlen + 2, "/%s", name);
+    else
+        snprintf(child, plen + nlen + 2, "%s/%s", rc->parent_path, name);
+
+    int match = (rc->list->filter == 0)
+             || (rc->list->filter == 1 && vs->kind == VFS_FILE)
+             || (rc->list->filter == 2 && vs->kind == VFS_DIR);
+    if (match) enum_list_push(rc->list, child);
+
+    if (vs->kind == VFS_DIR)
+        enum_dir(rc->vfs, child, rc->list);
+
+    free(child);
+    return 0;
+}
+
+static void enum_dir(vfs_t *vfs, const char *parent, enum_list_t *list)
+{
+    enum_cb_ctx_t ctx = { .vfs = vfs, .parent_path = parent, .list = list };
+    vfs_readdir(vfs, parent, enum_readdir_cb, &ctx);
+}
+
+int cp_enumerate_paths(vfs_t *vfs, int filter, char ***paths_out, size_t *n_out)
+{
+    enum_list_t list = { .filter = filter };
+    enum_dir(vfs, "/", &list);
+    *paths_out = list.paths;
+    *n_out     = list.n;
+    return 0;
+}
+
+void cp_enumerate_paths_free(char **paths, size_t n)
+{
+    for (size_t i = 0; i < n; i++) free(paths[i]);
+    free(paths);
 }
 
 /* -------------------------------------------------------------------------

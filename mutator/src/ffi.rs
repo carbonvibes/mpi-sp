@@ -104,6 +104,22 @@ extern "C" {
 
     /// FNV-1a hash of the current VFS tree.  Used for semantic yield tracking.
     pub fn cp_vfs_checksum(vfs: *mut VfsT) -> u64;
+
+    /// Enumerate all VFS paths filtered by kind.
+    ///
+    /// filter: 0 = all, 1 = regular files only, 2 = directories only.
+    ///
+    /// On success, *paths_out is a heap-allocated array of *n_out heap-allocated
+    /// NUL-terminated path strings.  Free with cp_enumerate_paths_free().
+    pub fn cp_enumerate_paths(
+        vfs:       *mut VfsT,
+        filter:    c_int,
+        paths_out: *mut *mut *mut i8,
+        n_out:     *mut usize,
+    ) -> c_int;
+
+    /// Free the array returned by cp_enumerate_paths().
+    pub fn cp_enumerate_paths_free(paths: *mut *mut i8, n: usize);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -239,6 +255,43 @@ pub fn apply_delta(vfs: *mut VfsT, delta: &FsDelta) -> Result<DeltaResult, i32> 
     unsafe { cp_result_free(result_ptr) };
 
     Ok(dr)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Path enumeration helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn collect_paths(vfs: *mut VfsT, filter: c_int) -> Vec<String> {
+    let mut raw: *mut *mut i8 = std::ptr::null_mut();
+    let mut n: usize = 0;
+    let ret = unsafe { cp_enumerate_paths(vfs, filter, &mut raw, &mut n) };
+    if ret != 0 || raw.is_null() || n == 0 {
+        return vec![];
+    }
+    let result = (0..n)
+        .map(|i| unsafe {
+            std::ffi::CStr::from_ptr(*raw.add(i))
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    unsafe { cp_enumerate_paths_free(raw, n) };
+    result
+}
+
+/// Return the absolute paths of all regular files currently in the VFS.
+pub fn enumerate_vfs_file_paths(vfs: *mut VfsT) -> Vec<String> {
+    collect_paths(vfs, 1)
+}
+
+/// Return the absolute paths of all directories currently in the VFS.
+pub fn enumerate_vfs_dir_paths(vfs: *mut VfsT) -> Vec<String> {
+    collect_paths(vfs, 2)
+}
+
+/// Return the absolute paths of all nodes (files + directories) in the VFS.
+pub fn enumerate_vfs_all_paths(vfs: *mut VfsT) -> Vec<String> {
+    collect_paths(vfs, 0)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

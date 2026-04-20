@@ -446,6 +446,32 @@ Phase A exit criteria:
 - serialization format cleaned up and roundtrip tests pass
 - reset cost and FUSE overhead ratio measured and documented
 
+Phase A scope actually delivered (beyond the minimum above — see
+`docs/WEEK5.md` for the full walkthrough):
+
+- live corpus with novel-checksum promotion, bounded at
+  `MAX_LIVE_CORPUS = 128` with non-seed eviction; `SpliceDelta` draws from
+  the same shared pool so promoted deltas become splice donors immediately
+- content dictionary (magic bytes, trigger strings, boundary-sized fills)
+  consumed by `ReplaceFileContent` (40% draw) and `UpdateExistingFile`
+- real-content perturbation in `UpdateExistingFile` (bit-flip / append /
+  truncate / dictionary-splice of live baseline bytes)
+- `MutationGuidance` threaded through `MutatePath` (ENOENT → recreate →
+  baseline preference on whole-swap) and `DestructiveMutator` (50%
+  recreate-path bias on DeleteFile / Rmdir) — Phase A still runs with
+  empty guidance, but the wiring is in place
+- skip-early stage filtering via `can_apply(&FsDelta)` — no budget slot
+  wasted on guaranteed-Skip stages; semantic yield climbed from ~95% to
+  98% on a 200-iteration run with 192 corpus promotions
+
+Four items are deliberately deferred (listed in `docs/WEEK5.md` §"Known
+Limitations"):
+
+- read-from-live-VFS content via `cp_read_file` FFI → Phase B
+- success-weighted per-stage scheduling → Phase B (needs `StdFuzzer`)
+- corpus minimization pass → Week 7
+- `Rc<RefCell<_>>` → `Arc<Mutex<_>>` migration → Week 8 (parallel scale-up)
+
 ---
 
 #### Phase B — Best Effort (FUSE Logging, Guidance Wiring)
@@ -500,31 +526,159 @@ Phase B exit criteria:
 - `mutation_guidance_t` populated from log and consumed by mutator stages
 - closed feedback loop runs without stale state
 
-### Week 6: Build The Minimal End-To-End Demo Harness
+### Week 6: Real LibAFL Integration + Minimal End-To-End Demo Harness
 
 Objectives:
 
-- create the smallest possible filesystem-backed fuzzing demo
-- keep the scope narrow enough that Week 7 can be used for stabilization, not first-time debugging
+- replace the hand-rolled `fuzz.rs` main loop with a real LibAFL `StdFuzzer`
+  driven by code-coverage feedback
+- compose LibAFL's stock primitives wherever they fit; implement custom
+  `Observer` / `Feedback` / `Executor` only where the FUSE+VFS world has no
+  off-the-shelf equivalent
+- build the smallest possible filesystem-backed fuzzing demo (`foobar`
+  crasher) as the proof-of-life that the integration works end-to-end
+- keep the scope narrow enough that Week 7 can be used for stabilization,
+  not first-time debugging
 
-Concrete steps:
+Context: by end of Week 5 Phase B we have FsDelta mutators implementing
+LibAFL's `Mutator<FsDelta, S>` trait, a working hand-rolled main loop, and
+FUSE-write-log-driven `MutationGuidance`.  Week 6 swaps the hand-rolled
+loop for LibAFL machinery while keeping the mutator stages and the
+guidance signal exactly as they are — those are already in the right
+shape.
 
-1. write a tiny target program that reads a mounted file
-2. crash when the file contains `foobar`
-3. implement the minimal LibAFL harness
-4. apply each testcase to the VFS before each execution
-5. verify the harness sees seeded crashing and non-crashing inputs correctly
+#### Architectural Principle: Use The Kit, Don't Rebuild It
 
-Testing and validation:
+LibAFL is a kit, not a fuzzer.  Our value-add lives in three custom traits
+(`Observer`, `Feedback`, `Executor`) that bridge the FUSE+VFS world into
+LibAFL's loop — the rest of the loop (corpus, scheduler, stages, fuzzer)
+is stock LibAFL.
 
-- direct manual crash reproduction outside the fuzzer
-- harness run with a crashing seed
-- harness run with a near-miss input
-- multiple consecutive executions with reset between runs
+| LibAFL primitive | Use as-is | Customize / extend |
+|---|---|---|
+| `Input` | — | `FsDelta` (semantic, not bytes) — already done |
+| `Mutator` trait | — | 8 stages with `can_apply` — already done |
+| `Observer` | (compose with `MultiMapObserver` for coverage) | new `FuseLogObserver` (drains the per-iter write log into `MutationGuidance`) |
+| `Feedback` | `MapFeedback` over edge-coverage map | new `FsAccessFeedback` (treats novel ENOENT / write-set paths as interesting); compose via `feedback_or!` |
+| `Executor` | — | new `VfsExecutor` (apply delta → spawn target → drain log → reset) |
+| `Corpus` | `OnDiskCorpus<FsDelta>` (replaces `Rc<RefCell<Vec<FsDelta>>>`) | — |
+| `Scheduler` | `IndexesLenTimeMinimizerScheduler` over a `QueueScheduler` base | — |
+| `Stage` | `StdMutationalStage` (composes our existing mutators) | — |
+| `Fuzzer` | `StdFuzzer` | — |
 
-Exit criteria:
+The hand-rolled `seen_checksums: HashSet<u64>` novelty gate is **retired**
+when `MapFeedback` lands — it is a strictly weaker signal than coverage
+and keeping it creates two competing novelty sources.
 
-- the harness can repeatedly run the target while updating the mounted filesystem
+#### Up-Front Decisions (lock these on day 1, do not relitigate)
+
+1. **Coverage source: SanitizerCoverage (`-fsanitize-coverage=trace-pc-guard`)**
+   - reasons: LibAFL's default and best-supported path; works with any
+     C target the user controls (we own the demo target); single-process
+     in-memory hot loop with `InProcessExecutor` is the fastest config
+   - rejected: forkserver (slower, more wiring); Intel PT (hardware
+     coupling, debugging cost not justified for a Week 6 demo)
+   - implementation: target compiled with
+     `clang -fsanitize-coverage=trace-pc-guard,trace-cmp` and linked
+     against LibAFL's `libafl_targets` runtime
+2. **Executor type: `InProcessExecutor` for Week 6, `ForkserverExecutor` revisited in Week 8 if instability shows up**
+   - reasons: in-process is the lowest-overhead path; the demo target is
+     a tiny program we control; one crash recovery is fine for Week 6
+   - migration trigger: if the campaign is unstable (process state leaks
+     across iterations, signal handling races), switch to forkserver in
+     Week 8 alongside the scale-snapshotting work
+3. **Corpus type: `OnDiskCorpus<FsDelta>`** at a deterministic path under
+   the run directory, plus `InMemoryOnDiskCorpus` if disk I/O dominates
+   in benchmarks
+4. **Scheduler: `IndexesLenTimeMinimizerScheduler` over `QueueScheduler`**
+   — favours short, fast-executing inputs; standard AFL-style behaviour
+5. **Mutation stage composition**: a single `StdMutationalStage` that
+   wraps a `StdScheduledMutator` containing our 8 `Mutator<FsDelta, S>`
+   impls.  `can_apply` precondition stays in place — `StdScheduledMutator`
+   honours `MutationResult::Skipped`.
+6. **No code coverage on the FUSE/VFS process itself.**  Coverage is
+   collected on the *target binary* only; the FUSE driver and VFS are
+   our infrastructure, not the fuzzed surface.
+
+#### Concrete Steps
+
+1. **Build the demo target** (`demo/target_foobar.c`):
+   - opens a configured filesystem path, reads it, crashes (`abort()`)
+     when the content contains `"foobar"`
+   - compiled with SanCov: `clang -fsanitize-coverage=trace-pc-guard,trace-cmp -O1 -g`
+   - linked against the LibAFL `libafl_targets` runtime so the coverage
+     map is exposed to the harness
+2. **Implement the three custom LibAFL traits** in
+   `mutator/src/libafl_glue/`:
+   - `vfs_executor.rs` — `impl<EM, Z> Executor<EM, FsDelta, S, Z> for VfsExecutor`:
+     `run_target` does `apply_delta(vfs, input)` → spawn target →
+     `vfs_reset_to_snapshot(vfs)` and returns the standard `ExitKind`
+   - `fuse_log_observer.rs` — `impl Observer<FsDelta, S> for FuseLogObserver`:
+     `pre_exec` calls `fuse_log_set_active(true)` + `fuse_log_clear()`;
+     `post_exec` drains the log and stashes it on the executor for the
+     next mutator pass to consume as `MutationGuidance`
+   - `fs_access_feedback.rs` — `impl<S> Feedback<S> for FsAccessFeedback`:
+     returns `is_interesting = true` when the drained log contains a
+     never-before-seen ENOENT path or write-set path; tracked in a
+     `HashSet<String>` on the feedback state
+3. **Wire the fuzzer** in `mutator/src/bin/fuzz_libafl.rs` (new binary;
+   leave `fuzz.rs` in place as a reference / regression target until
+   Week 7):
+   ```rust
+   let mut feedback = feedback_or!(
+       MaxMapFeedback::tracking(&edge_observer, true, false),
+       FsAccessFeedback::new()
+   );
+   let mut objective = CrashFeedback::new();
+   let scheduler = IndexesLenTimeMinimizerScheduler::new(QueueScheduler::new());
+   let mut fuzzer  = StdFuzzer::new(scheduler, feedback, objective);
+   let mut executor = VfsExecutor::new(vfs, target_cmd, edge_observer, fuse_log_observer);
+   let mut stages = tuple_list!(StdMutationalStage::new(
+       StdScheduledMutator::new(tuple_list!(/* our 8 mutators */))
+   ));
+   fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
+   ```
+4. **Retire the hand-rolled novelty gate.**  Drop `seen_checksums` and
+   `MAX_LIVE_CORPUS` eviction from the new binary.  `cp_vfs_checksum`
+   stays as a debug-print helper but no longer drives promotion.
+5. **End-to-end smoke test**: run `fuzz_libafl` against `target_foobar`,
+   confirm it finds the crash, save the crashing `FsDelta` as a
+   regression artifact in `demo/regressions/`.
+6. **Side-by-side baseline measurement**: run both binaries
+   (`fuzz` hand-rolled with FUSE guidance, `fuzz_libafl` with coverage)
+   on the same target for the same wall-clock budget; compare
+   time-to-first-crash.  This number goes in the paper.
+
+#### Testing and Validation
+
+- direct manual crash reproduction outside the fuzzer (target run with a
+  hand-crafted `foobar` file)
+- `fuzz_libafl` smoke run with a crashing seed (must reproduce the crash
+  on iteration 1)
+- `fuzz_libafl` cold run from random seeds (must reach the crash within
+  a documented iteration budget — record the median over 10 runs)
+- `fuzz_libafl` near-miss input (`fooba`) confirms coverage map advances
+  but objective does not fire
+- multiple consecutive executions with reset between runs (no stale VFS
+  state, no stale coverage map)
+- side-by-side: `fuzz` (FUSE-guided hand-rolled) vs `fuzz_libafl`
+  (coverage-guided) on `target_foobar` — both find the crash, the
+  coverage-guided run is faster
+
+#### Exit Criteria
+
+- `fuzz_libafl` binary exists, compiles cleanly with `--release`,
+  and finds the `foobar` crash from a cold corpus within the documented
+  iteration budget
+- the three custom traits (`VfsExecutor`, `FuseLogObserver`,
+  `FsAccessFeedback`) each have a unit test that exercises them in
+  isolation against a mock `State`
+- `seen_checksums` and `MAX_LIVE_CORPUS` removed from the LibAFL binary;
+  `MapFeedback` is the only novelty signal driving promotion
+- side-by-side comparison numbers recorded in
+  `docs/benchmark_baseline.md` §"Week 6"
+- demo target source, build instructions, and a regression `FsDelta`
+  for the crash committed under `demo/`
 
 ### Week 7: Close The First Major Milestone
 

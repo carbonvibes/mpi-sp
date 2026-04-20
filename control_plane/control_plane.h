@@ -101,6 +101,27 @@ cp_result_t *cp_apply_delta(vfs_t *vfs, const fs_delta_t *d, int dry_run);
 uint64_t cp_vfs_checksum(vfs_t *vfs);
 
 /* -------------------------------------------------------------------------
+ * Path enumeration
+ * ---------------------------------------------------------------------- */
+
+/*
+ * Enumerate all paths in the VFS tree, filtered by node kind.
+ *
+ * filter:  0 = all paths (files + directories + symlinks)
+ *          1 = regular files only
+ *          2 = directories only
+ *
+ * On success, *paths_out is a heap-allocated array of *n_out heap-allocated
+ * NUL-terminated absolute-path strings.  Free with cp_enumerate_paths_free().
+ * Returns 0 on success.
+ */
+int cp_enumerate_paths(vfs_t *vfs, int filter,
+                       char ***paths_out, size_t *n_out);
+
+/* Free the array returned by cp_enumerate_paths(). */
+void cp_enumerate_paths_free(char **paths, size_t n);
+
+/* -------------------------------------------------------------------------
  * Dump
  * ---------------------------------------------------------------------- */
 
