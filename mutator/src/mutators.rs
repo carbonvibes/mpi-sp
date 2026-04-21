@@ -433,15 +433,19 @@ where
 
         // Whole-path swap: redirect the op to a known-interesting path.
         // Preference order when the swap roll hits:
-        //   1. guidance.enoent_paths (highest signal — target wanted these)
-        //   2. guidance.recreate_paths (target acts on these)
-        //   3. baseline_paths (known to exist)
+        //   1. guidance.enoent_paths  — target wanted these; creating/targeting them reaches new code
+        //   2. guidance.write_paths   — target wrote here; these ops are most likely to succeed
+        //   3. guidance.recreate_paths — target deleted/renamed these; re-targeting exercises same code
+        //   4. baseline_paths         — known to exist; fallback
         let have_swap_target = self.guidance.has_enoent()
+            || self.guidance.has_write()
             || self.guidance.has_recreate()
             || !self.baseline_paths.is_empty();
         if have_swap_target && state.rand_mut().below(nz(100)) < 30 {
             let pool: &[String] = if self.guidance.has_enoent() {
                 &self.guidance.enoent_paths
+            } else if self.guidance.has_write() {
+                &self.guidance.write_paths
             } else if self.guidance.has_recreate() {
                 &self.guidance.recreate_paths
             } else {
@@ -813,7 +817,23 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        let path = pick(state.rand_mut(), &self.baseline_file_paths).clone();
+        // Path selection: prefer write_paths entries that also exist in the
+        // baseline (UpdateFile requires the VFS node to survive reset).
+        // Non-baseline write_paths are handled by ReplayWriteFile.
+        let path = if self.guidance.has_write()
+            && state.rand_mut().below(nz(100)) < 70
+        {
+            let baseline_writes: Vec<&String> = self.guidance.write_paths.iter()
+                .filter(|p| self.baseline_file_paths.contains(*p))
+                .collect();
+            if !baseline_writes.is_empty() {
+                pick(state.rand_mut(), &baseline_writes).to_string()
+            } else {
+                pick(state.rand_mut(), &self.baseline_file_paths).clone()
+            }
+        } else {
+            pick(state.rand_mut(), &self.baseline_file_paths).clone()
+        };
 
         // Content selection strategy:
         //  1. If we have live baseline content for this path AND the coin
@@ -834,6 +854,84 @@ where
         };
 
         input.ops.push(FsOp::update_file(path, content));
+        Ok(MutationResult::Mutated)
+    }
+
+    fn post_exec(&mut self, _state: &mut S, _id: Option<CorpusId>) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. ReplayWriteFile
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Recreate files the target generated mid-run that were wiped by VFS reset.
+///
+/// `UpdateExistingFile` covers `write_paths ∩ baseline` — files that existed
+/// before the run and were written to.  This stage covers the complement:
+/// `write_paths ∖ baseline` — files the target created itself during the run,
+/// which are absent after reset because the baseline never had them.
+///
+/// Emits `CreateFile(path, content)`.  `cp_ensure_parents` is called for
+/// every `CREATE_FILE` op, so missing parent directories are handled
+/// automatically.
+///
+/// Content: dictionary (30%) or random (70%).  Perturb is unavailable because
+/// there is no baseline content for paths the target created itself.  In Phase B
+/// the FUSE log will capture actual write bytes, enabling true content replay.
+///
+/// Skips when `guidance.write_paths ∖ baseline_file_paths` is empty (Phase A
+/// default) or when the delta is already at `MAX_OPS`.
+pub struct ReplayWriteFile {
+    pub guidance:            MutationGuidance,
+    pub baseline_file_paths: Vec<String>,
+}
+
+impl ReplayWriteFile {
+    pub fn new(baseline_file_paths: Vec<String>) -> Self {
+        Self {
+            guidance:            MutationGuidance::none(),
+            baseline_file_paths,
+        }
+    }
+}
+
+impl Named for ReplayWriteFile {
+    fn name(&self) -> &Cow<'static, str> {
+        static N: Cow<'static, str> = Cow::Borrowed("ReplayWriteFile");
+        &N
+    }
+}
+
+impl<S> Mutator<FsDelta, S> for ReplayWriteFile
+where
+    S: HasRand,
+{
+    fn mutate(&mut self, state: &mut S, input: &mut FsDelta) -> Result<MutationResult, Error> {
+        if input.ops.len() >= MAX_OPS {
+            return Ok(MutationResult::Skipped);
+        }
+
+        // write_paths ∖ baseline: target created these during the run; they
+        // don't survive reset, so UpdateExistingFile cannot touch them.
+        let new_paths: Vec<&String> = self.guidance.write_paths
+            .iter()
+            .filter(|p| !self.baseline_file_paths.contains(*p))
+            .collect();
+
+        if new_paths.is_empty() {
+            return Ok(MutationResult::Skipped);
+        }
+
+        let path    = pick(state.rand_mut(), &new_paths).to_string();
+        let content = if state.rand_mut().below(nz(100)) < 30 {
+            pick(state.rand_mut(), CONTENT_DICTIONARY).to_vec()
+        } else {
+            random_content(state.rand_mut())
+        };
+
+        input.ops.push(FsOp::create_file(path, content));
         Ok(MutationResult::Mutated)
     }
 
@@ -1393,5 +1491,115 @@ mod tests {
             }
         }
         assert!(used_recreate, "recreate_paths never used by destructive in 200 tries");
+    }
+
+    #[test]
+    fn update_existing_file_prefers_write_paths() {
+        // write_paths entry that IS in the baseline should be preferred (70%
+        // bias).  Non-baseline write_paths are filtered out; those belong to
+        // ReplayWriteFile.
+        let mut state = TestState::new();
+        let mut guidance = MutationGuidance::default();
+        // "/input" is in the baseline — qualifies for the bias.
+        guidance.write_paths = vec!["/input".to_string()];
+
+        let mut m = UpdateExistingFile::new(vec!["/input".to_string(), "/etc/config".to_string()]);
+        m.guidance = guidance;
+
+        let mut used_write = false;
+        for _ in 0..100 {
+            let mut delta = FsDelta::new(vec![FsOp::mkdir("/seed")]);
+            m.mutate(&mut state, &mut delta).unwrap();
+            let new_op = delta.ops.last().unwrap();
+            if new_op.kind == FsOpKind::UpdateFile
+                && new_op.path == "/input"
+            {
+                used_write = true;
+                break;
+            }
+        }
+        assert!(used_write, "guidance.write_paths (baseline-intersecting) never preferred by UpdateExistingFile in 100 tries");
+    }
+
+    #[test]
+    fn mutate_path_whole_swap_prefers_write_paths_over_recreate() {
+        // write_paths must rank above recreate_paths in the whole-swap
+        // preference chain.
+        let mut state = TestState::new();
+        let mut guidance = MutationGuidance::default();
+        guidance.write_paths   = vec!["/written/path".to_string()];
+        guidance.recreate_paths = vec!["/recreate/path".to_string()];
+
+        let mut m = MutatePath::with_baseline(vec!["/input".to_string()])
+            .with_guidance(guidance);
+
+        let mut used_write = false;
+        for _ in 0..200 {
+            let mut delta = FsDelta::new(vec![FsOp::update_file("/random/path", b"x".to_vec())]);
+            m.mutate(&mut state, &mut delta).unwrap();
+            if delta.ops[0].path == "/written/path" {
+                used_write = true;
+                break;
+            }
+        }
+        assert!(used_write, "write_paths never preferred over recreate_paths in whole-swap");
+    }
+
+    // ── 9. ReplayWriteFile ────────────────────────────────────────────────
+
+    #[test]
+    fn replay_write_file_skips_with_no_guidance() {
+        let mut state = TestState::new();
+        let mut m = ReplayWriteFile::new(vec!["/input".to_string()]);
+        let mut delta = file_delta();
+        let res = m.mutate(&mut state, &mut delta).unwrap();
+        assert_eq!(res, MutationResult::Skipped);
+    }
+
+    #[test]
+    fn replay_write_file_skips_when_all_write_paths_in_baseline() {
+        // If every write_path is already in the baseline, ∖ is empty → Skipped.
+        let mut state = TestState::new();
+        let baseline = vec!["/input".to_string(), "/etc/config".to_string()];
+        let mut m = ReplayWriteFile::new(baseline.clone());
+        m.guidance.write_paths = baseline; // identical set → complement is empty
+        let mut delta = file_delta();
+        let res = m.mutate(&mut state, &mut delta).unwrap();
+        assert_eq!(res, MutationResult::Skipped);
+    }
+
+    #[test]
+    fn replay_write_file_creates_non_baseline_path() {
+        // A write_path absent from the baseline should produce CreateFile.
+        let mut state = TestState::new();
+        let mut m = ReplayWriteFile::new(vec!["/input".to_string()]);
+        m.guidance.write_paths = vec!["/target/created/this".to_string()];
+        let mut delta = file_delta();
+        let before = delta.ops.len();
+        let res = m.mutate(&mut state, &mut delta).unwrap();
+        assert_eq!(res, MutationResult::Mutated);
+        assert_eq!(delta.ops.len(), before + 1);
+        let new_op = delta.ops.last().unwrap();
+        assert_eq!(new_op.kind, FsOpKind::CreateFile);
+        assert_eq!(new_op.path, "/target/created/this");
+    }
+
+    #[test]
+    fn replay_write_file_ignores_baseline_write_paths() {
+        // Mixed write_paths: one in baseline, one not.  Only the non-baseline
+        // path should ever be selected.
+        let mut state = TestState::new();
+        let mut m = ReplayWriteFile::new(vec!["/input".to_string()]);
+        m.guidance.write_paths = vec![
+            "/input".to_string(),               // in baseline — must be ignored
+            "/target/output".to_string(),        // not in baseline — only valid pick
+        ];
+        for _ in 0..100 {
+            let mut delta = file_delta();
+            m.mutate(&mut state, &mut delta).unwrap();
+            let new_op = delta.ops.last().unwrap();
+            assert_eq!(new_op.path, "/target/output",
+                "ReplayWriteFile picked a baseline path — should be filtered out");
+        }
     }
 }

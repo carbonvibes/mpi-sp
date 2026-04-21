@@ -4,14 +4,14 @@
 
 Week 5 built the Rust-side fuzzing layer that sits between LibAFL and the
 in-memory VFS.  The deliverable is a working, measurable mutation → apply →
-reset loop that exercises all eight mutation strategies across all seven
+reset loop that exercises all nine mutation strategies across all seven
 `FsOpKind` variants, with per-op failure reporting, semantic yield tracking,
 baseline-path targeting, and insertion-order-independent checksums.
 
 The week is split into two phases:
 
-- **Phase A (complete)** — Rust `FsDelta`/`FsOp` corpus types, eight mutator
-  stages (including `UpdateExistingFile` that targets real baseline files),
+- **Phase A (complete)** — Rust `FsDelta`/`FsOp` corpus types, nine mutator
+  stages (including `UpdateExistingFile` + `ReplayWriteFile` for write-path coverage),
   full FFI bridge with per-op result inspection, `MAX_OPS` cap,
   `validate_delta` debug assertions, baseline path enumeration via
   `cp_enumerate_paths` (files / dirs / all), sorted `cp_vfs_checksum`
@@ -24,12 +24,15 @@ The week is split into two phases:
   strings, magic bytes, boundary sizes — 40% of `ReplaceFileContent`
   outputs), **real-content perturbation** in `UpdateExistingFile` (bit-flip /
   append / truncate / dictionary-splice of the live baseline content),
-  **guidance threading** through `MutatePath` (enoent-path preference in
-  whole-swap) and `DestructiveMutator` (recreate-path bias on `DeleteFile` /
-  `Rmdir`), **skip-early stage filtering** via `can_apply` precondition
-  checks (no wasted mutation-budget slots on guaranteed skips), dumb loop
-  harness with 98% semantic yield, 40 unit + E2E integration tests, C
-  serialization cleanup, benchmarks.
+  **guidance threading** — all three `MutationGuidance` fields wired to
+  consumers (`write_paths ∩ baseline` → `UpdateExistingFile` path bias;
+  `write_paths ∖ baseline` → `ReplayWriteFile`; both → `MutatePath` whole-swap;
+  `enoent_paths` → `AddFileOp` + `MutatePath` whole-swap;
+  `recreate_paths` → `DestructiveMutator` + `MutatePath` whole-swap),
+  **skip-early stage filtering** via `can_apply` precondition checks (no
+  wasted mutation-budget slots on guaranteed skips), dumb loop harness with
+  98% semantic yield, 46 unit + E2E integration tests, C serialization
+  cleanup, benchmarks.
 - **Phase B** — FUSE callback logging, `MutationGuidance` population
   from the write log, full closed loop.  The guidance hooks are already in
   place in Phase A; Phase B only adds the producer side.
@@ -198,7 +201,7 @@ The VFS is reset to the same saved baseline after every iteration:
 
 ### 3. Mutator Pool
 
-The dumb loop randomly chooses one of the eight stages:
+The dumb loop randomly chooses one of the nine stages:
 
 | Stage | High-level behavior |
 |---|---|
@@ -209,7 +212,8 @@ The dumb loop randomly chooses one of the eight stages:
 | `MutatePath` | Replace one path component |
 | `SpliceDelta` | Append a prefix from a donor delta |
 | `DestructiveMutator` | Append delete/rmdir/truncate/set-times ops; targets real baseline paths |
-| `UpdateExistingFile` | Append `UpdateFile` on a file known to exist in the baseline |
+| `UpdateExistingFile` | Append `UpdateFile` on a file from `write_paths ∩ baseline` (70%) or baseline |
+| `ReplayWriteFile` | Append `CreateFile` for `write_paths ∖ baseline` — recreates target-generated files wiped by reset |
 
 Each stage returns:
 
@@ -301,7 +305,7 @@ Two modes, selected randomly:
 
 - **Whole-path swap** (30% when any target-pool is non-empty): replaces the
   entire path with a known-interesting path.  Preference order:
-  `guidance.enoent_paths` → `guidance.recreate_paths` → `baseline_paths`.
+  `guidance.enoent_paths` → `guidance.write_paths` → `guidance.recreate_paths` → `baseline_paths`.
   In Phase A the guidance lists are empty so this always draws from
   `baseline_paths`; in Phase B the ENOENT paths the target actually tried to
   open take precedence, and the mutator immediately converts failing random
@@ -311,8 +315,10 @@ Two modes, selected randomly:
 
 ```text
 Before: [ UpdateFile("/random/path", ...) ]
-After (whole swap, baseline):   [ UpdateFile("/etc/config", ...) ]       ← known good
-After (whole swap, ENOENT):     [ UpdateFile("/wanted/by/target", ...) ] ← Phase B signal
+After (whole swap, ENOENT):     [ UpdateFile("/wanted/by/target", ...) ] ← highest priority
+After (whole swap, write_paths):[ UpdateFile("/written/by/target", ...) ]← target wrote here
+After (whole swap, recreate):   [ UpdateFile("/deleted/by/target", ...) ]← target deleted this
+After (whole swap, baseline):   [ UpdateFile("/etc/config", ...) ]       ← fallback
 After (component swap):         [ UpdateFile("/random/config", ...) ]    ← neighbour
 ```
 
@@ -384,8 +390,12 @@ empty recreate list; Phase B feeds this from the FUSE `UNLINK` /
 
 #### `UpdateExistingFile`
 
-Appends an `UpdateFile` op on a path drawn exclusively from
-`baseline_file_paths`.  Content selection follows a three-way strategy:
+Appends an `UpdateFile` op.  Path is drawn from `guidance.write_paths ∩
+baseline_file_paths` (70% bias when the intersection is non-empty — these
+are paths the target actively wrote to AND that survive reset) falling back
+to `baseline_file_paths`.  Non-baseline `write_paths` entries are handled
+by `ReplayWriteFile` instead.  Content selection follows a three-way
+strategy:
 
 | Strategy | Probability | Behaviour |
 |---|---|---|
@@ -396,7 +406,9 @@ Appends an `UpdateFile` op on a path drawn exclusively from
 This is the highest-value mutation for reaching deep parser state:
 targets that read structured content (e.g. `/etc/config`) keep most of the
 structure intact under perturbation and reach downstream logic that random
-bytes would never reach.  Constructor chain:
+bytes would never reach.  When `write_paths` is active, the path is one
+the target confirmed it just wrote — so the mutated content is guaranteed
+to be read back.  Constructor chain:
 
 ```rust
 UpdateExistingFile::new(baseline_file_paths)
@@ -425,6 +437,30 @@ After:  [
 ```
 
 Skips when `baseline_file_paths` is empty or the delta is at `MAX_OPS`.
+
+#### `ReplayWriteFile`
+
+Covers the complement of `UpdateExistingFile`: `guidance.write_paths ∖
+baseline_file_paths` — paths the target *created* mid-run that were wiped
+by VFS reset and therefore have no node in the next iteration.  Emits
+`CreateFile(path, content)`; `cp_ensure_parents` handles missing parent
+directories automatically (it is called for every `CREATE_FILE` op).
+
+Content selection: dictionary (30%) or random (70%).  Real-content
+perturbation is unavailable because there is no baseline snapshot of
+target-created files.  In Phase B the FUSE write log will capture actual
+write bytes, enabling exact content replay.
+
+```text
+guidance.write_paths = ["/input", "/tmp/output"]
+baseline_file_paths  = ["/input"]
+
+UpdateExistingFile → may pick "/input"   (∩ baseline)
+ReplayWriteFile    → always picks "/tmp/output"  (∖ baseline)
+```
+
+Skips when `write_paths ∖ baseline_file_paths` is empty (Phase A default —
+guidance is unpopulated) or at `MAX_OPS`.
 
 ### 5. Apply, Yield, Reset
 
@@ -494,14 +530,16 @@ restores the baseline before the next iteration.
      │  ► apply each mutation to the delta in sequence
      │
      ▼
-  FsDelta  ←── 8 Rust mutator stages (mutators.rs)
+  FsDelta  ←── 9 Rust mutator stages (mutators.rs)
      │           MAX_OPS = 20 cap enforced by AddFileOp, SpliceDelta,
-     │           DestructiveMutator, UpdateExistingFile
+     │           DestructiveMutator, UpdateExistingFile, ReplayWriteFile
      │           DestructiveMutator: op-type-aware (files/dirs/all, 70% bias);
      │                               50% recreate_paths bias on DeleteFile/Rmdir
-     │           UpdateExistingFile: path from baseline_file_paths;
+     │           UpdateExistingFile: path from write_paths∩baseline (70%) → baseline;
      │                               content = perturb(baseline) 50% / dict 30% / random 70%
-     │           MutatePath: 30% whole-path swap (enoent → recreate → baseline)
+     │           ReplayWriteFile:    path from write_paths∖baseline → CreateFile
+     │                               content = dict 30% / random 70%
+     │           MutatePath: 30% whole-path swap (enoent → write → recreate → baseline)
      │           SpliceDelta: random start offset; donors drawn from live_corpus
      │           ReplaceFileContent: 40% dictionary / 60% random
      │
@@ -551,7 +589,7 @@ to `cp_apply_delta`, reads the `cp_result_t` fields directly (transparent
 | `mutator/src/lib.rs` | Crate root; `pub mod` declarations |
 | `mutator/src/delta.rs` | `FsOpKind`, `FsOp` (7 constructors), `FsDelta`, `generate_seed`, `generate_seed_corpus`, `initial_corpus_pool`, 6 unit tests |
 | `mutator/src/guidance.rs` | `MutationGuidance` — FUSE log stub (populated in Phase B) |
-| `mutator/src/mutators.rs` | `MAX_OPS`, `MAX_LIVE_CORPUS`, `LiveCorpus`, `CONTENT_DICTIONARY`, `PATH_COMPONENTS`, `pick_or_random`, `pick_timestamp`, `perturb_bytes`, 8 mutator stages (each with `can_apply`), 29 unit tests |
+| `mutator/src/mutators.rs` | `MAX_OPS`, `MAX_LIVE_CORPUS`, `LiveCorpus`, `CONTENT_DICTIONARY`, `PATH_COMPONENTS`, `pick_or_random`, `pick_timestamp`, `perturb_bytes`, 9 mutator stages (each with `can_apply`), 35 unit tests |
 | `mutator/src/ffi.rs` | C type bindings, `DeltaResult`, `apply_delta()`, `enumerate_vfs_file_paths`, `enumerate_vfs_dir_paths`, `enumerate_vfs_all_paths`, 5 E2E integration tests |
 | `mutator/src/bin/fuzz.rs` | Dumb loop harness with live-corpus promotion and semantic yield tracking |
 | `mutator/src/bin/vfs_bench.rs` | Direct VFS benchmark (no FUSE, no mutators) |
@@ -642,14 +680,33 @@ pub fn initial_corpus_pool() -> Vec<FsDelta>
 
 ```rust
 pub struct MutationGuidance {
+    pub write_paths:    Vec<String>,  // paths target wrote to / created / renamed into
     pub enoent_paths:   Vec<String>,  // paths target tried to open but ENOENT'd
     pub recreate_paths: Vec<String>,  // paths target deleted or renamed away
 }
 ```
 
-All fields default to empty in Phase A.  `AddFileOp` checks `has_enoent()` and
-biases 70% of new path choices toward `enoent_paths` when populated.
-Phase B will fill this from the FUSE write log after each target execution.
+All three fields map 1:1 to `fuse_iter_log_t` event kinds and default to
+empty in Phase A.  Phase B fills them from the FUSE write log after each
+target execution.
+
+| Field | FUSE events | Consumer | Bias |
+|---|---|---|---|
+| `write_paths ∩ baseline` | `LOG_WRITE / LOG_CREATE / LOG_RENAME_TO / LOG_MKDIR` | `UpdateExistingFile` (path selection), `MutatePath` whole-swap | 70% |
+| `write_paths ∖ baseline` | same events, but path absent from baseline (target-created) | `ReplayWriteFile` → `CreateFile` | 100% of eligible picks |
+| `enoent_paths` | `LOG_ENOENT` (`fvfs_getattr → -ENOENT`) | `AddFileOp` (new path), `MutatePath` whole-swap (highest priority) | 70% |
+| `recreate_paths` | `LOG_UNLINK / LOG_RMDIR / LOG_RENAME_FROM` | `DestructiveMutator` (DeleteFile/Rmdir), `MutatePath` whole-swap | 50% / 30% |
+
+`write_paths` is the highest-value signal: the target confirmed these paths
+matter this iteration.  The split into baseline-intersecting and
+non-intersecting subsets ensures that `UpdateFile` is only emitted for VFS
+nodes that survive reset, while target-created paths are handled by
+`ReplayWriteFile`.  Together they cover the full write-set — mutating
+content at a path the target just wrote to is the most direct route to
+reaching downstream parser logic.
+
+`MutatePath` whole-swap preference chain (highest → lowest):
+`enoent_paths → write_paths → recreate_paths → baseline_paths`.
 
 ---
 
@@ -806,19 +863,19 @@ Two modes selected randomly:
 
 - **Whole-path swap** (30% when any target pool is non-empty): replace the
   entire path with a known-interesting path.  Preference order:
-  `guidance.enoent_paths` → `guidance.recreate_paths` → `baseline_paths`.
-  In Phase A the guidance lists are empty and the swap always draws from
-  `baseline_paths`.  Once Phase B wires the FUSE log, the swap prefers paths
-  the target actually tried to open but failed with ENOENT — turning
-  wasted-op failures into exactly the paths that will reach uncovered code.
+  `guidance.enoent_paths` → `guidance.write_paths` → `guidance.recreate_paths` → `baseline_paths`.
+  In Phase A all guidance lists are empty and the swap always draws from
+  `baseline_paths`.  Once Phase B wires the FUSE log, enoent paths take
+  first priority (turn failing ops into paths the target wanted), write
+  paths take second (the target confirmed these exist and matter), and
+  recreate paths take third (re-target paths the target deleted).
 - **Component swap** (70%, or always when no pool is populated): replace one
   segment with a `PATH_COMPONENTS` word.
 
 Builder chain:
 
 ```rust
-MutatePath::new()
-    .with_baseline(baseline_all_paths.clone())
+MutatePath::with_baseline(baseline_all_paths.clone())
     .with_guidance(MutationGuidance::default())
 ```
 
@@ -905,9 +962,12 @@ already shown interest in.
 
 ### 8. `UpdateExistingFile`
 
-Appends an `UpdateFile` op on a path drawn from `baseline_file_paths` (the
-set of regular files that exist in the baseline VFS at startup, enumerated via
-`enumerate_vfs_file_paths`).
+Appends an `UpdateFile` op targeting a file that is known to exist after
+reset.  Path is drawn from `guidance.write_paths ∩ baseline_file_paths`
+first (70% bias when the intersection is non-empty); falls back to
+`baseline_file_paths`.  Non-baseline `write_paths` entries — paths the
+target created mid-run, absent after reset — are excluded here and handled
+exclusively by `ReplayWriteFile` (stage 9).
 
 ```rust
 pub struct UpdateExistingFile {
@@ -922,7 +982,14 @@ impl UpdateExistingFile {
 }
 ```
 
-Content selection follows a three-way strategy:
+**Path selection:**
+
+| Source | Condition | Probability |
+|---|---|---|
+| `guidance.write_paths ∩ baseline` | target wrote here AND node survives reset | 70% bias |
+| `baseline_file_paths` | fallback — all files enumerated at startup | remaining |
+
+**Content selection** follows a three-way strategy:
 
 | Strategy | Probability | Behaviour |
 |---|---|---|
@@ -933,19 +1000,66 @@ Content selection follows a three-way strategy:
 Skips if `baseline_file_paths` is empty or `ops.len() >= MAX_OPS`.
 
 **Why**: `AddFileOp` only creates new files at random paths, so existing
-baseline files (`/input`, `/etc/config`) were never mutated in-place.
-`UpdateExistingFile` targets exactly these files — those the target process
-is guaranteed to read — and guarantees the VFS op succeeds (100% semantic
-yield for this stage in practice).  Real-content perturbation is the
-highest-value mutation for reaching deep parser state: a config file with
-`[settings]\nverbose=0\n` keeps most of its structure when a single bit
-flips, so the parser advances past its header check and the mutator
-exercises downstream logic that random bytes never reach.
+files are never mutated in-place by any other stage.  `UpdateExistingFile`
+closes that gap.  When `write_paths` is populated (Phase B), the mutator
+directly targets paths the target just wrote to — those are the most
+valuable to perturb because the target will immediately read back the
+modified content and exercise downstream logic.  Without guidance it falls
+back to baseline paths (`/input`, `/etc/config`) which the target is
+guaranteed to read — still 100% semantic yield for this stage in practice.
+Real-content perturbation keeps structure intact (a config file with
+`[settings]\nverbose=0\n` survives a single-bit flip) so the parser
+advances past its header check and reaches code that random bytes never
+reach.
 
 Phase A feeds `baseline_contents` from a hard-coded map that mirrors
 `populate_baseline`.  When Phase B adds a `cp_read_file` FFI the list can
-be populated from the live VFS after each iteration, which will also catch
-any mutation-induced content drift.
+be re-populated from the live VFS each iteration, catching any
+mutation-induced content drift.
+
+---
+
+### 9. `ReplayWriteFile`
+
+Covers `write_paths ∖ baseline_file_paths` — paths the target *created*
+during a run that are absent after VFS reset.  `UpdateExistingFile` cannot
+emit `UpdateFile` for these (node doesn't exist); `ReplayWriteFile` emits
+`CreateFile` instead, which triggers `cp_ensure_parents` to create any
+missing parent directories before the file node is created.
+
+```rust
+pub struct ReplayWriteFile {
+    pub guidance:            MutationGuidance,
+    pub baseline_file_paths: Vec<String>,
+}
+impl ReplayWriteFile {
+    pub fn new(baseline_file_paths: Vec<String>) -> Self { ... }
+}
+```
+
+**Path selection:** always from `write_paths ∖ baseline_file_paths`.  The
+complement is recomputed each `mutate()` call — O(|write_paths| ×
+|baseline|), negligible for the sizes involved (< 100 paths each).
+
+**Content selection:**
+
+| Strategy | Probability | Behaviour |
+|---|---|---|
+| **Dictionary draw** | 30% | pick an entry from `CONTENT_DICTIONARY` |
+| **Random bytes** | 70% | 1–64 uniform random bytes |
+
+Real-content perturbation is unavailable (no baseline snapshot for
+target-created files).  Phase B will extend the FUSE write log to capture
+actual written bytes, enabling true content replay.
+
+Skips when `write_paths ∖ baseline` is empty (Phase A default — guidance
+unpopulated) or `ops.len() >= MAX_OPS`.
+
+**Why**: without this stage, 100% of `write_paths` entries that correspond
+to target-created files are silently wasted — `UpdateExistingFile` would
+skip or generate a failing VFS op.  `ReplayWriteFile` closes the gap,
+ensuring every path the target touched is reachable by the mutation engine
+regardless of whether it pre-existed in the baseline.
 
 ---
 
@@ -1232,7 +1346,7 @@ once target execution (milliseconds) is included.
 
 ## Unit & Integration Tests
 
-Run with `cargo test`.  **40 tests, 0 failures.**
+Run with `cargo test`.  **46 tests, 0 failures.**
 
 ### `delta::tests` — 6 unit tests
 
@@ -1245,7 +1359,7 @@ Run with `cargo test`.  **40 tests, 0 failures.**
 | `seed_one_uses_update_not_create` | first family is `UpdateFile` — eliminates EEXIST bug |
 | `initial_corpus_pool_has_no_eexist_collision` | no `CreateFile` on a baseline path in any donor |
 
-### `mutators::tests` — 29 structural unit tests
+### `mutators::tests` — 35 structural unit tests
 
 | Test | Verifies |
 |---|---|
@@ -1275,9 +1389,15 @@ Run with `cargo test`.  **40 tests, 0 failures.**
 | `destructive_mutator_delete_prefers_recreate_paths` | with non-empty `guidance.recreate_paths`, DeleteFile path chosen from that list at least once in 200 tries |
 | `update_existing_file_appends_update_op` | kind is `UpdateFile`; path from baseline; `size == content.len()` |
 | `update_existing_file_perturbs_baseline_content` | when `baseline_contents` is set, observed content differs from the raw baseline within 200 tries (perturbation active) |
+| `update_existing_file_prefers_write_paths` | with `write_paths` entry that IS in baseline, path is drawn from that list at least once in 100 tries (70% bias); non-baseline write_paths are not eligible |
 | `update_existing_file_skips_when_no_baseline` | `Skipped`; delta unchanged |
 | `update_existing_file_skips_at_max_ops` | `Skipped` when `ops.len() == MAX_OPS` |
 | `perturb_bytes_handles_empty_base` | `perturb_bytes(rand, &[])` returns a non-empty `Vec<u8>` across modes |
+| `mutate_path_whole_swap_prefers_write_paths_over_recreate` | with both `write_paths` and `recreate_paths` populated, whole-swap picks `write_paths` (higher priority) |
+| `replay_write_file_skips_with_no_guidance` | `Skipped` when `write_paths` is empty |
+| `replay_write_file_skips_when_all_write_paths_in_baseline` | `Skipped` when every `write_paths` entry is already in the baseline (complement is empty) |
+| `replay_write_file_creates_non_baseline_path` | non-baseline `write_paths` entry produces `CreateFile` op at that exact path |
+| `replay_write_file_ignores_baseline_write_paths` | mixed `write_paths` (some in baseline, some not) — only non-baseline paths are ever selected across 100 tries |
 
 ### `ffi::tests` — 5 E2E integration tests
 
@@ -1302,8 +1422,10 @@ The `e2e_set_times` test confirms the SetTimes FFI bridge is wired end-to-end
 - `vfs/fvfs.c`: log writes in `fvfs_write`, `fvfs_create`, `fvfs_mkdir`,
   `fvfs_unlink`, `fvfs_rename` behind a `g_target_running` flag.
 - `control_plane/`: `fuse_iter_log_t` struct, `cp_collect_log()` to drain it.
-- `mutators.rs`: populate `MutationGuidance.enoent_paths` and
-  `recreate_paths` from the collected log before each mutation.
+- `mutators.rs`: populate all three `MutationGuidance` fields from the
+  collected log — `write_paths` (LOG_WRITE/CREATE/RENAME_TO/MKDIR),
+  `enoent_paths` (LOG_ENOENT), `recreate_paths` (LOG_UNLINK/RMDIR/RENAME_FROM)
+  — before each mutation.  The consumer wiring is already in place.
 - `fuzz.rs`: replace dumb loop with a real LibAFL `StdFuzzer` loop that
   forks the target through the FUSE mount.
 
