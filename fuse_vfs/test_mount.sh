@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-#
-# test_mount.sh — integration test for the VFS-backed FUSE mount.
-#
-# Mounts fuse_vfs at a temporary directory, runs read/stat/ls checks, then
-# unmounts cleanly.  Exit code 0 = all pass, 1 = any failure.
-#
 # Usage:  bash test_mount.sh          (or: make test)
 
 set -euo pipefail
@@ -39,9 +33,6 @@ check_eq() {
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 
-# -------------------------------------------------------------------------
-# Setup: mount and register cleanup handler
-# -------------------------------------------------------------------------
 
 [ -x "$BINARY" ] || die "Binary not found: $BINARY  (run 'make' first)"
 
@@ -53,19 +44,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Mount (FUSE daemonises by default).
 "$BINARY" "$MOUNT"
 
-# Wait up to 2 s for the mountpoint to become active.
 for _ in $(seq 1 20); do
     mountpoint -q "$MOUNT" 2>/dev/null && break
     sleep 0.1
 done
 mountpoint -q "$MOUNT" || die "Mount did not appear after 2 s"
 
-# -------------------------------------------------------------------------
-# Tests
-# -------------------------------------------------------------------------
 
 echo ""
 echo "fuse_vfs integration tests"
@@ -130,10 +116,6 @@ check    "removed dir is gone"          bash -c "! test -d '$MOUNT/newdir' 2>/de
 # --- unlink ---
 check    "unlink file"                  rm "$MOUNT/newfile"
 check    "unlinked file is gone"        bash -c "! test -f '$MOUNT/newfile' 2>/dev/null"
-
-# -------------------------------------------------------------------------
-# Summary
-# -------------------------------------------------------------------------
 
 echo ""
 if [ "$FAIL" -eq 0 ]; then

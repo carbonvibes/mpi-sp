@@ -1,6 +1,4 @@
 /*
- * fuse_vfs.c — FUSE frontend backed by the in-memory VFS core.
- *
  * Exposes a read-write FUSE mount backed entirely by the in-memory VFS.
  * No data is ever written to disk; all state lives in heap memory.
  *
@@ -33,12 +31,7 @@
 
 #include "../vfs/vfs.h"
 
-/* Global VFS instance.  Initialised in main() before fuse_main() runs. */
 static vfs_t *g_vfs;
-
-/* -------------------------------------------------------------------------
- * Stat conversion helper
- * ---------------------------------------------------------------------- */
 
 static void vfs_stat_to_stat(const vfs_stat_t *vs, struct stat *st)
 {
@@ -59,10 +52,6 @@ static void vfs_stat_to_stat(const vfs_stat_t *vs, struct stat *st)
     st->st_atim = vs->atime;
 }
 
-/* -------------------------------------------------------------------------
- * FUSE callbacks
- * ---------------------------------------------------------------------- */
-
 static int fvfs_getattr(const char *path, struct stat *st,
                         struct fuse_file_info *fi)
 {
@@ -74,10 +63,6 @@ static int fvfs_getattr(const char *path, struct stat *st,
     return 0;
 }
 
-/*
- * Bridge: adapts the vfs_readdir_cb_t signature to a FUSE filler call.
- * Passed as the callback to vfs_readdir(); ctx is a readdir_ctx_t *.
- */
 typedef struct {
     void            *buf;
     fuse_fill_dir_t  filler;
@@ -123,28 +108,12 @@ static int fvfs_read(const char *path, char *buf, size_t size, off_t offset,
     return (int)got;
 }
 
-/* -------------------------------------------------------------------------
- * Write-path callbacks
- * ---------------------------------------------------------------------- */
-
-/*
- * Create a new empty file.  FUSE calls this (not open) when O_CREAT is used
- * on a path that does not yet exist.
- */
 static int fvfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
     (void)mode; (void)fi;
     return vfs_create_file(g_vfs, path, NULL, 0);
 }
 
-/*
- * Write size bytes from buf into the file at offset.
- *
- * The VFS stores content as a single flat buffer, so this is a
- * read-modify-write: read the current content, overlay the new bytes,
- * then call vfs_update_file with the merged result.  Gaps introduced by
- * writes past the end of the current content are zero-filled.
- */
 static int fvfs_write(const char *path, const char *buf, size_t size,
                       off_t offset, struct fuse_file_info *fi)
 {
@@ -174,10 +143,6 @@ static int fvfs_write(const char *path, const char *buf, size_t size,
     return (r == 0) ? (int)size : r;
 }
 
-/*
- * Truncate or extend the file to exactly newsize bytes.
- * Bytes beyond the old size are zero-filled on extension.
- */
 static int fvfs_truncate(const char *path, off_t newsize,
                          struct fuse_file_info *fi)
 {
@@ -220,11 +185,6 @@ static int fvfs_rmdir(const char *path)
     return vfs_rmdir(g_vfs, path);
 }
 
-/*
- * rename: FUSE passes (oldpath, newpath, flags).
- * flags (RENAME_NOREPLACE, RENAME_EXCHANGE) are not supported; we ignore them
- * and fall through to standard POSIX replace semantics.
- */
 static int fvfs_rename(const char *oldpath, const char *newpath,
                        unsigned int flags)
 {
@@ -247,11 +207,6 @@ static int fvfs_readlink(const char *path, char *buf, size_t size)
     return (r >= 0) ? 0 : r;
 }
 
-/*
- * Set atime (tv[0]) and mtime (tv[1]) on the node at path.
- * Handles UTIME_NOW (set to current time) and UTIME_OMIT (leave unchanged)
- * as required by POSIX utimensat(2).
- */
 static int fvfs_utimens(const char *path, const struct timespec tv[2],
                         struct fuse_file_info *fi)
 {
@@ -287,19 +242,10 @@ static const struct fuse_operations fvfs_ops = {
     .utimens  = fvfs_utimens,
 };
 
-/* -------------------------------------------------------------------------
- * Initial filesystem layout
- *
- * Populated once in main() before FUSE takes control.  The fuzzer control
- * path (Week 5) will replace this with dynamic mutation batches.
- * ---------------------------------------------------------------------- */
 
 static void populate_vfs(void)
 {
-    /*
-     * /counter — the benchmark (../benchmark.c) opens this path for 60 s.
-     * Content is a static string; throughput, not value, is what we measure.
-     */
+    
     vfs_create_file(g_vfs, "/counter",
                     (const uint8_t *)"0\n", 2);
 
