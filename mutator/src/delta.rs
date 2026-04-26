@@ -175,9 +175,23 @@ impl FsDelta {
 impl Input for FsDelta {
     fn generate_name(&self, id: Option<CorpusId>) -> String {
         match id {
-            Some(id) => format!("delta_{}_ops{}", id.0, self.ops.len()),
-            None     => format!("delta_ops{}", self.ops.len()),
+            Some(id) => format!("delta_{}_ops{}.json", id.0, self.ops.len()),
+            None     => format!("delta_ops{}.json", self.ops.len()),
         }
+    }
+
+    fn to_file<P: AsRef<std::path::Path>>(&self, path: P) -> Result<(), libafl::Error> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| libafl::Error::serialize(e.to_string()))?;
+        std::fs::write(path, json.as_bytes())
+            .map_err(|e| libafl::Error::os_error(e, "writing corpus entry"))
+    }
+
+    fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, libafl::Error> {
+        let data = std::fs::read(path)
+            .map_err(|e| libafl::Error::os_error(e, "reading corpus entry"))?;
+        serde_json::from_slice(&data)
+            .map_err(|e| libafl::Error::serialize(e.to_string()))
     }
 }
 

@@ -14,11 +14,27 @@ path = "src/bin/fuzz.rs"
 name = "vfs_bench"
 path = "src/bin/vfs_bench.rs"
 
+# Phase B: LibAFL harness — foobar demo + libarchive campaign.
+# Usage:
+#   cargo run --bin fuzz_libafl -- foobar        (default demo)
+#   cargo run --bin fuzz_libafl -- libarchive    (needs libarchive-dev)
+[[bin]]
+name = "fuzz_libafl"
+path = "src/bin/fuzz_libafl.rs"
+
 [dependencies]
-libafl        = "0.15"
-libafl_bolts  = "0.15"
-serde         = { version = "1", features = ["derive"] }
-libc          = "0.2"
+libafl         = "0.15"
+libafl_bolts   = "0.15"
+# libafl_targets provides SanCov callbacks (__sanitizer_cov_trace_pc_guard*)
+# and EDGES_MAP.  foobar_target.c is compiled with -fsanitize-coverage=trace-pc-guard;
+# these symbols resolve here at link time.
+libafl_targets = { version = "0.15", features = ["sancov_pcguard_edges"] }
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+libc           = "0.2"
+
+[build-dependencies]
+cc = "1"
 
 [profile.release]
 opt-level     = 3

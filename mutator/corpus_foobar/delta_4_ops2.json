@@ -1,0 +1,39 @@
+{
+  "ops": [
+    {
+      "kind": "UpdateFile",
+      "path": "/input",
+      "content": [
+        102,
+        117,
+        122,
+        122,
+        101,
+        100,
+        32,
+        99,
+        111,
+        110,
+        116,
+        101,
+        110,
+        116
+      ],
+      "size": 14,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "SetTimes",
+      "path": "/input",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 1000000000,
+      "mtime_nsec": 0,
+      "atime_sec": 1000000000,
+      "atime_nsec": 0
+    }
+  ]
+}

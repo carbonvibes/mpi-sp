@@ -69,8 +69,10 @@ static PATH_COMPONENTS: &[&str] = &[
 /// this pool with 40% probability; the other 60% fall back to random bytes so
 /// the mutator still explores unstructured space.
 static CONTENT_DICTIONARY: &[&[u8]] = &[
-    b"foobar",                               // Week 6 demo crash trigger
-    b"FOOBAR",
+    b"chocobar",                               // Week 6 demo crash trigger
+    b"cone_ice",
+    b"paal_ice",
+    b"kuch_ice",
     b"",                                     // empty content
     b"\x7fELF",                              // ELF magic
     b"#!/bin/sh\n",                          // shell shebang
@@ -149,7 +151,15 @@ fn pick_timestamp<R: Rand>(rand: &mut R) -> i64 {
 // 1. ByteFlipFileContent
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Flip 1–4 random bytes inside the content of a randomly chosen file op.
+/// Set 1–4 random bytes inside the content of a randomly chosen file op to random values.
+///
+/// Uses byte replacement (assign random value) rather than bit flipping (XOR).
+/// Bit flipping can only reach a specific target byte if the exact required bits happen to
+/// toggle simultaneously — the probability depends on the Hamming distance between the
+/// current and target byte.  Byte replacement always has P = 1/256 per position regardless
+/// of the current value, which is strictly better for converging toward specific byte values.
+///
+/// Also has a 20 % chance to append 1–8 random bytes, keeping the length-gate escape path.
 /// Skips if no file ops with non-empty content exist.
 pub struct ByteFlipFileContent {
     pub guidance: MutationGuidance,
@@ -192,11 +202,26 @@ where
         let op = &mut input.ops[chosen];
         let content_len = op.content.len();
 
-        let n_flips = 1 + state.rand_mut().below(nz(4));
-        for _ in 0..n_flips {
+        // 20%: append 1–8 random bytes.
+        // Keeps the length-gate escape path: a byte-set on existing bytes can never
+        // grow content past a `if len < N { return }` guard.
+        if state.rand_mut().below(nz(100)) < 20 {
+            let n_append = 1 + state.rand_mut().below(nz(8));
+            for _ in 0..n_append {
+                op.content.push(state.rand_mut().below(nz(256)) as u8);
+            }
+            op.size = op.content.len();
+            return Ok(MutationResult::Mutated);
+        }
+
+        // 80%: set 1–4 random byte positions to a uniformly random value.
+        // P(hitting the target value at any position) = 1/256, independent of
+        // the current byte — unlike bit flipping whose probability depends on
+        // the Hamming distance between the current and target byte.
+        let n_sets = 1 + state.rand_mut().below(nz(4));
+        for _ in 0..n_sets {
             let byte_idx = state.rand_mut().below(nz(content_len));
-            let flip_mask = 1u8 << state.rand_mut().below(nz(8));
-            op.content[byte_idx] ^= flip_mask;
+            op.content[byte_idx] = state.rand_mut().below(nz(256)) as u8;
         }
 
         Ok(MutationResult::Mutated)

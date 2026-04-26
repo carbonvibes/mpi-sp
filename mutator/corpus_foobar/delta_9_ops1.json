@@ -1,0 +1,31 @@
+{
+  "ops": [
+    {
+      "kind": "UpdateFile",
+      "path": "/input",
+      "content": [
+        65,
+        65,
+        65,
+        65,
+        65,
+        65,
+        65,
+        65,
+        65,
+        65,
+        65,
+        65,
+        65,
+        65,
+        65,
+        65
+      ],
+      "size": 16,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    }
+  ]
+}

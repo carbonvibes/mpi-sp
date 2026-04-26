@@ -88,13 +88,29 @@ static int fvfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     return vfs_readdir(g_vfs, path, readdir_bridge, &ctx);
 }
 
+static void *fvfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
+{
+    (void)conn;
+    /*
+     * Disable all kernel-side caching so every read/stat goes through FUSE.
+     * Without this the kernel page cache serves stale bytes after the fuzzer
+     * mutates the VFS in-place — the target sees the same content every
+     * iteration regardless of what apply_delta wrote.
+     */
+    cfg->attr_timeout     = 0;
+    cfg->entry_timeout    = 0;
+    cfg->negative_timeout = 0;
+    return NULL;
+}
+
 static int fvfs_open(const char *path, struct fuse_file_info *fi)
 {
-    (void)fi;
     vfs_stat_t vs;
     int r = vfs_getattr(g_vfs, path, &vs);
     if (r != 0) return r;
     if (vs.kind == VFS_DIR) return -EISDIR;
+    /* Bypass the kernel page cache so each fread() hits fvfs_read() fresh. */
+    fi->direct_io = 1;
     return 0;
 }
 
@@ -224,6 +240,7 @@ static int fvfs_utimens(const char *path, const struct timespec tv[2],
 }
 
 static const struct fuse_operations fvfs_ops = {
+    .init     = fvfs_init,
     /* read path */
     .getattr  = fvfs_getattr,
     .readdir  = fvfs_readdir,
@@ -242,14 +259,81 @@ static const struct fuse_operations fvfs_ops = {
     .utimens  = fvfs_utimens,
 };
 
+/* ── Library API (used by the LibAFL fuzzer harness) ─────────────────────────
+ *
+ * Call sequence from the fuzzer:
+ *   fuse_vfs_lib_init(vfs)          — bind the VFS to serve
+ *   // spawn thread:
+ *   fuse_vfs_lib_run(mountpoint)    — mount + block in event loop
+ *   // main thread polls:
+ *   while (!fuse_vfs_lib_is_mounted()) sleep(5ms);
+ *   // per iteration:
+ *   apply_delta(vfs, delta)
+ *   <target reads from mountpoint>
+ *   vfs_reset_to_snapshot(vfs)
+ *   // on exit:
+ *   fuse_vfs_lib_stop()
+ */
+
+static struct fuse   *g_fuse_handle = NULL;
+static volatile int   g_mounted     = 0;
+
+void fuse_vfs_lib_init(vfs_t *vfs)
+{
+    g_vfs = vfs;
+}
+
+/* Blocking: mounts the FUSE filesystem and runs the event loop.
+ * Returns when fuse_vfs_lib_stop() signals the session to exit. */
+int fuse_vfs_lib_run(const char *mountpoint)
+{
+    /* Minimal args — just the program name; no extra FUSE options needed. */
+    char *argv0 = "fvfs_lib";
+    struct fuse_args args = FUSE_ARGS_INIT(1, &argv0);
+
+    g_fuse_handle = fuse_new(&args, &fvfs_ops, sizeof(fvfs_ops), NULL);
+    fuse_opt_free_args(&args);
+    if (!g_fuse_handle) {
+        fprintf(stderr, "fuse_vfs_lib: fuse_new failed\n");
+        return -1;
+    }
+
+    if (fuse_mount(g_fuse_handle, mountpoint) != 0) {
+        fprintf(stderr, "fuse_vfs_lib: fuse_mount failed on %s\n", mountpoint);
+        fuse_destroy(g_fuse_handle);
+        g_fuse_handle = NULL;
+        return -1;
+    }
+
+    g_mounted = 1;                         /* signal readiness to main thread */
+    int ret = fuse_loop(g_fuse_handle);    /* blocks until fuse_vfs_lib_stop() */
+    g_mounted = 0;
+
+    fuse_unmount(g_fuse_handle);
+    fuse_destroy(g_fuse_handle);
+    g_fuse_handle = NULL;
+    return ret;
+}
+
+int fuse_vfs_lib_is_mounted(void)
+{
+    return g_mounted;
+}
+
+void fuse_vfs_lib_stop(void)
+{
+    if (g_fuse_handle && g_mounted)
+        fuse_exit(g_fuse_handle);
+}
+
+/* ── Standalone binary (not compiled when FUSE_VFS_LIBRARY is defined) ─────── */
+#ifndef FUSE_VFS_LIBRARY
 
 static void populate_vfs(void)
 {
-    
     vfs_create_file(g_vfs, "/counter",
                     (const uint8_t *)"0\n", 2);
 
-    /* A small directory tree used by the integration test and manual checks. */
     vfs_mkdir(g_vfs, "/docs");
     vfs_create_file(g_vfs, "/docs/readme.txt",
                     (const uint8_t *)"fuse_vfs: VFS-backed read-only FUSE mount.\n", 43);
@@ -257,7 +341,6 @@ static void populate_vfs(void)
     vfs_mkdir(g_vfs, "/data");
     vfs_create_file(g_vfs, "/data/sample.txt",
                     (const uint8_t *)"hello world\n", 12);
-    /* A file with non-text bytes to confirm binary read works. */
     vfs_create_file(g_vfs, "/data/binary.bin",
                     (const uint8_t *)"\x00\x01\x02\x03\xff\xfe", 6);
 }
@@ -275,3 +358,5 @@ int main(int argc, char *argv[])
     vfs_destroy(g_vfs);
     return ret;
 }
+
+#endif /* FUSE_VFS_LIBRARY */

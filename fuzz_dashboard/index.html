@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MPI-SP Fuzz Dashboard</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+
+  :root {
+    --bg:      #0d1117;
+    --surface: #161b22;
+    --border:  #21262d;
+    --green:   #00ff88;
+    --green2:  #00cc6a;
+    --red:     #ff4d4d;
+    --yellow:  #ffa500;
+    --blue:    #58a6ff;
+    --muted:   #8b949e;
+    --text:    #e6edf3;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    font-size: 14px;
+    min-height: 100vh;
+  }
+
+  /* ── Header ── */
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky; top: 0; z-index: 10;
+  }
+  .header-left { display: flex; align-items: center; gap: 14px; }
+  .logo { font-size: 18px; font-weight: 700; letter-spacing: -.5px; }
+  .logo span { color: var(--green); }
+  .campaign-badge {
+    background: #1f2937;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 3px 10px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--blue);
+  }
+  .status-badge {
+    display: flex; align-items: center; gap: 6px;
+    border: 1px solid var(--green);
+    border-radius: 6px;
+    padding: 4px 12px;
+    font-size: 12px; font-weight: 600;
+    color: var(--green);
+  }
+  .pulse {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.4;transform:scale(.8)} }
+  .status-badge.dead { border-color: var(--muted); color: var(--muted); }
+  .status-badge.dead .pulse { background: var(--muted); animation: none; }
+
+  /* ── Layout ── */
+  main { padding: 20px 24px; display: flex; flex-direction: column; gap: 20px; max-width: 1400px; margin: 0 auto; }
+
+  /* ── Stat cards ── */
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+  }
+  .card-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 8px; }
+  .card-value { font-size: 32px; font-weight: 700; font-family: 'JetBrains Mono', monospace; letter-spacing: -1px; }
+  .card-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .card.green .card-value { color: var(--green); }
+  .card.red   .card-value { color: var(--red); }
+  .card.blue  .card-value { color: var(--blue); }
+  .card.yellow .card-value { color: var(--yellow); }
+
+  /* ── Sections ── */
+  .section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .section-header {
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--muted);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+
+  /* ── Chart ── */
+  #chart-wrap { padding: 16px 18px; height: 200px; }
+  canvas { width: 100% !important; }
+
+  /* ── Two-column layout ── */
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+
+  /* ── Corpus table ── */
+  .corpus-table { width: 100%; border-collapse: collapse; }
+  .corpus-table th {
+    padding: 8px 12px; text-align: left;
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--muted); border-bottom: 1px solid var(--border);
+  }
+  .corpus-table td { padding: 7px 12px; border-bottom: 1px solid #1a1f27; font-size: 13px; }
+  .corpus-table tbody tr:hover { background: #1c2129; }
+  .corpus-table tbody tr:last-child td { border-bottom: none; }
+  .mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  .tag {
+    display: inline-block; border-radius: 4px; padding: 1px 6px;
+    font-size: 11px; font-weight: 600; font-family: 'JetBrains Mono', monospace;
+    margin-right: 2px;
+  }
+  .tag-u { background: #0c2d1f; color: var(--green); border: 1px solid #1a5c3a; }
+  .tag-c { background: #1a2d40; color: var(--blue); border: 1px solid #1e4976; }
+  .tag-d { background: #2d1a1a; color: var(--red); border: 1px solid #5c1e1e; }
+  .tag-m { background: #2d2a1a; color: var(--yellow); border: 1px solid #5c521e; }
+  .tag-t { background: #1a1a2d; color: #a78bfa; border: 1px solid #3d2d6b; }
+  .tag-s { background: #1a2a2d; color: #67e8f9; border: 1px solid #1e5c6b; }
+  .empty-msg { padding: 24px; text-align: center; color: var(--muted); font-size: 13px; }
+
+  /* ── Log ── */
+  .log-wrap {
+    padding: 12px 14px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    line-height: 1.7;
+    max-height: 280px;
+    overflow-y: auto;
+    color: #adbac7;
+  }
+  .log-wrap::-webkit-scrollbar { width: 6px; }
+  .log-wrap::-webkit-scrollbar-track { background: transparent; }
+  .log-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .log-line { white-space: pre-wrap; word-break: break-all; }
+  .log-line.heartbeat { color: var(--green); }
+  .log-line.crash     { color: var(--red); font-weight: 600; }
+  .log-line.testcase  { color: var(--blue); }
+  .log-line.mount     { color: var(--yellow); }
+
+  /* ── Runtime display ── */
+  .runtime { color: var(--muted); font-size: 13px; }
+
+  /* ── Refresh indicator ── */
+  .refresh-info { font-size: 12px; color: var(--muted); }
+  .refresh-info span { color: var(--green); }
+
+  /* ── Corpus detail panel ── */
+  .delta-entry { border-bottom: 1px solid var(--border); }
+  .delta-header {
+    padding: 8px 16px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    user-select: none;
+  }
+  .delta-header:hover { background: #1c2129; }
+  .delta-ops {
+    display: none;
+    background: #0a0f14;
+    border-top: 1px solid var(--border);
+  }
+  .delta-ops.open { display: block; }
+  .op-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 6px 20px;
+    border-bottom: 1px solid #12171e;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+  }
+  .op-row:last-child { border-bottom: none; }
+  .op-badge {
+    flex-shrink: 0;
+    width: 36px;
+    text-align: center;
+    border-radius: 4px;
+    padding: 2px 0;
+    font-size: 10px;
+    font-weight: 700;
+    border: 1px solid;
+  }
+  .op-path { color: var(--blue); flex-shrink: 0; }
+  .op-content { color: #adbac7; word-break: break-all; flex: 1; }
+  .op-meta { color: var(--muted); font-size: 11px; flex-shrink: 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <div class="logo">MPI<span>·</span>SP Fuzzer</div>
+    <div class="campaign-badge" id="campaign-badge">—</div>
+  </div>
+  <div style="display:flex;align-items:center;gap:16px">
+    <div class="refresh-info">auto-refresh <span>2s</span></div>
+    <div class="status-badge dead" id="status-badge">
+      <div class="pulse"></div>
+      <span id="status-text">CONNECTING</span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <!-- Stat cards -->
+  <div class="cards">
+    <div class="card green">
+      <div class="card-label">Total Executions</div>
+      <div class="card-value" id="val-execs">—</div>
+      <div class="card-sub" id="val-runtime">—</div>
+    </div>
+    <div class="card blue">
+      <div class="card-label">Exec / sec</div>
+      <div class="card-value" id="val-execsec">—</div>
+      <div class="card-sub">iterations per second</div>
+    </div>
+    <div class="card yellow">
+      <div class="card-label">Corpus Size</div>
+      <div class="card-value" id="val-corpus">—</div>
+      <div class="card-sub">interesting inputs</div>
+    </div>
+    <div class="card red">
+      <div class="card-label">Crashes Found</div>
+      <div class="card-value" id="val-crashes">—</div>
+      <div class="card-sub">saved to solutions/</div>
+    </div>
+  </div>
+
+  <!-- Coverage chart -->
+  <div class="section">
+    <div class="section-header">
+      <span>Coverage — Edges Discovered Over Time</span>
+      <span id="val-edges" style="color:var(--green);font-family:'JetBrains Mono',monospace;font-size:13px">—</span>
+    </div>
+    <div id="chart-wrap"><canvas id="chart"></canvas></div>
+  </div>
+
+  <!-- Corpus + solutions side by side -->
+  <div class="two-col">
+    <div class="section">
+      <div class="section-header">
+        <span>Corpus Files (on-disk)</span>
+        <span id="corpus-count" style="color:var(--blue)">0 entries</span>
+      </div>
+      <div id="corpus-body">
+        <div class="empty-msg">Waiting for corpus entries…</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-header">
+        <span>🔴 Crashes / Solutions</span>
+        <span id="solutions-count" style="color:var(--red)">0 found</span>
+      </div>
+      <div id="solutions-body">
+        <div class="empty-msg">No crashes yet — keep fuzzing!</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Live Corpus Detail -->
+  <div class="section">
+    <div class="section-header">
+      <span>Live Corpus — Full FsDelta View</span>
+      <div style="display:flex;align-items:center;gap:14px">
+        <span style="font-size:11px;color:var(--muted)">click entry to expand ops</span>
+        <span id="corpus-detail-count" style="color:var(--blue);font-family:'JetBrains Mono',monospace;font-size:13px">0 entries</span>
+      </div>
+    </div>
+    <div id="corpus-detail-body">
+      <div class="empty-msg">Waiting for corpus entries…</div>
+    </div>
+  </div>
+
+  <!-- Live log -->
+  <div class="section">
+    <div class="section-header">
+      <span>Live Log</span>
+      <span id="logfile-path" class="mono" style="font-size:11px;color:var(--muted)"></span>
+    </div>
+    <div class="log-wrap" id="log-wrap"></div>
+  </div>
+</main>
+
+<script>
+// ── Tiny canvas chart ──────────────────────────────────────────────────────
+
+const canvas = document.getElementById('chart');
+const ctx    = canvas.getContext('2d');
+let chartHistory = [];
+
+function drawChart(history) {
+  const wrap = document.getElementById('chart-wrap');
+  const W = wrap.clientWidth;
+  const H = wrap.clientHeight;
+  canvas.width  = W;
+  canvas.height = H;
+
+  if (!history.length) return;
+
+  const vals = history.map(h => h.edges);
+  const maxV = Math.max(...vals, 1);
+  const pad  = { top: 10, right: 10, bottom: 28, left: 44 };
+  const cW   = W - pad.left - pad.right;
+  const cH   = H - pad.top  - pad.bottom;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Grid lines
+  ctx.strokeStyle = '#21262d';
+  ctx.lineWidth   = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.top + (cH * i / 4);
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cW, y); ctx.stroke();
+    ctx.fillStyle = '#5c6470';
+    ctx.font = '10px JetBrains Mono, monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(Math.round(maxV * (4 - i) / 4), pad.left - 6, y + 4);
+  }
+
+  // Area fill
+  const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + cH);
+  grad.addColorStop(0, 'rgba(0,255,136,0.3)');
+  grad.addColorStop(1, 'rgba(0,255,136,0.02)');
+
+  ctx.beginPath();
+  ctx.moveTo(pad.left, pad.top + cH);
+  vals.forEach((v, i) => {
+    const x = pad.left + (i / (vals.length - 1 || 1)) * cW;
+    const y = pad.top  + cH - (v / maxV) * cH;
+    if (i === 0) ctx.lineTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.lineTo(pad.left + cW, pad.top + cH);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  ctx.strokeStyle = '#00ff88';
+  ctx.lineWidth   = 2;
+  vals.forEach((v, i) => {
+    const x = pad.left + (i / (vals.length - 1 || 1)) * cW;
+    const y = pad.top  + cH - (v / maxV) * cH;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  // X-axis labels (runtime)
+  ctx.fillStyle = '#5c6470';
+  ctx.font = '10px JetBrains Mono, monospace';
+  ctx.textAlign = 'center';
+  const step = Math.ceil(vals.length / 6);
+  history.forEach((h, i) => {
+    if (i % step === 0 || i === history.length - 1) {
+      const x = pad.left + (i / (vals.length - 1 || 1)) * cW;
+      ctx.fillText(h.runtime, x, H - 4);
+    }
+  });
+}
+
+// ── Corpus file renderer ───────────────────────────────────────────────────
+
+function bytesHuman(n) {
+  if (n < 1024) return n + 'B';
+  if (n < 1024*1024) return (n/1024).toFixed(1) + 'KB';
+  return (n/1024/1024).toFixed(1) + 'MB';
+}
+
+function timeAgo(ts) {
+  const s = Math.floor(Date.now()/1000 - ts);
+  if (s < 60)  return s + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  return Math.floor(s/3600) + 'h ago';
+}
+
+function renderFileList(files, containerId, countId, colorClass, emptyMsg) {
+  const count = document.getElementById(countId);
+  const body  = document.getElementById(containerId);
+  count.textContent = files.length + (files.length === 1 ? ' entry' : ' entries');
+
+  if (!files.length) {
+    body.innerHTML = `<div class="empty-msg">${emptyMsg}</div>`;
+    return;
+  }
+
+  const rows = files.slice(-40).reverse().map(f => {
+    const color = colorClass === 'red' ? 'var(--red)' : 'var(--blue)';
+    return `<tr>
+      <td class="mono" style="color:${color};max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${f.name}</td>
+      <td style="color:var(--muted)">${bytesHuman(f.bytes)}</td>
+      <td style="color:var(--muted)">${timeAgo(f.mtime)}</td>
+    </tr>`;
+  }).join('');
+
+  body.innerHTML = `<table class="corpus-table">
+    <thead><tr><th>Name</th><th>Size</th><th>Age</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+// ── Log renderer ───────────────────────────────────────────────────────────
+
+function classifyLine(line) {
+  if (/Client Heartbeat|UserStats/.test(line)) return 'heartbeat';
+  if (/Objective|crash|CRASH|abort/.test(line))  return 'crash';
+  if (/Testcase/.test(line))                      return 'testcase';
+  if (/FUSE mounted|runc bundle|runc rootfs/.test(line)) return 'mount';
+  return '';
+}
+
+function renderLog(lines, logFile) {
+  document.getElementById('logfile-path').textContent = logFile;
+  const wrap = document.getElementById('log-wrap');
+  const wasAtBottom = wrap.scrollHeight - wrap.scrollTop <= wrap.clientHeight + 40;
+
+  wrap.innerHTML = lines.map(l => {
+    const cls = classifyLine(l);
+    const escaped = l.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return `<div class="log-line ${cls}">${escaped}</div>`;
+  }).join('');
+
+  if (wasAtBottom) wrap.scrollTop = wrap.scrollHeight;
+}
+
+// ── Number formatter ───────────────────────────────────────────────────────
+
+function fmtNum(n) {
+  if (n >= 1e9) return (n/1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n/1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'k';
+  return String(n);
+}
+
+function fmtExecSec(n) {
+  if (n >= 1000) return (n/1000).toFixed(1) + 'k';
+  return n.toFixed(0);
+}
+
+// ── Corpus detail renderer ─────────────────────────────────────────────────
+
+const OP_STYLE = {
+  UpdateFile: { bg:'#0c2d1f', color:'#00ff88', border:'#1a5c3a', label:'UPD' },
+  CreateFile: { bg:'#1a2d40', color:'#58a6ff', border:'#1e4976', label:'NEW' },
+  DeleteFile: { bg:'#2d1a1a', color:'#ff4d4d', border:'#5c1e1e', label:'DEL' },
+  Mkdir:      { bg:'#2d2a1a', color:'#ffa500', border:'#5c521e', label:'DIR' },
+  Rmdir:      { bg:'#2a1a2d', color:'#c084fc', border:'#5c1e5c', label:'RMD' },
+  Truncate:   { bg:'#1a2a2d', color:'#67e8f9', border:'#1e5c6b', label:'TRC' },
+  SetTimes:   { bg:'#2d2d1a', color:'#d4d47a', border:'#5c5c1e', label:'TMS' },
+};
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function formatContent(arr) {
+  if (!arr || !arr.length) return '<span style="color:var(--muted)">&lt;empty&gt;</span>';
+  const max = 200;
+  const isPrint = arr.every(b => (b >= 32 && b < 127) || b === 10 || b === 13 || b === 9);
+  const trunc   = arr.length > max;
+  const preview = arr.slice(0, max);
+  let body;
+  if (isPrint) {
+    body = escHtml(String.fromCharCode(...preview));
+  } else {
+    body = preview.map(b => b.toString(16).padStart(2,'0')).join(' ');
+  }
+  const suffix = trunc
+    ? `<span style="color:var(--muted)"> … (${arr.length} bytes total)</span>`
+    : '';
+  return `<span style="white-space:pre-wrap">${body}</span>${suffix}`;
+}
+
+function renderOp(op) {
+  const s = OP_STYLE[op.kind] || { bg:'#1a1a1a', color:'#ccc', border:'#333', label:'???' };
+  const badge = `<span class="op-badge" style="background:${s.bg};color:${s.color};border-color:${s.border}">${s.label}</span>`;
+  const path  = `<span class="op-path">${escHtml(op.path)}</span>`;
+
+  let extra = '';
+  if (op.kind === 'UpdateFile' || op.kind === 'CreateFile') {
+    extra = `<span class="op-content">${formatContent(op.content)}</span>`;
+    if (op.size != null) extra += `<span class="op-meta">${op.size}B</span>`;
+  } else if (op.kind === 'Truncate') {
+    extra = `<span class="op-meta">new_size = ${op.size}</span>`;
+  } else if (op.kind === 'SetTimes') {
+    extra = `<span class="op-meta">mtime=${op.mtime_sec}  atime=${op.atime_sec}</span>`;
+  }
+
+  return `<div class="op-row">${badge}${path}${extra}</div>`;
+}
+
+let openEntries = new Set();
+
+function toggleDelta(id) {
+  const el = document.getElementById('ops-' + id);
+  if (!el) return;
+  if (openEntries.has(id)) {
+    openEntries.delete(id);
+    el.classList.remove('open');
+  } else {
+    openEntries.add(id);
+    el.classList.add('open');
+  }
+}
+
+function renderCorpusDetail(entries) {
+  const body     = document.getElementById('corpus-detail-body');
+  const countEl  = document.getElementById('corpus-detail-count');
+  const withDelta = entries.filter(e => e.delta);
+  countEl.textContent = withDelta.length + ' entr' + (withDelta.length === 1 ? 'y' : 'ies');
+
+  if (!withDelta.length) {
+    body.innerHTML = '<div class="empty-msg">Waiting for corpus entries…</div>';
+    return;
+  }
+
+  const html = withDelta.map((e, idx) => {
+    const ops   = (e.delta && e.delta.ops) || [];
+    const age   = timeAgo(e.mtime);
+    const isOpen = openEntries.has(idx);
+
+    // Op-kind summary pills in the header
+    const kindCounts = {};
+    ops.forEach(op => { kindCounts[op.kind] = (kindCounts[op.kind] || 0) + 1; });
+    const pills = Object.entries(kindCounts).map(([k, n]) => {
+      const s = OP_STYLE[k] || { bg:'#1a1a1a', color:'#ccc', border:'#333', label:'???' };
+      return `<span class="op-badge" style="background:${s.bg};color:${s.color};border-color:${s.border};margin-right:3px">${n}×${s.label}</span>`;
+    }).join('');
+
+    const opsHtml = ops.map(op => renderOp(op)).join('');
+
+    return `<div class="delta-entry">
+      <div class="delta-header" onclick="toggleDelta(${idx})">
+        <span style="color:var(--blue);font-family:'JetBrains Mono',monospace;font-size:12px;min-width:200px">${escHtml(e.name)}</span>
+        <span style="display:flex;gap:4px;align-items:center">${pills}</span>
+        <span style="color:var(--muted);font-size:12px;margin-left:auto">${age}</span>
+        <span style="color:var(--muted);font-size:11px;margin-left:12px">${isOpen ? '▼' : '▶'}</span>
+      </div>
+      <div class="delta-ops ${isOpen ? 'open' : ''}" id="ops-${idx}">${opsHtml}</div>
+    </div>`;
+  }).join('');
+
+  body.innerHTML = html;
+}
+
+// ── Main update ───────────────────────────────────────────────────────────
+
+let lastExecs = 0;
+let alive     = false;
+
+function update() {
+  fetch('/api/state')
+    .then(r => r.json())
+    .then(d => {
+      alive = true;
+      const badge = document.getElementById('status-badge');
+      badge.className = 'status-badge';
+      document.getElementById('status-text').textContent = 'RUNNING';
+
+      document.getElementById('campaign-badge').textContent = d.campaign;
+
+      const L = d.latest;
+      if (L && L.execs != null) {
+        document.getElementById('val-execs').textContent   = fmtNum(L.execs);
+        document.getElementById('val-execsec').textContent = fmtExecSec(L.exec_sec);
+        document.getElementById('val-corpus').textContent  = L.corpus;
+        document.getElementById('val-crashes').textContent = L.objectives;
+        document.getElementById('val-runtime').textContent = 'runtime: ' + L.runtime;
+        document.getElementById('val-edges').textContent   =
+          `${L.edges} / ${L.edge_total} edges (${((L.edges/L.edge_total)*100).toFixed(2)}%)`;
+      }
+
+      drawChart(d.history);
+      renderLog(d.log_tail, d.log_file);
+
+      renderFileList(d.corpus_files,    'corpus-body',    'corpus-count',    'blue', 'Waiting for corpus entries…');
+      renderFileList(d.solutions_files, 'solutions-body', 'solutions-count', 'red',  'No crashes yet — keep fuzzing!');
+      renderCorpusDetail(d.corpus_files);
+    })
+    .catch(() => {
+      if (alive) {
+        document.getElementById('status-badge').className = 'status-badge dead';
+        document.getElementById('status-text').textContent = 'DISCONNECTED';
+      }
+    });
+}
+
+update();
+setInterval(update, 2000);
+window.addEventListener('resize', () => drawChart(chartHistory));
+</script>
+</body>
+</html>

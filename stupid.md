@@ -962,3 +962,79 @@ The mutators are mostly naive operators waiting for a real corpus,
 real guidance, and real state-aware path selection.
 ```
 
+## Regarding Guidance
+
+Short version: **the design is sound for a Week 5 / Phase A filesystem fuzzer, but the guidance probabilities are not “optimal” yet.** They are good hand-tuned heuristics. The scaffolding is strong, but once you move into real feedback-guided fuzzing, you should make the guidance more type-aware and evaluate the percentages empirically.
+
+I checked [docs/WEEK5.md](/home/arjun/mpi-sp/docs/WEEK5.md:13), [mutator/src/mutators.rs](/home/arjun/mpi-sp/mutator/src/mutators.rs:301), and [mutator/src/guidance.rs](/home/arjun/mpi-sp/mutator/src/guidance.rs:10). I also ran:
+
+```text
+cargo test
+cargo run --bin fuzz -- 200
+```
+
+Results: **42/42 tests passed**, and the 200-iteration dumb loop had **200 apply OK, 0 apply errors, 200 clean resets, 196/200 semantic yield, 192 promotions, final corpus 128 entries**. So mechanically, the Phase A loop is healthy.
+
+**What Looks Sound**
+- Semantic `FsDelta` mutation is the right model. Mutating typed filesystem ops is much better than byte-flipping serialized deltas for this project. The doc makes this clear around [docs/WEEK5.md](/home/arjun/mpi-sp/docs/WEEK5.md:61).
+- The seed corpus fix is important and correct: using `UpdateFile("/input")` instead of `CreateFile("/input")` avoids immediate `EEXIST` dead inputs.
+- Live corpus promotion by novel checksum is a reasonable Phase A substitute for real feedback. It gives `SpliceDelta` evolving donors, documented at [docs/WEEK5.md](/home/arjun/mpi-sp/docs/WEEK5.md:44).
+- Skip-early `can_apply` filtering is a real win. It explains the 0 skipped iterations in the run and avoids wasting mutation budget.
+- Baseline-path targeting is exactly the right correction for filesystem fuzzing. Random paths are useful, but filesystem ops need known-existing files/dirs often enough to produce meaningful state.
+- Real-content perturbation in `UpdateExistingFile` is probably the highest-value content strategy you have right now. Preserving most of `/etc/config` while perturbing bytes is much better than pure random replacement.
+
+**Are The Percentages Optimal?**
+No. They are **reasonable defaults**, not optimal. For example:
+- `AddFileOp`: 70% guided ENOENT path, 90% file bias when guided, implemented at [mutator/src/mutators.rs](/home/arjun/mpi-sp/mutator/src/mutators.rs:310). This is sensible because most failed lookups are likely file opens, but it should eventually be validated against actual FUSE event context.
+- `MutatePath`: 30% whole-path swap, otherwise component mutation, implemented at [mutator/src/mutators.rs](/home/arjun/mpi-sp/mutator/src/mutators.rs:440). This keeps diversity, but it is not op-type-aware enough yet.
+- `DestructiveMutator`: 70% baseline bias and 50% recreate-path bias, implemented at [mutator/src/mutators.rs](/home/arjun/mpi-sp/mutator/src/mutators.rs:647). Good as a starting point, but static.
+- `ReplaceFileContent`: 40% dictionary, 60% random, described at [mutator/src/mutators.rs](/home/arjun/mpi-sp/mutator/src/mutators.rs:216). Reasonable.
+- `UpdateExistingFile`: 50% real-content perturbation, then 30% dictionary / 70% random fallback, implemented at [mutator/src/mutators.rs](/home/arjun/mpi-sp/mutator/src/mutators.rs:830). This is probably the best knob, but I would later raise real-content perturbation for structured files.
+
+So I would phrase it as: **the probabilities are defensible exploration/exploitation heuristics, but they need ablation or adaptive scheduling before you can claim optimality.**
+
+**Main Design Risks**
+The biggest issue is that the guidance signals are currently path-only, not type-rich enough. [MutationGuidance](/home/arjun/mpi-sp/mutator/src/guidance.rs:15) has `write_paths`, `enoent_paths`, and `recreate_paths`, but it does not encode whether a path was a file, dir, rename source, rename destination, failed open target, failed stat target, etc.
+
+That can create bad guided mutations later:
+
+- `write_paths` includes `LOG_MKDIR`, but `UpdateExistingFile` may choose a guided `write_path` and emit `UpdateFile(path, ...)`. If that path is a directory, the op fails.
+- `recreate_paths` can contain both file and directory deletes. `DestructiveMutator` may use the same pool for `DeleteFile` and `Rmdir`, so `Rmdir(file_path)` or `DeleteFile(dir_path)` can happen.
+- `MutatePath` can swap an `UpdateFile` path to an `ENOENT` path. Unless another op creates that path first, the update fails.
+- The current 98% semantic yield is encouraging, but it is VFS-state yield, not target-behavior yield. A checksum change can be irrelevant to target coverage.
+
+**What I’d Change Before Calling It Strong Feedback Guidance**
+1. Split guidance by path kind and event kind:
+   - `enoent_file_candidates`
+   - `enoent_dir_candidates`
+   - `written_file_paths`
+   - `created_dir_paths`
+   - `deleted_file_paths`
+   - `removed_dir_paths`
+
+2. Make path guidance op-kind-aware:
+   - `UpdateFile`, `Truncate`, `DeleteFile` should prefer known or inferred file paths.
+   - `Rmdir` should prefer known or inferred dir paths.
+   - `CreateFile` should prefer ENOENT file candidates.
+   - `Mkdir` should prefer ENOENT dir candidates or parent-expansion paths.
+
+3. Track per-stage success:
+   - mutation produced semantic yield
+   - mutation produced target access-log novelty
+   - mutation produced coverage novelty
+   - mutation produced only VFS op failures
+
+4. Replace fixed percentages with adaptive weights once Phase B exists. Even a simple UCB/epsilon-greedy scheduler would be more defensible than permanent hand-tuned constants.
+
+5. Add an ablation table:
+   - no guidance
+   - baseline path guidance only
+   - ENOENT creation guidance
+   - write-path content guidance
+   - recreate-path guidance
+   - all guidance enabled
+
+**Verdict**
+For building a feedback fuzzer for filesystems: **yes, the logic is sound and the architecture is pointed in the right direction.** The Week 5 doc is not nonsense at all. It reflects a real progression from random filesystem mutation toward target-aware mutation.
+
+But I would not say the probabilities are optimal. I’d say: **they are solid Phase A defaults, good enough to proceed, and the next correctness upgrade is typed guidance plus empirical/adaptive tuning.** The one thing I’d be careful about in the writeup is not overclaiming “feedback-guided” until Phase B actually populates `MutationGuidance` from FUSE logs and measures target-level improvement.

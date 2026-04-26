@@ -1,0 +1,24 @@
+{
+  "ops": [
+    {
+      "kind": "SetTimes",
+      "path": "/input",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 1700000000,
+      "mtime_nsec": 0,
+      "atime_sec": 1700000000,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Truncate",
+      "path": "/input",
+      "content": [],
+      "size": 2,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    }
+  ]
+}

@@ -8,7 +8,7 @@
  */
 
 use std::ffi::CString;
-use std::os::raw::c_int;
+use std::os::raw::{c_char, c_int};
 
 use libc::timespec;
 
@@ -120,6 +120,24 @@ extern "C" {
 
     /// Free the array returned by cp_enumerate_paths().
     pub fn cp_enumerate_paths_free(paths: *mut *mut i8, n: usize);
+}
+
+// ── fuse_vfs library API (compiled in when has_fuse3 is set) ─────────────────
+#[cfg(has_fuse3)]
+extern "C" {
+    /// Bind the VFS that the FUSE mount will serve.  Call once before
+    /// fuse_vfs_lib_run().
+    pub fn fuse_vfs_lib_init(vfs: *mut VfsT);
+
+    /// Mount at `mountpoint` and block in the FUSE event loop until
+    /// fuse_vfs_lib_stop() is called.  Intended to run in a background thread.
+    pub fn fuse_vfs_lib_run(mountpoint: *const c_char) -> c_int;
+
+    /// Returns 1 after fuse_mount() has succeeded inside fuse_vfs_lib_run().
+    pub fn fuse_vfs_lib_is_mounted() -> c_int;
+
+    /// Signal the FUSE event loop to exit cleanly.
+    pub fn fuse_vfs_lib_stop();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

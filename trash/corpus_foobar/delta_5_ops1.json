@@ -1,0 +1,18 @@
+{
+  "ops": [
+    {
+      "kind": "CreateFile",
+      "path": "/fuzz_input",
+      "content": [
+        110,
+        101,
+        119
+      ],
+      "size": 3,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    }
+  ]
+}

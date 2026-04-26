@@ -1,0 +1,46 @@
+{
+  "ops": [
+    {
+      "kind": "Mkdir",
+      "path": "/data",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "CreateFile",
+      "path": "/data/a.bin",
+      "content": [
+        222,
+        173,
+        190,
+        239
+      ],
+      "size": 4,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "CreateFile",
+      "path": "/data/b.txt",
+      "content": [
+        104,
+        101,
+        108,
+        108,
+        111,
+        10
+      ],
+      "size": 6,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    }
+  ]
+}
