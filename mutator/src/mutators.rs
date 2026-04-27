@@ -69,10 +69,11 @@ static PATH_COMPONENTS: &[&str] = &[
 /// this pool with 40% probability; the other 60% fall back to random bytes so
 /// the mutator still explores unstructured space.
 static CONTENT_DICTIONARY: &[&[u8]] = &[
-    b"chocobar",                               // Week 6 demo crash trigger
+    b"random_shit",                               // Week 6 demo crash trigger
     b"cone_ice",
     b"paal_ice",
-    b"kuch_ice",
+    b"chocobar",
+    b"fahhhhhhh",
     b"",                                     // empty content
     b"\x7fELF",                              // ELF magic
     b"#!/bin/sh\n",                          // shell shebang
@@ -183,20 +184,11 @@ where
     S: HasRand,
 {
     fn mutate(&mut self, state: &mut S, input: &mut FsDelta) -> Result<MutationResult, Error> {
-        // For each path, only the LAST CreateFile/UpdateFile op is effective:
-        // apply_delta processes ops in order, so earlier ops for the same path
-        // are dead weight. Build a deduped candidate set (last index per path)
-        // so byte-sets always land on the op that the target actually reads.
-        let mut last_idx_by_path: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        for (i, op) in input.ops.iter().enumerate() {
-            if matches!(op.kind, FsOpKind::CreateFile | FsOpKind::UpdateFile)
-                && !op.content.is_empty()
-            {
-                last_idx_by_path.insert(op.path.as_str(), i);
-            }
-        }
-        let candidates: Vec<usize> = last_idx_by_path.values().copied().collect();
+        let candidates: Vec<usize> = input.ops.iter().enumerate()
+            .filter(|(_, op)| matches!(op.kind, FsOpKind::CreateFile | FsOpKind::UpdateFile)
+                && !op.content.is_empty())
+            .map(|(i, _)| i)
+            .collect();
 
         if candidates.is_empty() {
             return Ok(MutationResult::Skipped);

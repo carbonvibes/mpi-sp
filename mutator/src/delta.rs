@@ -170,6 +170,36 @@ impl FsDelta {
     pub fn len(&self) -> usize {
         self.ops.len()
     }
+
+    /// Remove dead ops: for any path that has multiple UpdateFile/CreateFile
+    /// ops, only the last one affects the VFS (apply_delta processes in order,
+    /// last write wins). Earlier ones are dead weight — strip them so corpus
+    /// entries stay compact and future mutations always start from a clean base.
+    ///
+    /// Non-content ops (Mkdir, DeleteFile, Rmdir, Truncate, SetTimes) and
+    /// ops for paths that appear only once are kept as-is.
+    pub fn dedup_content_ops(&self) -> Self {
+        // Walk backwards to record the index of the last content op per path.
+        let mut last_content_idx: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (i, op) in self.ops.iter().enumerate() {
+            if matches!(op.kind, FsOpKind::CreateFile | FsOpKind::UpdateFile) {
+                last_content_idx.insert(op.path.as_str(), i);
+            }
+        }
+
+        let ops = self.ops.iter().enumerate()
+            .filter(|(i, op)| {
+                match last_content_idx.get(op.path.as_str()) {
+                    Some(last) => *i == *last,   // keep only the last content op for this path
+                    None       => true,           // non-content op — always keep
+                }
+            })
+            .map(|(_, op)| op.clone())
+            .collect();
+
+        Self { ops }
+    }
 }
 
 impl Input for FsDelta {
@@ -181,7 +211,8 @@ impl Input for FsDelta {
     }
 
     fn to_file<P: AsRef<std::path::Path>>(&self, path: P) -> Result<(), libafl::Error> {
-        let json = serde_json::to_string_pretty(self)
+        let clean = self.dedup_content_ops();
+        let json = serde_json::to_string_pretty(&clean)
             .map_err(|e| libafl::Error::serialize(e.to_string()))?;
         std::fs::write(path, json.as_bytes())
             .map_err(|e| libafl::Error::os_error(e, "writing corpus entry"))
