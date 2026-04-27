@@ -183,16 +183,20 @@ where
     S: HasRand,
 {
     fn mutate(&mut self, state: &mut S, input: &mut FsDelta) -> Result<MutationResult, Error> {
-        let candidates: Vec<usize> = input
-            .ops
-            .iter()
-            .enumerate()
-            .filter(|(_, op)| {
-                matches!(op.kind, FsOpKind::CreateFile | FsOpKind::UpdateFile)
-                    && !op.content.is_empty()
-            })
-            .map(|(i, _)| i)
-            .collect();
+        // For each path, only the LAST CreateFile/UpdateFile op is effective:
+        // apply_delta processes ops in order, so earlier ops for the same path
+        // are dead weight. Build a deduped candidate set (last index per path)
+        // so byte-sets always land on the op that the target actually reads.
+        let mut last_idx_by_path: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (i, op) in input.ops.iter().enumerate() {
+            if matches!(op.kind, FsOpKind::CreateFile | FsOpKind::UpdateFile)
+                && !op.content.is_empty()
+            {
+                last_idx_by_path.insert(op.path.as_str(), i);
+            }
+        }
+        let candidates: Vec<usize> = last_idx_by_path.values().copied().collect();
 
         if candidates.is_empty() {
             return Ok(MutationResult::Skipped);
@@ -835,9 +839,6 @@ where
     S: HasRand,
 {
     fn mutate(&mut self, state: &mut S, input: &mut FsDelta) -> Result<MutationResult, Error> {
-        if input.ops.len() >= MAX_OPS {
-            return Ok(MutationResult::Skipped);
-        }
         if self.baseline_file_paths.is_empty() {
             return Ok(MutationResult::Skipped);
         }
@@ -878,6 +879,24 @@ where
             }
         };
 
+        // Modify the last existing UpdateFile op for this path in-place rather
+        // than appending a new one. Appending creates dead ops: apply_delta
+        // processes ops in order so the last op wins, making all earlier ops
+        // for the same path unreachable by the target. In-place modification
+        // keeps the delta compact and ensures ByteFlipFileContent always
+        // operates on the op the target actually reads.
+        if let Some(existing) = input.ops.iter_mut().rev()
+            .find(|op| op.kind == FsOpKind::UpdateFile && op.path == path)
+        {
+            existing.content = content;
+            existing.size = existing.content.len();
+            return Ok(MutationResult::Mutated);
+        }
+
+        // No existing op for this path — append a new one if there is room.
+        if input.ops.len() >= MAX_OPS {
+            return Ok(MutationResult::Skipped);
+        }
         input.ops.push(FsOp::update_file(path, content));
         Ok(MutationResult::Mutated)
     }
