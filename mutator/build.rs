@@ -37,7 +37,7 @@ fn main() {
     cc::Build::new()
         .compiler("clang")
         .file("../demo/foobar_target.c")
-        .flag("-fsanitize-coverage=trace-pc-guard")
+        .flag("-fsanitize-coverage=trace-pc-guard,trace-cmp")
         .opt_level(1)
         .compile("foobar_target");
 
@@ -62,7 +62,7 @@ fn main() {
         let mut build = cc::Build::new();
         build.compiler("clang")
              .file("../demo/libarchive_harness.c")
-             .flag("-fsanitize-coverage=trace-pc-guard")
+             .flag("-fsanitize-coverage=trace-pc-guard,trace-cmp")
              .opt_level(1);
 
         if sancov_lib.exists() {

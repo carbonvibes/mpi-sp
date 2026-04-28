@@ -37,7 +37,7 @@ use std::{
 };
 
 use libafl::{
-    corpus::OnDiskCorpus,
+    corpus::{Corpus, CorpusId, OnDiskCorpus},
     events::SimpleEventManager,
     executors::{ExitKind, InProcessExecutor},
     feedbacks::{CrashFeedback, MaxMapFeedback},
@@ -46,12 +46,79 @@ use libafl::{
     mutators::HavocScheduledMutator,
     schedulers::QueueScheduler,
     stages::StdMutationalStage,
-    state::StdState,
+    state::{HasCorpus, StdState},
+    HasMetadata,
 };
-use libafl_bolts::{current_nanos, rands::StdRand, tuples::tuple_list};
+use libafl::observers::cmp::CmpValuesMetadata;
+use libafl::observers::{HitcountsMapObserver, Observer, StdMapObserver};
+use libafl_bolts::{current_nanos, rands::StdRand, tuples::tuple_list, Named};
 use libafl_targets::{EDGES_MAP, EDGES_MAP_DEFAULT_SIZE};
 use libafl_targets::coverage::MAX_EDGES_FOUND;
-use libafl::observers::{HitcountsMapObserver, StdMapObserver};
+use libafl_targets::cmps::{CmpLogObserver, CMPLOG_ENABLED};
+use serde::{Deserialize, Serialize};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SerializableCmpLogObserver
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Newtype wrapper around [`CmpLogObserver`] that satisfies the
+/// `Serialize + DeserializeOwned` bounds required by [`InProcessExecutor`].
+///
+/// The CmpLog comparison map lives in a global static (`libafl_cmplog_map_ptr`),
+/// so the observer has no meaningful in-memory state to persist across
+/// restarts.  Serialising it as a unit type `{}` and reconstructing it from
+/// scratch on deserialisation is therefore correct.
+#[derive(Debug)]
+struct SerializableCmpLogObserver {
+    inner: CmpLogObserver,
+}
+
+impl SerializableCmpLogObserver {
+    fn new(name: &'static str, add_meta: bool) -> Self {
+        Self { inner: CmpLogObserver::new(name, add_meta) }
+    }
+}
+
+// Trivial Serialize: emit an empty map — no persistent state needed.
+impl Serialize for SerializableCmpLogObserver {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        s.serialize_map(Some(0))?.end()
+    }
+}
+
+// Trivial Deserialize: always reconstruct from the global CmpLog map.
+impl<'de> Deserialize<'de> for SerializableCmpLogObserver {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Consume whatever was serialised (expect an empty map `{}`).
+        let _ = serde::de::IgnoredAny::deserialize(d)?;
+        Ok(Self::new("cmplog", true))
+    }
+}
+
+impl Named for SerializableCmpLogObserver {
+    fn name(&self) -> &std::borrow::Cow<'static, str> {
+        self.inner.name()
+    }
+}
+
+impl<I, S> Observer<I, S> for SerializableCmpLogObserver
+where
+    S: HasMetadata,
+{
+    fn pre_exec(&mut self, state: &mut S, input: &I) -> Result<(), libafl::Error> {
+        self.inner.pre_exec(state, input)
+    }
+
+    fn post_exec(
+        &mut self,
+        state: &mut S,
+        input: &I,
+        exit_kind: &ExitKind,
+    ) -> Result<(), libafl::Error> {
+        self.inner.post_exec(state, input, exit_kind)
+    }
+}
 
 use fs_mutator::{
     delta::{generate_seed_corpus, initial_corpus_pool, FsDelta, FsOp},
@@ -61,13 +128,14 @@ use fs_mutator::{
         vfs_reset_to_snapshot, vfs_save_snapshot, VfsT,
     },
     mutators::{
-        AddFileOp, ByteFlipFileContent, DestructiveMutator, LiveCorpus, MutatePath,
-        RemoveOp, ReplaceFileContent, ReplayWriteFile, SpliceDelta, UpdateExistingFile,
+        AddFileOp, ByteFlipFileContent, DestructiveMutator, FsDeltaI2SMutator, LiveCorpus,
+        MutatePath, RemoveOp, ReplaceFileContent, ReplayWriteFile, SpliceDelta,
+        UpdateExistingFile,
     },
 };
 
 #[cfg(has_fuse3)]
-use fs_mutator::ffi::{fuse_vfs_lib_init, fuse_vfs_lib_is_mounted, fuse_vfs_lib_run, fuse_vfs_lib_stop};
+use fs_mutator::ffi::{fuse_vfs_lib_init, fuse_vfs_lib_is_mounted, fuse_vfs_lib_run};
 
 // Per-iteration counter for unique container IDs (avoids runc state conflicts).
 static RUNC_ITER: AtomicU64 = AtomicU64::new(0);
@@ -539,6 +607,15 @@ fn main() {
         ))
     };
 
+    // CmpLog: the observer lives in the main executor so its post_exec fires on
+    // every execution and writes comparison pairs into CmpValuesMetadata.
+    // pre_exec resets the CmpLog map; post_exec scans it — this costs ~5k exec/s
+    // vs running without CmpLog.  The tradeoff is worth it: FsDeltaI2SMutator
+    // resolves each gate in a handful of executions rather than thousands of
+    // random guesses, so the crash is found orders of magnitude faster overall.
+    unsafe { CMPLOG_ENABLED = 1; }
+    let cmplog_observer = SerializableCmpLogObserver::new("cmplog", true);
+
     // ── Feedback + objective ──────────────────────────────────────────────────
     let mut feedback  = MaxMapFeedback::new(&edges_observer);
     let mut objective = CrashFeedback::new();
@@ -553,11 +630,32 @@ fn main() {
     )
     .expect("failed to create StdState");
 
+    // Seed CmpValuesMetadata so the observer can update it from the first execution.
+    state.add_metadata(CmpValuesMetadata::new());
+
     // ── Event manager + monitor ───────────────────────────────────────────────
     let monitor = SimpleMonitor::new(|msg| println!("{msg}"));
     let mut mgr = SimpleEventManager::new(monitor);
 
     // ── Mutator stages ────────────────────────────────────────────────────────
+    //
+    // Two-stage pipeline:
+    //
+    //   Stage 1 — i2s_stage (dedicated, single mutator)
+    //     Runs FsDeltaI2SMutator in isolation.  Because it is the ONLY mutator
+    //     in this stage, no subsequent ByteFlip/Replace/etc. can overwrite its
+    //     substitution before the harness executes the input.  The CmpLog pairs
+    //     it reads were written by the previous execution of the same corpus
+    //     entry — a much tighter coupling than mixing I2S into the havoc pool.
+    //
+    //   Stage 2 — havoc_stage (all structural mutators)
+    //     The normal exploration engine.  FsDeltaI2SMutator is intentionally
+    //     absent here; it lives only in stage 1.
+    //
+    // CmpLog disabled — uncomment to re-enable:
+    let i2s_scheduled = HavocScheduledMutator::new(tuple_list!(FsDeltaI2SMutator::new()));
+    let i2s_stage     = StdMutationalStage::new(i2s_scheduled);
+
     let mutators = tuple_list!(
         ByteFlipFileContent::new(),
         ReplaceFileContent::new(),
@@ -574,8 +672,9 @@ fn main() {
             .with_baseline_contents(baseline_contents.clone()),
         ReplayWriteFile::new(baseline_file_paths.clone()),
     );
-    let scheduled  = HavocScheduledMutator::new(mutators);
-    let mut stages = tuple_list!(StdMutationalStage::new(scheduled));
+    let scheduled    = HavocScheduledMutator::new(mutators);
+    let havoc_stage  = StdMutationalStage::new(scheduled);
+    let mut stages   = tuple_list!(i2s_stage, havoc_stage);  // CmpLog disabled — swap to tuple_list!(i2s_stage, havoc_stage) to re-enable
 
     // ── Scheduler + fuzzer ────────────────────────────────────────────────────
     let scheduler  = QueueScheduler::new();
@@ -663,7 +762,12 @@ fn main() {
     };
     let mut executor = InProcessExecutor::with_timeout(
         &mut harness,
-        tuple_list!(edges_observer),
+        // Both observers live here:
+        //   edges_observer   — hitcount map → MaxMapFeedback drives corpus growth
+        //   cmplog_observer  — resets CmpLog map (pre_exec) and writes comparison
+        //                      pairs into CmpValuesMetadata (post_exec) so that
+        //                      FsDeltaI2SMutator in i2s_stage can read them.
+        tuple_list!(edges_observer, cmplog_observer),  // CmpLog disabled — swap to tuple_list!(edges_observer, cmplog_observer) to re-enable
         &mut fuzzer,
         &mut state,
         &mut mgr,
@@ -693,11 +797,29 @@ fn main() {
     }
 
     // ── Fuzz loop ─────────────────────────────────────────────────────────────
-    fuzzer
-        .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
-        .expect("fuzzing loop exited with error");
+    // Manual loop instead of fuzz_loop so we can sync newly promoted corpus
+    // entries into LiveCorpus after every iteration.  Without this, SpliceDelta
+    // would only ever see the original 11 seed entries as splice donors —
+    // it would never splice from the evolved "foobar..." inputs that I2S and
+    // havoc discover, defeating the purpose of having a "live" corpus.
+    loop {
+        let count_before = state.corpus().count();
 
-    // ── Cleanup ───────────────────────────────────────────────────────────────
-    #[cfg(has_fuse3)]
-    unsafe { fuse_vfs_lib_stop() };
+        fuzzer
+            .fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr)
+            .expect("fuzzing iteration failed");
+
+        // Push any newly promoted entries into LiveCorpus so SpliceDelta
+        // immediately sees them as splice donors in subsequent iterations.
+        let count_after = state.corpus().count();
+        for idx in count_before..count_after {
+            let cid = CorpusId::from(idx);
+            if let Ok(tc) = state.corpus().get(cid) {
+                if let Some(input) = tc.borrow().input().clone() {
+                    live_corpus.borrow_mut().push(input);
+                }
+            }
+        }
+    }
+
 }

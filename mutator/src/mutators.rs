@@ -16,9 +16,11 @@ use std::rc::Rc;
 use libafl::{
     corpus::CorpusId,
     mutators::{MutationResult, Mutator},
+    observers::cmp::{CmpValues, CmpValuesMetadata},
     state::HasRand,
     Error,
 };
+use libafl::common::HasMetadata;
 use libafl_bolts::{rands::Rand, Named};
 
 use crate::{
@@ -968,6 +970,119 @@ where
         };
 
         input.ops.push(FsOp::create_file(path, content));
+        Ok(MutationResult::Mutated)
+    }
+
+    fn post_exec(&mut self, _state: &mut S, _id: Option<CorpusId>) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. FsDeltaI2SMutator
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// CmpLog-guided input-to-state mutator for FsDelta.
+///
+/// `CmpLogObserver` accumulates comparison operand pairs in `CmpValuesMetadata`
+/// on every execution.  When the target runs `if (data[i] != 'a') return`, the
+/// observer records `(current_byte, 'a')`.  This mutator reads those pairs and
+/// substitutes `current_byte → 'a'` directly inside a file content op, resolving
+/// the comparison in one step instead of a random walk through 256 values.
+///
+/// Works for 1/2/4/8-byte integer comparisons.  Tries both substitution directions
+/// (`lhs→rhs` and `rhs→lhs`) so coverage feedback filters the correct one.
+pub struct FsDeltaI2SMutator;
+
+impl FsDeltaI2SMutator {
+    pub fn new() -> Self { Self }
+}
+
+impl Named for FsDeltaI2SMutator {
+    fn name(&self) -> &Cow<'static, str> {
+        static N: Cow<'static, str> = Cow::Borrowed("FsDeltaI2SMutator");
+        &N
+    }
+}
+
+impl<S> Mutator<FsDelta, S> for FsDeltaI2SMutator
+where
+    S: HasRand + HasMetadata,
+{
+    fn mutate(&mut self, state: &mut S, input: &mut FsDelta) -> Result<MutationResult, Error> {
+        let Ok(meta) = state.metadata::<CmpValuesMetadata>() else {
+            return Ok(MutationResult::Skipped);
+        };
+
+        // Collect (lhs_bytes, rhs_bytes) from every failed comparison recorded
+        // by CmpLogObserver.  Both directions are added so coverage feedback
+        // selects the one that makes progress.
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for val in &meta.list {
+                match val {
+                    CmpValues::U8((a, b, _)) if a != b => {
+                        pairs.push((vec![*a], vec![*b]));
+                        pairs.push((vec![*b], vec![*a]));
+                    }
+                    CmpValues::U16((a, b, _)) if a != b => {
+                        pairs.push((a.to_le_bytes().to_vec(), b.to_le_bytes().to_vec()));
+                        pairs.push((b.to_le_bytes().to_vec(), a.to_le_bytes().to_vec()));
+                    }
+                    CmpValues::U32((a, b, _)) if a != b => {
+                        pairs.push((a.to_le_bytes().to_vec(), b.to_le_bytes().to_vec()));
+                        pairs.push((b.to_le_bytes().to_vec(), a.to_le_bytes().to_vec()));
+                    }
+                    CmpValues::U64((a, b, _)) if a != b => {
+                        pairs.push((a.to_le_bytes().to_vec(), b.to_le_bytes().to_vec()));
+                        pairs.push((b.to_le_bytes().to_vec(), a.to_le_bytes().to_vec()));
+                    }
+                    _ => {}
+                }
+        }
+
+        if pairs.is_empty() {
+            return Ok(MutationResult::Skipped);
+        }
+
+        // Pick a content op to mutate.
+        let candidates: Vec<usize> = input.ops.iter().enumerate()
+            .filter(|(_, op)| matches!(op.kind, FsOpKind::CreateFile | FsOpKind::UpdateFile)
+                && !op.content.is_empty())
+            .map(|(i, _)| i)
+            .collect();
+
+        if candidates.is_empty() {
+            return Ok(MutationResult::Skipped);
+        }
+
+        let op_idx    = *pick(state.rand_mut(), &candidates);
+        let (lhs, rhs) = pick(state.rand_mut(), &pairs).clone();
+
+        let content_len = input.ops[op_idx].content.len();
+        if lhs.is_empty() || lhs.len() > content_len {
+            return Ok(MutationResult::Skipped);
+        }
+
+        // Search for lhs starting at a random offset, wrapping around.
+        let search_end = content_len - lhs.len() + 1;
+        let start = if search_end > 1 { state.rand_mut().below(nz(search_end)) } else { 0 };
+
+        let pos = (start..search_end)
+            .chain(0..start)
+            .find(|&i| input.ops[op_idx].content[i..i + lhs.len()] == lhs[..]);
+
+        let Some(pos) = pos else {
+            return Ok(MutationResult::Skipped);
+        };
+
+        let end = pos + lhs.len();
+        let mut new_content = Vec::with_capacity(content_len - lhs.len() + rhs.len());
+        new_content.extend_from_slice(&input.ops[op_idx].content[..pos]);
+        new_content.extend_from_slice(&rhs);
+        new_content.extend_from_slice(&input.ops[op_idx].content[end..]);
+        input.ops[op_idx].content = new_content;
+        input.ops[op_idx].size    = input.ops[op_idx].content.len();
+
         Ok(MutationResult::Mutated)
     }
 
