@@ -473,15 +473,15 @@ function escHtml(s) {
 function formatContent(arr) {
   if (!arr || !arr.length) return '<span style="color:var(--muted)">&lt;empty&gt;</span>';
   const max = 200;
-  const isPrint = arr.every(b => (b >= 32 && b < 127) || b === 10 || b === 13 || b === 9);
   const trunc   = arr.length > max;
   const preview = arr.slice(0, max);
-  let body;
-  if (isPrint) {
-    body = escHtml(String.fromCharCode(...preview));
-  } else {
-    body = preview.map(b => b.toString(16).padStart(2,'0')).join(' ');
-  }
+  const body = escHtml(preview.map(b => {
+    if (b >= 32 && b < 127) return String.fromCharCode(b);
+    if (b === 10) return '\\n';
+    if (b === 13) return '\\r';
+    if (b === 9)  return '\\t';
+    return '\\x' + b.toString(16).padStart(2, '0');
+  }).join(''));
   const suffix = trunc
     ? `<span style="color:var(--muted)"> … (${arr.length} bytes total)</span>`
     : '';

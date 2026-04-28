@@ -43,14 +43,37 @@ void fuzz_foobar(const uint8_t *data, size_t len)
     if (data[4] != 'a') return;
     if (len < 6) return;
 
-    /* Gate 6: sixth byte is 'r' — crash */
+    /* Gate 6: sixth byte is 'r' */
     if (data[5] != 'r') return;
+    if (len < 7) return;
+
+    /* Gate 7: seventh byte is 'w' */
+    if (data[6] != 'w') return;
+    if (len < 8) return;
+
+    /* Gate 8: eighth byte is 'o' */
+    if (data[7] != 'o') return;
+    if (len < 9) return;
+
+    /* Gate 9: ninth byte is 'r' */
+    if (data[8] != 'r') return;
+    if (len < 10) return;
+
+    /* Gate 10: tenth byte is 'l' */
+    if (data[9] != 'l') return;
+    if (len < 11) return;
+
+    /* Gate 11: eleventh byte is 'd' */
+    if (data[10] != 'd') return;
+    if (len < 12) return;
+
+    /* Gate 12: twelfth byte is '!' */
+    if (data[11] != '!') return;
 
     abort();
 }
 
-/* Read the file at path and apply fuzz_foobar() to its contents.
- * Used with the FUSE mount so the full FsDelta (not just bytes) is exercised. */
+/* Read the file at path and apply fuzz_foobar() to its contents. */
 void fuzz_foobar_from_path(const char *path)
 {
     FILE *f = fopen(path, "rb");

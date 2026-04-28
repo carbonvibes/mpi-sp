@@ -1038,3 +1038,24 @@ That can create bad guided mutations later:
 For building a feedback fuzzer for filesystems: **yes, the logic is sound and the architecture is pointed in the right direction.** The Week 5 doc is not nonsense at all. It reflects a real progression from random filesystem mutation toward target-aware mutation.
 
 But I would not say the probabilities are optimal. I’d say: **they are solid Phase A defaults, good enough to proceed, and the next correctness upgrade is typed guidance plus empirical/adaptive tuning.** The one thing I’d be careful about in the writeup is not overclaiming “feedback-guided” until Phase B actually populates `MutationGuidance` from FUSE logs and measures target-level improvement.
+
+
+1. Corpus minimization stage — highest impact, moderate effort
+
+Before an entry is promoted, minimize it to the smallest delta that still triggers the same new coverage. LibAFL has StdTminMutationalStage for this. Right now a SpliceDelta can produce a 19-op delta that discovered one new edge — after minimization it might be 2 ops. Smaller base = every future mutation is more focused. This directly helps for any real target.
+
+2. N-gram coverage instead of edge coverage — easy to add, meaningful upgrade
+
+Instead of tracking individual edges (A→B), track 4-grams (A→B→C→D). More path-sensitive, fewer collisions on complex targets, naturally distinguishes "same edge reached via different contexts." Just requires adding sancov_ngram4 feature to libafl_targets and changing the compilation flag. No harness logic changes.
+
+3. Weighted scheduler — moderate effort, real benefit for long campaigns
+
+Already discussed. The concern about under-prioritizing structurally diverse entries is real but manageable — you can combine a weighted scheduler with a "minimum budget" floor so no entry ever gets starved completely. AFL++ does this.
+
+4. VFS-level feedback signal — high impact for real bugs, significant work
+
+Right now feedback is purely SanCov edges in the target. But your VFS/FUSE layer has its own signal: which ops actually succeeded vs. failed (errno values), which paths were accessed, file sizes after operations. A new errno from a VFS op = new behavior the target hasn't seen before. Tracking this as a secondary feedback would help find bugs that don't manifest as new SanCov edges — permission errors, unexpected ENOENT, etc. This is unique to your architecture and would differentiate this fuzzer from generic ones.
+
+5. Dynamic content dictionary from corpus — simple, solid gain
+
+Whenever a corpus entry is promoted, extract its file content bytes as dictionary tokens. Feed those into TokenInsert/TokenReplace mutators. Cheaper than CmpLog, same basic idea — builds an evolving vocabulary of "bytes that matter" from what coverage feedback already validated. LibAFL has TokenInsert and TokenReplace mutators ready to use.
