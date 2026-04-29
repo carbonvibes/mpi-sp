@@ -1,13 +1,3 @@
-/*
- * mutators.rs — LibAFL mutator stages for FsDelta.
- *
- * Each struct implements libafl::mutators::Mutator<FsDelta, S> and
- * libafl_bolts::Named, as required by LibAFL 0.15.
- *
- * All stages accept a MutationGuidance field (empty in Phase A, populated
- * from the FUSE write log in Phase B).
- */
-
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
@@ -28,33 +18,18 @@ use crate::{
     guidance::MutationGuidance,
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Constants
-// ─────────────────────────────────────────────────────────────────────────────
 
-/// Hard cap on the number of ops in a single delta.
-/// AddFileOp and SpliceDelta skip rather than grow past this.
-/// Prevents unbounded delta bloat across iterations.
+
+/// Hard cap on ops per delta.
 pub const MAX_OPS: usize = 20;
 
-/// Cap on the live corpus size.  Once reached, novel deltas evict a random
-/// non-seed entry rather than letting the corpus grow unboundedly.
+/// Cap on the live corpus size; evicts a random non-seed entry when full.
 pub const MAX_LIVE_CORPUS: usize = 128;
 
-/// Shared, mutable corpus reference.  The harness holds one `LiveCorpus` and
-/// passes `Rc::clone(...)` to every mutator that needs to read from or push
-/// to it (currently only `SpliceDelta`).
-///
-/// Interior mutability via `RefCell` is required because the mutator API
-/// takes `&mut self` but the harness also needs to push promoted deltas
-/// between mutator calls.  Single-threaded use only (Phase A harness is
-/// single-threaded; Phase B's LibAFL harness will migrate to `Arc<Mutex<_>>`
-/// if needed).
+/// Shared live corpus; interior mutability needed since harness pushes between mutator calls.
 pub type LiveCorpus = Rc<RefCell<Vec<crate::delta::FsDelta>>>;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Shared helpers
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 /// A small vocabulary of valid path components.
 static PATH_COMPONENTS: &[&str] = &[
@@ -65,13 +40,9 @@ static PATH_COMPONENTS: &[&str] = &[
 
 /// Dictionary of structurally interesting content values.
 ///
-/// Covers: trigger strings the Week 6 demo target will crash on, magic bytes
-/// for common file formats, boundary / overflow markers, and path-shaped
-/// strings that sometimes confuse parsers.  `ReplaceFileContent` draws from
-/// this pool with 40% probability; the other 60% fall back to random bytes so
-/// the mutator still explores unstructured space.
+// 40% chance to draw from this; rest is random bytes
 static CONTENT_DICTIONARY: &[&[u8]] = &[
-    b"random_shit",                               // Week 6 demo crash trigger
+    b"random_shit",
     b"cone_ice",
     b"paal_ice",
     b"chocobar",
@@ -91,19 +62,15 @@ static CONTENT_DICTIONARY: &[&[u8]] = &[
     &[0x41; 4096],                           // 4KB of 'A' (page-size content)
 ];
 
-/// Wrap n in NonZeroUsize, panicking (programming error) if n == 0.
-/// Only call this where callers have already checked n > 0.
 #[inline]
 fn nz(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).expect("below() called with zero upper bound")
 }
 
-/// Pick a random element from a non-empty slice.
 fn pick<'a, T, R: Rand>(rand: &mut R, slice: &'a [T]) -> &'a T {
     &slice[rand.below(nz(slice.len()))]
 }
 
-/// Generate a random absolute path with 1–3 components.
 fn random_path<R: Rand>(rand: &mut R) -> String {
     let depth = 1 + rand.below(nz(3));
     let mut path = String::new();
@@ -114,14 +81,11 @@ fn random_path<R: Rand>(rand: &mut R) -> String {
     path
 }
 
-/// Generate random content: 1–64 random bytes.
 fn random_content<R: Rand>(rand: &mut R) -> Vec<u8> {
     let len = 1 + rand.below(nz(64));
     (0..len).map(|_| rand.below(nz(256)) as u8).collect()
 }
 
-/// Pick from `baseline` with `bias_pct`% probability; fall back to a random path.
-/// When `baseline` is empty, always returns a random path.
 fn pick_or_random<R: Rand>(rand: &mut R, baseline: &[String], bias_pct: usize) -> String {
     if !baseline.is_empty() && rand.below(nz(100)) < bias_pct {
         pick(rand, baseline).clone()
@@ -130,11 +94,6 @@ fn pick_or_random<R: Rand>(rand: &mut R, baseline: &[String], bias_pct: usize) -
     }
 }
 
-/// Pick a timestamp from a set of interesting edge-case values (40%) or a
-/// random UNIX timestamp (60%).
-///
-/// Edge cases: epoch, pre-epoch (-1), 2038 i32::MAX boundary, a recent
-/// timestamp (~2023), and zero nanoseconds vs a large nanosecond value.
 fn pick_timestamp<R: Rand>(rand: &mut R) -> i64 {
     const INTERESTING: &[i64] = &[
         0,                   // epoch
@@ -150,20 +109,9 @@ fn pick_timestamp<R: Rand>(rand: &mut R) -> i64 {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 1. ByteFlipFileContent
-// ─────────────────────────────────────────────────────────────────────────────
 
-/// Set 1–4 random bytes inside the content of a randomly chosen file op to random values.
-///
-/// Uses byte replacement (assign random value) rather than bit flipping (XOR).
-/// Bit flipping can only reach a specific target byte if the exact required bits happen to
-/// toggle simultaneously — the probability depends on the Hamming distance between the
-/// current and target byte.  Byte replacement always has P = 1/256 per position regardless
-/// of the current value, which is strictly better for converging toward specific byte values.
-///
-/// Also has a 20 % chance to append 1–8 random bytes, keeping the length-gate escape path.
-/// Skips if no file ops with non-empty content exist.
+
+/// Randomly set 1–4 bytes inside a file op content, or append up to 8 bytes (20%).
 pub struct ByteFlipFileContent {
     pub guidance: MutationGuidance,
 }
@@ -200,9 +148,7 @@ where
         let op = &mut input.ops[chosen];
         let content_len = op.content.len();
 
-        // 20%: append 1–8 random bytes.
-        // Keeps the length-gate escape path: a byte-set on existing bytes can never
-        // grow content past a `if len < N { return }` guard.
+        // 20%: append random bytes
         if state.rand_mut().below(nz(100)) < 20 {
             let n_append = 1 + state.rand_mut().below(nz(8));
             for _ in 0..n_append {
@@ -212,10 +158,7 @@ where
             return Ok(MutationResult::Mutated);
         }
 
-        // 80%: set 1–4 random byte positions to a uniformly random value.
-        // P(hitting the target value at any position) = 1/256, independent of
-        // the current byte — unlike bit flipping whose probability depends on
-        // the Hamming distance between the current and target byte.
+        // 80%: set 1–4 bytes to a random value
         let n_sets = 1 + state.rand_mut().below(nz(4));
         for _ in 0..n_sets {
             let byte_idx = state.rand_mut().below(nz(content_len));
@@ -230,16 +173,9 @@ where
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 2. ReplaceFileContent
-// ─────────────────────────────────────────────────────────────────────────────
 
-/// Replace the entire content of a randomly chosen file op with fresh bytes.
-///
-/// With 40% probability draws a value from `CONTENT_DICTIONARY` (trigger
-/// strings, magic bytes, boundary sizes) instead of random bytes.  Dictionary
-/// entries are short structured values that have a much higher chance of
-/// reaching parser error paths than uniform random input.
+
+/// Replace the entire content of a randomly chosen file op.
 pub struct ReplaceFileContent {
     pub guidance: MutationGuidance,
 }
@@ -276,10 +212,6 @@ where
 
         let chosen = *pick(state.rand_mut(), &candidates);
 
-        // 40% dictionary draw, 60% random bytes.  The dictionary contains
-        // short structured values (trigger strings, magic numbers, boundary
-        // sizes) that are far more likely to reach parser error paths than
-        // uniform random bytes of similar length.
         let new_content = if state.rand_mut().below(nz(100)) < 40 {
             pick(state.rand_mut(), CONTENT_DICTIONARY).to_vec()
         } else {
@@ -298,12 +230,9 @@ where
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 3. AddFileOp
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 /// Append a new CreateFile or Mkdir op with a random valid path.
-/// Biased toward ENOENT paths from guidance when available.
 pub struct AddFileOp {
     pub guidance: MutationGuidance,
 }
@@ -339,9 +268,7 @@ where
             random_path(state.rand_mut())
         };
 
-        // When using a guided ENOENT path the target tried to *open* a file
-        // there — bias strongly toward CreateFile (90 %) rather than Mkdir.
-        // For random paths, keep the default 70/30 split.
+        // bias toward CreateFile when using a guided ENOENT path
         let file_bias = if using_guided { 90 } else { 70 };
         let op = if state.rand_mut().below(nz(100)) < file_bias {
             FsOp::create_file(path, random_content(state.rand_mut()))
@@ -358,12 +285,9 @@ where
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 4. RemoveOp
-// ─────────────────────────────────────────────────────────────────────────────
 
-/// Remove a random op from the delta.
-/// Skips when only one op remains (empty delta is invalid).
+
+/// Remove a random op. Skips when only one op remains.
 pub struct RemoveOp {
     pub guidance: MutationGuidance,
 }
@@ -399,24 +323,11 @@ where
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 5. MutatePath
-// ─────────────────────────────────────────────────────────────────────────────
 
-/// Mutate the path of a randomly chosen op.
-///
-/// Two modes, chosen at random:
-/// - **Whole-path swap** (30 % when a target pool is non-empty): replace
-///   the entire path with a known-interesting path — prefers
-///   `guidance.enoent_paths` (paths the target tried to open) when populated,
-///   otherwise falls back to `baseline_paths`.  Useful for turning a failing
-///   op (random path that doesn't exist) into one the target actually reads.
-/// - **Component swap** (otherwise): replace one component with a word from
-///   `PATH_COMPONENTS`.  Explores the neighbourhood of the current path.
+
+/// Mutate the path of a randomly chosen op (whole-path swap or component swap).
 pub struct MutatePath {
     pub guidance:       MutationGuidance,
-    /// All VFS paths at baseline.  When non-empty, 30 % of mutations replace
-    /// the whole path with a baseline path rather than swapping a component.
     pub baseline_paths: Vec<String>,
 }
 
@@ -454,12 +365,7 @@ where
         let op_idx = state.rand_mut().below(nz(input.ops.len()));
         let op     = &mut input.ops[op_idx];
 
-        // Whole-path swap: redirect the op to a known-interesting path.
-        // Preference order when the swap roll hits:
-        //   1. guidance.enoent_paths  — target wanted these; creating/targeting them reaches new code
-        //   2. guidance.write_paths   — target wrote here; these ops are most likely to succeed
-        //   3. guidance.recreate_paths — target deleted/renamed these; re-targeting exercises same code
-        //   4. baseline_paths         — known to exist; fallback
+        // whole-path swap: redirect to a known-interesting path
         let have_swap_target = self.guidance.has_enoent()
             || self.guidance.has_write()
             || self.guidance.has_recreate()
@@ -497,27 +403,15 @@ where
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 6. SpliceDelta
-// ─────────────────────────────────────────────────────────────────────────────
 
-/// Append a random contiguous slice of ops from a donor delta.
-///
-/// Unlike a strict prefix splice, this picks a random start offset so that
-/// late-donor ops (e.g. metadata ops at the end of a sequence) can be spliced
-/// independently of the earlier ops they follow.  Since `cp_ensure_parents`
-/// handles missing parent directories, any slice is structurally safe.
-///
-/// The donor pool is a `LiveCorpus` shared with the harness — when the harness
-/// promotes a mutated delta (novel semantic yield) it pushes into this pool
-/// and subsequent `SpliceDelta` calls immediately see the new donor.
+
+/// Append a random slice of ops from a donor delta in the live corpus pool.
 pub struct SpliceDelta {
     pub guidance:    MutationGuidance,
     pub corpus_pool: LiveCorpus,
 }
 
 impl SpliceDelta {
-    /// Construct with a shared live corpus.
     pub fn new(pool: LiveCorpus) -> Self {
         Self {
             guidance: MutationGuidance::none(),
@@ -525,8 +419,6 @@ impl SpliceDelta {
         }
     }
 
-    /// Construct with a one-shot fixed pool (test/legacy helper).  The pool
-    /// is wrapped in a fresh `Rc<RefCell<_>>` so the struct type still matches.
     pub fn new_fixed(pool: Vec<FsDelta>) -> Self {
         Self {
             guidance: MutationGuidance::none(),
@@ -534,7 +426,6 @@ impl SpliceDelta {
         }
     }
 
-    /// Number of donors currently available.
     pub fn pool_len(&self) -> usize {
         self.corpus_pool.borrow().len()
     }
@@ -569,9 +460,7 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        // Pick a random start offset instead of always beginning at 0.
-        // cp_ensure_parents makes any slice structurally safe even when
-        // it skips an earlier Mkdir that creates the parent directory.
+        // random start offset so late-donor ops can be spliced independently
         let start       = state.rand_mut().below(nz(donor.ops.len()));
         let donor_slice = &donor.ops[start..];
 
@@ -593,31 +482,14 @@ where
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 7. DestructiveMutator
-// ─────────────────────────────────────────────────────────────────────────────
 
-/// Append a destructive or metadata op: DeleteFile, Rmdir, Truncate, or
-/// SetTimes.  These are the four op kinds that the other stages never
-/// generate as primary ops, ensuring all seven FsOpKind variants are
-/// reachable through the mutation pipeline.
-///
-/// Op-type-aware path selection (70 % baseline bias when lists are populated):
-///
-/// | Op | Path drawn from |
-/// |---|---|
-/// | `DeleteFile` | `baseline_file_paths` (files only) |
-/// | `Rmdir` | `baseline_dir_paths` (dirs only) |
-/// | `Truncate` | `baseline_file_paths` (files only) |
-/// | `SetTimes` | `baseline_all_paths` (any path) |
-///
-/// `SetTimes` timestamps are drawn from a set of interesting edge-case values
-/// (epoch, pre-epoch, 2038 boundary, far future) 40 % of the time.
+
+/// Append a destructive or metadata op (DeleteFile/Rmdir/Truncate/SetTimes).
 pub struct DestructiveMutator {
     pub guidance:            MutationGuidance,
-    pub baseline_file_paths: Vec<String>,  // for DeleteFile, Truncate
-    pub baseline_dir_paths:  Vec<String>,  // for Rmdir
-    pub baseline_all_paths:  Vec<String>,  // for SetTimes
+    pub baseline_file_paths: Vec<String>,
+    pub baseline_dir_paths:  Vec<String>,
+    pub baseline_all_paths:  Vec<String>,
 }
 
 impl DestructiveMutator {
@@ -630,8 +502,6 @@ impl DestructiveMutator {
         }
     }
 
-    /// Construct with pre-enumerated baseline path lists for op-type-aware
-    /// path selection.
     pub fn with_baseline(
         file_paths: Vec<String>,
         dir_paths:  Vec<String>,
@@ -669,9 +539,6 @@ where
 
         let op = match state.rand_mut().below(nz(4)) {
             0 => {
-                // DeleteFile: prefer guidance.recreate_paths (the target has
-                // shown it acts on these — re-deleting them may exercise the
-                // same code path again) → then baseline files → random.
                 let path = if self.guidance.has_recreate()
                     && state.rand_mut().below(nz(100)) < 50
                 {
@@ -682,7 +549,6 @@ where
                 FsOp::delete_file(path)
             }
             1 => {
-                // Rmdir: same idea as DeleteFile but on directory paths.
                 let path = if self.guidance.has_recreate()
                     && state.rand_mut().below(nz(100)) < 50
                 {
@@ -693,14 +559,11 @@ where
                 FsOp::rmdir(path)
             }
             2 => {
-                // Truncate: only meaningful on files.
                 let path     = pick_or_random(state.rand_mut(), &self.baseline_file_paths, 70);
                 let new_size = state.rand_mut().below(nz(1024));
                 FsOp::truncate(path, new_size)
             }
             _ => {
-                // SetTimes: any path (files and dirs can both have timestamps).
-                // Use interesting edge-case timestamps 40 % of the time.
                 let path       = pick_or_random(state.rand_mut(), &self.baseline_all_paths, 70);
                 let mtime_sec  = pick_timestamp(state.rand_mut());
                 let atime_sec  = pick_timestamp(state.rand_mut());
@@ -717,35 +580,13 @@ where
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 8. UpdateExistingFile
-// ─────────────────────────────────────────────────────────────────────────────
 
-/// Append an UpdateFile op targeting a file that is known to exist in the
-/// baseline VFS.
-///
-/// When `baseline_contents` is populated the mutator 50% of the time starts
-/// from the real content of the chosen file and applies a small perturbation
-/// (bit-flip, append, truncate, or dictionary splice), rather than emitting
-/// 1–64 random bytes.  This matters for targets that read structured content
-/// (e.g. `/etc/config`) — random-byte UpdateFile ops will short-circuit on the
-/// first parse error and never exercise deeper parser state.
-///
-/// The other 50% (and always when `baseline_contents` is empty) produces
-/// either a dictionary value or a random byte string, matching the behaviour
-/// of `ReplaceFileContent`.
-///
-/// Skips when `baseline_file_paths` is empty (graceful no-op if the harness
-/// did not populate it) or when the delta is already at `MAX_OPS`.
+
+/// Append an UpdateFile op targeting a known baseline file.
+/// Perturbs real content 50% of the time when baseline_contents is populated.
 pub struct UpdateExistingFile {
     pub guidance:            MutationGuidance,
-    /// Paths of regular files in the baseline VFS.  Populated by the harness
-    /// at startup via `enumerate_vfs_file_paths`.
     pub baseline_file_paths: Vec<String>,
-    /// Optional (path → content) pairs for baseline files.  When a chosen
-    /// path has an entry here, the mutator can produce a small perturbation
-    /// of the real content rather than random bytes.  Empty = always fall
-    /// back to dictionary/random content.
     pub baseline_contents:   Vec<(String, Vec<u8>)>,
 }
 
@@ -758,20 +599,15 @@ impl UpdateExistingFile {
         }
     }
 
-    /// Attach baseline (path, content) pairs for real-content perturbation.
-    /// Only the paths also present in `baseline_file_paths` will ever be used.
     pub fn with_baseline_contents(mut self, contents: Vec<(String, Vec<u8>)>) -> Self {
         self.baseline_contents = contents;
         self
     }
 
-    /// True when the mutator can produce anything (path list non-empty).
     pub fn has_baseline(&self) -> bool {
         !self.baseline_file_paths.is_empty()
     }
 
-    /// Lookup the baseline content for a path; returns None when the path
-    /// was not populated at startup.
     fn lookup_baseline<'a>(&'a self, path: &str) -> Option<&'a [u8]> {
         self.baseline_contents
             .iter()
@@ -780,11 +616,7 @@ impl UpdateExistingFile {
     }
 }
 
-/// Perturb a byte slice: bit-flip, append, truncate, or dictionary-splice.
-///
-/// Used by `UpdateExistingFile` to produce structurally-similar variants of
-/// a real file content.  Preserves most of the structure, which is what lets
-/// parsers reach deeper state than a fully random replacement would.
+/// Small perturbation of a byte slice: flip, append, truncate, or dict splice.
 fn perturb_bytes<R: Rand>(rand: &mut R, base: &[u8]) -> Vec<u8> {
     let mut out = base.to_vec();
     match rand.below(nz(4)) {
@@ -837,9 +669,6 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        // Path selection: prefer write_paths entries that also exist in the
-        // baseline (UpdateFile requires the VFS node to survive reset).
-        // Non-baseline write_paths are handled by ReplayWriteFile.
         let path = if self.guidance.has_write()
             && state.rand_mut().below(nz(100)) < 70
         {
@@ -855,12 +684,6 @@ where
             pick(state.rand_mut(), &self.baseline_file_paths).clone()
         };
 
-        // Content selection strategy:
-        //  1. If we have live baseline content for this path AND the coin
-        //     lands (50%), perturb the real content — structured mutation.
-        //  2. Else, 30% chance to draw from the dictionary (trigger strings,
-        //     magic values).
-        //  3. Else, random bytes — unstructured exploration.
         let content = {
             let base = self.lookup_baseline(&path).map(|b| b.to_vec());
             let use_perturb = base.is_some() && state.rand_mut().below(nz(100)) < 50;
@@ -873,12 +696,7 @@ where
             }
         };
 
-        // Modify the last existing UpdateFile op for this path in-place rather
-        // than appending a new one. Appending creates dead ops: apply_delta
-        // processes ops in order so the last op wins, making all earlier ops
-        // for the same path unreachable by the target. In-place modification
-        // keeps the delta compact and ensures ByteFlipFileContent always
-        // operates on the op the target actually reads.
+        // update in-place if possible to avoid dead ops (last write wins)
         if let Some(existing) = input.ops.iter_mut().rev()
             .find(|op| op.kind == FsOpKind::UpdateFile && op.path == path)
         {
@@ -887,7 +705,6 @@ where
             return Ok(MutationResult::Mutated);
         }
 
-        // No existing op for this path — append a new one if there is room.
         if input.ops.len() >= MAX_OPS {
             return Ok(MutationResult::Skipped);
         }
@@ -900,27 +717,9 @@ where
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 9. ReplayWriteFile
-// ─────────────────────────────────────────────────────────────────────────────
 
-/// Recreate files the target generated mid-run that were wiped by VFS reset.
-///
-/// `UpdateExistingFile` covers `write_paths ∩ baseline` — files that existed
-/// before the run and were written to.  This stage covers the complement:
-/// `write_paths ∖ baseline` — files the target created itself during the run,
-/// which are absent after reset because the baseline never had them.
-///
-/// Emits `CreateFile(path, content)`.  `cp_ensure_parents` is called for
-/// every `CREATE_FILE` op, so missing parent directories are handled
-/// automatically.
-///
-/// Content: dictionary (30%) or random (70%).  Perturb is unavailable because
-/// there is no baseline content for paths the target created itself.  In Phase B
-/// the FUSE log will capture actual write bytes, enabling true content replay.
-///
-/// Skips when `guidance.write_paths ∖ baseline_file_paths` is empty (Phase A
-/// default) or when the delta is already at `MAX_OPS`.
+
+/// CreateFile for paths the target wrote to that are not in the baseline.
 pub struct ReplayWriteFile {
     pub guidance:            MutationGuidance,
     pub baseline_file_paths: Vec<String>,
@@ -951,8 +750,6 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        // write_paths ∖ baseline: target created these during the run; they
-        // don't survive reset, so UpdateExistingFile cannot touch them.
         let new_paths: Vec<&String> = self.guidance.write_paths
             .iter()
             .filter(|p| !self.baseline_file_paths.contains(*p))
@@ -978,20 +775,10 @@ where
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 10. FsDeltaI2SMutator
-// ─────────────────────────────────────────────────────────────────────────────
 
-/// CmpLog-guided input-to-state mutator for FsDelta.
-///
-/// `CmpLogObserver` accumulates comparison operand pairs in `CmpValuesMetadata`
-/// on every execution.  When the target runs `if (data[i] != 'a') return`, the
-/// observer records `(current_byte, 'a')`.  This mutator reads those pairs and
-/// substitutes `current_byte → 'a'` directly inside a file content op, resolving
-/// the comparison in one step instead of a random walk through 256 values.
-///
-/// Works for 1/2/4/8-byte integer comparisons.  Tries both substitution directions
-/// (`lhs→rhs` and `rhs→lhs`) so coverage feedback filters the correct one.
+
+/// CmpLog-guided I2S mutator: resolves comparison gates by substituting
+/// known operand pairs directly into file content ops.
 pub struct FsDeltaI2SMutator;
 
 impl FsDeltaI2SMutator {
@@ -1014,9 +801,7 @@ where
             return Ok(MutationResult::Skipped);
         };
 
-        // Collect (lhs_bytes, rhs_bytes) from every failed comparison recorded
-        // by CmpLogObserver.  Both directions are added so coverage feedback
-        // selects the one that makes progress.
+        // collect comparison pairs from CmpLog, both directions
         let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for val in &meta.list {
                 match val {
@@ -1044,7 +829,6 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        // Pick a content op to mutate.
         let candidates: Vec<usize> = input.ops.iter().enumerate()
             .filter(|(_, op)| matches!(op.kind, FsOpKind::CreateFile | FsOpKind::UpdateFile)
                 && !op.content.is_empty())
@@ -1063,7 +847,6 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        // Search for lhs starting at a random offset, wrapping around.
         let search_end = content_len - lhs.len() + 1;
         let start = if search_end > 1 { state.rand_mut().below(nz(search_end)) } else { 0 };
 
@@ -1091,9 +874,7 @@ where
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 #[cfg(test)]
 mod tests {
@@ -1103,7 +884,6 @@ mod tests {
     use libafl::state::HasRand;
     use libafl_bolts::rands::StdRand;
 
-    /// Minimal state that satisfies HasRand — mirrors DumbState in fuzz.rs.
     struct TestState {
         rand: StdRand,
     }
@@ -1132,7 +912,7 @@ mod tests {
         ])
     }
 
-    // ── 1. ByteFlipFileContent ────────────────────────────────────────────
+
 
     #[test]
     fn byte_flip_mutates_content() {
@@ -1157,7 +937,7 @@ mod tests {
         assert_eq!(res, MutationResult::Skipped);
     }
 
-    // ── 2. ReplaceFileContent ─────────────────────────────────────────────
+
 
     #[test]
     fn replace_file_content_changes_content_and_size() {
@@ -1183,7 +963,7 @@ mod tests {
         assert_eq!(res, MutationResult::Skipped);
     }
 
-    // ── 3. AddFileOp ─────────────────────────────────────────────────────
+
 
     #[test]
     fn add_file_op_grows_delta() {
@@ -1225,7 +1005,7 @@ mod tests {
         assert!(used_guided, "guided path was never chosen in 50 tries");
     }
 
-    // ── 4. RemoveOp ───────────────────────────────────────────────────────
+
 
     #[test]
     fn remove_op_shrinks_delta() {
@@ -1249,7 +1029,7 @@ mod tests {
         assert_eq!(delta.ops.len(), 1);
     }
 
-    // ── 5. MutatePath ────────────────────────────────────────────────────
+
 
     #[test]
     fn mutate_path_changes_a_component() {
@@ -1280,7 +1060,7 @@ mod tests {
         assert_eq!(res, MutationResult::Skipped);
     }
 
-    // ── 6. SpliceDelta ───────────────────────────────────────────────────
+
 
     #[test]
     fn splice_delta_appends_ops_from_donor() {
@@ -1325,7 +1105,7 @@ mod tests {
         assert_eq!(res, MutationResult::Mutated, "mutator must pick up live pool update");
     }
 
-    // ── 7. DestructiveMutator ────────────────────────────────────────────
+
 
     #[test]
     fn destructive_mutator_grows_delta() {
@@ -1366,7 +1146,7 @@ mod tests {
         assert_eq!(seen.len(), 4, "not all destructive kinds were generated");
     }
 
-    // ── MAX_OPS cap ──────────────────────────────────────────────────────
+
 
     #[test]
     fn add_file_op_skips_at_max_ops() {
@@ -1413,7 +1193,7 @@ mod tests {
         assert_eq!(delta.ops.len(), MAX_OPS);
     }
 
-    // ── DestructiveMutator baseline bias ─────────────────────────────────
+
 
     #[test]
     fn destructive_mutator_uses_baseline_paths() {
@@ -1465,7 +1245,7 @@ mod tests {
         assert!(seen_truncate, "Truncate kind never generated in 200 tries");
     }
 
-    // ── MutatePath with baseline ──────────────────────────────────────────
+
 
     #[test]
     fn mutate_path_whole_swap_uses_baseline_path() {
@@ -1486,7 +1266,7 @@ mod tests {
         assert!(used_baseline, "whole-path swap never used a baseline path in 50 tries");
     }
 
-    // ── 8. UpdateExistingFile ─────────────────────────────────────────────
+
 
     #[test]
     fn update_existing_file_appends_update_op() {
@@ -1532,7 +1312,7 @@ mod tests {
         assert_eq!(delta.ops.len(), MAX_OPS);
     }
 
-    // ── Real-content perturbation ─────────────────────────────────────────
+
 
     #[test]
     fn update_existing_file_perturbs_baseline_content() {
@@ -1572,7 +1352,7 @@ mod tests {
         }
     }
 
-    // ── Content dictionary ────────────────────────────────────────────────
+
 
     #[test]
     fn replace_file_content_uses_dictionary_sometimes() {
@@ -1594,7 +1374,7 @@ mod tests {
         assert!(used_dict, "ReplaceFileContent never picked a dictionary entry in 200 tries");
     }
 
-    // ── MutatePath guidance ───────────────────────────────────────────────
+
 
     #[test]
     fn mutate_path_whole_swap_prefers_enoent_paths() {
@@ -1616,7 +1396,7 @@ mod tests {
         assert!(used_enoent, "guidance.enoent_paths never used in whole-swap across 100 tries");
     }
 
-    // ── DestructiveMutator guidance ───────────────────────────────────────
+
 
     #[test]
     fn destructive_mutator_delete_prefers_recreate_paths() {
@@ -1696,7 +1476,7 @@ mod tests {
         assert!(used_write, "write_paths never preferred over recreate_paths in whole-swap");
     }
 
-    // ── 9. ReplayWriteFile ────────────────────────────────────────────────
+
 
     #[test]
     fn replay_write_file_skips_with_no_guidance() {

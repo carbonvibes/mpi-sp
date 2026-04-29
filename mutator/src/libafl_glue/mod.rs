@@ -1,28 +1,6 @@
-/*
- * libafl_glue/mod.rs — bridge between FsDelta semantics and LibAFL primitives.
- *
- * Phase B adds:
- *   primary_content()  — extract the byte payload the target will consume
- *
- * Phase C will add:
- *   FuseLogObserver    — drains per-iteration FUSE write log → MutationGuidance
- *   FsAccessFeedback   — treats novel enoent/write-set paths as interesting
- */
-
 use crate::delta::{FsDelta, FsOpKind};
 
-/// Extract the primary fuzz content from a FsDelta.
-///
-/// Returns the content bytes of the first CreateFile or UpdateFile op, or an
-/// empty slice when the delta has no file-content ops (e.g. a metadata-only
-/// delta of Truncate + SetTimes ops).
-///
-/// This is the semantic bridge: the fuzzer mutates a FsDelta (a series of
-/// filesystem operations), and this function distils the "what bytes does the
-/// target actually read" view of that delta for in-process target harnesses.
-/// Once Phase C wires the FUSE mount, the full delta is applied to the VFS and
-/// the target reads through the mount — this function is only needed for the
-/// in-process (no-FUSE) Phase B campaigns.
+/// Returns content of the first CreateFile/UpdateFile op, or empty for metadata-only deltas.
 pub fn primary_content(delta: &FsDelta) -> &[u8] {
     delta
         .ops

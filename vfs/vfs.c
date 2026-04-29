@@ -5,7 +5,6 @@
 #include <string.h>
 #include <time.h>
 
-/* Return the current wall-clock time. */
 static struct timespec ts_now(void)
 {
     struct timespec ts;
@@ -13,10 +12,8 @@ static struct timespec ts_now(void)
     return ts;
 }
 
-/* Maximum allowed length for a single path component (name). */
 #define VFS_MAX_NAME 255
 
-/* Allocate a fresh node, assign the next inode number, zero everything. */
 static vfs_node_t *node_alloc(vfs_t *vfs, vfs_kind_t kind)
 {
     vfs_node_t *n = calloc(1, sizeof(*n));
@@ -28,10 +25,6 @@ static vfs_node_t *node_alloc(vfs_t *vfs, vfs_kind_t kind)
     return n;
 }
 
-/*
- * Free only the node itself and its own content buffer.
- * Does NOT free children or their subtrees; that is the caller's job.
- */
 static void node_free_self(vfs_node_t *n)
 {
     if (!n) return;
@@ -40,7 +33,6 @@ static void node_free_self(vfs_node_t *n)
     free(n);
 }
 
-/* Recursively free a node and the entire subtree rooted at it. */
 static void node_free_deep(vfs_node_t *n)
 {
     if (!n) return;
@@ -57,12 +49,6 @@ static void node_free_deep(vfs_node_t *n)
     node_free_self(n);
 }
 
-/*
- * Deep-copy the subtree rooted at src.
- * parent_copy is the parent of the returned copy (NULL for the root copy).
- * Inode numbers are preserved from the source.
- * Returns NULL on allocation failure; the partially-built copy is freed.
- */
 static vfs_node_t *node_deepcopy(const vfs_node_t *src, vfs_node_t *parent_copy)
 {
     if (!src) return NULL;
@@ -87,7 +73,6 @@ static vfs_node_t *node_deepcopy(const vfs_node_t *src, vfs_node_t *parent_copy)
         dst->link_target = strdup(src->link_target);
         if (!dst->link_target) { free(dst); return NULL; }
     } else {
-        /* Copy children, keeping the same insertion order. */
         vfs_dirent_t **tail = &dst->children;
         for (const vfs_dirent_t *d = src->children; d; d = d->next) {
             vfs_dirent_t *nd = calloc(1, sizeof(*nd));
@@ -110,17 +95,6 @@ oom:
     return NULL;
 }
 
-/*
- * Resolve an absolute path to the node it names.
- *
- * Rules enforced here:
- *   - path must start with '/'
- *   - components must not be empty (no double slash, no trailing slash)
- *   - "." and ".." components are rejected (EINVAL)
- *
- * On success returns the node pointer.
- * On failure returns NULL and sets errno.
- */
 static vfs_node_t *resolve_path(vfs_t *vfs, const char *path)
 {
     if (!path || path[0] != '/') { errno = EINVAL; return NULL; }
@@ -128,7 +102,6 @@ static vfs_node_t *resolve_path(vfs_t *vfs, const char *path)
     vfs_node_t *cur = vfs->root;
     const char *p   = path + 1;
 
-    /* Bare "/" → root. */
     if (*p == '\0') return cur;
 
     while (*p) {
@@ -136,10 +109,8 @@ static vfs_node_t *resolve_path(vfs_t *vfs, const char *path)
         while (*p && *p != '/') p++;
         size_t len = (size_t)(p - start);
 
-        /* Empty component: double slash or trailing slash. */
         if (len == 0) { errno = EINVAL; return NULL; }
 
-        /* Reject "." and "..". */
         if (len == 1 && start[0] == '.') { errno = EINVAL; return NULL; }
         if (len == 2 && start[0] == '.' && start[1] == '.') {
             errno = EINVAL;
@@ -148,10 +119,8 @@ static vfs_node_t *resolve_path(vfs_t *vfs, const char *path)
 
         if (len > VFS_MAX_NAME) { errno = ENAMETOOLONG; return NULL; }
 
-        /* Current node must be a directory to descend into it. */
         if (cur->kind != VFS_DIR) { errno = ENOTDIR; return NULL; }
 
-        /* Look up this component in the current directory. */
         vfs_node_t *child = NULL;
         for (vfs_dirent_t *d = cur->children; d; d = d->next) {
             if (strlen(d->name) == len && memcmp(d->name, start, len) == 0) {
@@ -162,10 +131,8 @@ static vfs_node_t *resolve_path(vfs_t *vfs, const char *path)
         if (!child) { errno = ENOENT; return NULL; }
         cur = child;
 
-        /* Step over the '/' separator, if present. */
         if (*p == '/') {
             p++;
-            /* Trailing slash: nothing follows — reject. */
             if (*p == '\0') { errno = EINVAL; return NULL; }
         }
     }
@@ -173,15 +140,6 @@ static vfs_node_t *resolve_path(vfs_t *vfs, const char *path)
     return cur;
 }
 
-/*
- * Split path into a parent path and a final component name.
- *
- * Resolves the parent directory and writes the final component into
- * name_buf (at most name_buf_len-1 chars, NUL-terminated).
- *
- * Returns the parent directory node on success.
- * Returns NULL and sets errno on failure.
- */
 static vfs_node_t *resolve_parent(vfs_t *vfs, const char *path,
                                    char *name_buf)
 {
@@ -191,12 +149,10 @@ static vfs_node_t *resolve_parent(vfs_t *vfs, const char *path,
     const char *name       = last_slash + 1;
     size_t      name_len   = strlen(name);
 
-    /* Trailing slash or bare "/". */
     if (name_len == 0) { errno = EINVAL; return NULL; }
 
     if (name_len > VFS_MAX_NAME) { errno = ENAMETOOLONG; return NULL; }
 
-    /* Reject "." and ".." as the final component. */
     if (name_len == 1 && name[0] == '.') { errno = EINVAL; return NULL; }
     if (name_len == 2 && name[0] == '.' && name[1] == '.') {
         errno = EINVAL;
@@ -206,11 +162,9 @@ static vfs_node_t *resolve_parent(vfs_t *vfs, const char *path,
     memcpy(name_buf, name, name_len);
     name_buf[name_len] = '\0';
 
-    /* Resolve the parent portion of the path. */
     size_t parent_len = (size_t)(last_slash - path);
 
     if (parent_len == 0) {
-        /* Parent is root ("/foo" case). */
         return resolve_path(vfs, "/");
     }
 
@@ -226,11 +180,6 @@ static vfs_node_t *resolve_parent(vfs_t *vfs, const char *path,
     return parent;
 }
 
-/* -------------------------------------------------------------------------
- * Directory helpers
- * ---------------------------------------------------------------------- */
-
-/* Append a (name, node) entry to a directory. The name is strdup'd. */
 static int dir_add_child(vfs_node_t *dir, const char *name, vfs_node_t *child)
 {
     vfs_dirent_t *d = calloc(1, sizeof(*d));
@@ -240,18 +189,12 @@ static int dir_add_child(vfs_node_t *dir, const char *name, vfs_node_t *child)
     if (!d->name) { free(d); return -ENOMEM; }
     d->node = child;
 
-    /* Append to maintain insertion order. */
     vfs_dirent_t **tail = &dir->children;
     while (*tail) tail = &(*tail)->next;
     *tail = d;
     return 0;
 }
 
-/*
- * Remove the entry named name from dir.
- * The dirent struct and its name are freed; the node pointer is NOT freed.
- * Returns 0 on success, -ENOENT if name is not present.
- */
 static int dir_remove_child(vfs_node_t *dir, const char *name)
 {
     for (vfs_dirent_t **p = &dir->children; *p; p = &(*p)->next) {
@@ -266,17 +209,12 @@ static int dir_remove_child(vfs_node_t *dir, const char *name)
     return -ENOENT;
 }
 
-/* Return the child node named name, or NULL if absent. */
 static vfs_node_t *dir_lookup_child(const vfs_node_t *dir, const char *name)
 {
     for (const vfs_dirent_t *d = dir->children; d; d = d->next)
         if (strcmp(d->name, name) == 0) return d->node;
     return NULL;
 }
-
-/* -------------------------------------------------------------------------
- * Stat conversion
- * ---------------------------------------------------------------------- */
 
 static void fill_stat(const vfs_node_t *n, vfs_stat_t *st)
 {
@@ -291,10 +229,6 @@ static void fill_stat(const vfs_node_t *n, vfs_stat_t *st)
     st->mtime = n->mtime;
     st->atime = n->atime;
 }
-
-/* -------------------------------------------------------------------------
- * Lifecycle
- * ---------------------------------------------------------------------- */
 
 vfs_t *vfs_create(void)
 {
@@ -316,10 +250,6 @@ void vfs_destroy(vfs_t *vfs)
     free(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * Read-only operations
- * ---------------------------------------------------------------------- */
-
 int vfs_getattr(vfs_t *vfs, const char *path, vfs_stat_t *out)
 {
     errno = 0;
@@ -340,18 +270,16 @@ int vfs_readdir(vfs_t *vfs, const char *path,
     vfs_stat_t st;
     int ret;
 
-    /* "." */
     fill_stat(n, &st);
     ret = cb(ctx, ".", &st);
     if (ret) return ret;
 
-    /* ".." — root's parent is itself */
+    /* root's parent is itself */
     vfs_node_t *parent_node = n->parent ? n->parent : n;
     fill_stat(parent_node, &st);
     ret = cb(ctx, "..", &st);
     if (ret) return ret;
 
-    /* Real children. */
     for (const vfs_dirent_t *d = n->children; d; d = d->next) {
         fill_stat(d->node, &st);
         ret = cb(ctx, d->name, &st);
@@ -380,10 +308,6 @@ int vfs_read(vfs_t *vfs, const char *path, size_t offset, size_t size,
     *out_len = to_copy;
     return 0;
 }
-
-/* -------------------------------------------------------------------------
- * Control-path mutating operations
- * ---------------------------------------------------------------------- */
 
 int vfs_create_file(vfs_t *vfs, const char *path,
                     const uint8_t *content, size_t content_len)
@@ -509,10 +433,9 @@ int vfs_rename(vfs_t *vfs, const char *oldpath, const char *newpath)
 
     vfs_node_t *dst = dir_lookup_child(new_parent, newname);
 
-    /* Same inode: no-op. */
     if (src == dst) return 0;
 
-    /* Prevent moving a directory into its own subtree. */
+    /* prevent moving a dir into itself */
     if (src->kind == VFS_DIR) {
         for (vfs_node_t *p = new_parent; p; p = p->parent) {
             if (p == src) return -EINVAL;
@@ -528,14 +451,12 @@ int vfs_rename(vfs_t *vfs, const char *oldpath, const char *newpath)
         node_free_deep(dst);
     }
 
-    /* Detach src from its current parent. */
     dir_remove_child(old_parent, oldname);
 
-    /* Attach under the new name. */
     src->parent = new_parent;
     int r = dir_add_child(new_parent, newname, src);
     if (r < 0) {
-        /* Reattach to old parent to avoid losing the node. */
+        /* reattach to avoid losing the node on alloc failure */
         src->parent = old_parent;
         dir_add_child(old_parent, oldname, src);
         return r;
@@ -592,10 +513,6 @@ int vfs_set_times(vfs_t *vfs, const char *path,
     return 0;
 }
 
-/* -------------------------------------------------------------------------
- * Snapshot and reset
- * ---------------------------------------------------------------------- */
-
 int vfs_save_snapshot(vfs_t *vfs)
 {
     vfs_node_t *copy = node_deepcopy(vfs->root, NULL);
@@ -610,7 +527,7 @@ int vfs_reset_to_snapshot(vfs_t *vfs)
 {
     if (!vfs->snapshot) return -EINVAL;
 
-    /* Deep-copy the snapshot so the snapshot itself is never mutated. */
+    /* copy so the snapshot itself stays immutable across resets */
     vfs_node_t *copy = node_deepcopy(vfs->snapshot, NULL);
     if (!copy) return -ENOMEM;
 

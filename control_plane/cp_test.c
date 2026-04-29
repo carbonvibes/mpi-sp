@@ -1,25 +1,4 @@
-/*
- * cp_test.c — Test suite for the Week 4 control plane.
- *
- * Covers:
- *   delta_lifecycle       — create, add all 7 op kinds, free
- *   delta_serialize       — serialize → deserialize roundtrip for all kinds
- *   delta_deser_errors    — truncated buf, bad magic, bad kind, bad path
- *   delta_checksum        — same data → same hash; different data → different
- *   ensure_parents        — basic, deep, already-exists, root, bad path
- *   apply_basic           — all 7 op kinds through cp_apply_delta
- *   apply_ensure_parents  — CREATE_FILE before MKDIR parent succeeds
- *   apply_rmdir_ordering  — shallowest-first RMDIR list is reordered to work
- *   apply_errors          — ENOENT, EISDIR, ENOTEMPTY from delta ops
- *   apply_set_times       — SET_TIMES op reaches VFS and is verified
- *   apply_truncate        — TRUNCATE shrink and extend
- *   apply_dry_run         — dry_run=1 shows tree; VFS unchanged after
- *   apply_mutate_reset    — 10 iterations of apply + vfs_reset_to_snapshot
- *   vfs_checksum          — identical tree → same hash; mutation changes hash
- *
- * Build: see control_plane/Makefile
- * Run:   ./cp_test
- */
+/* cp_test.c — test suite for the control plane */
 
 #include <errno.h>
 #include <stdint.h>
@@ -32,9 +11,7 @@
 #include "control_plane.h"
 #include "delta.h"
 
-/* -------------------------------------------------------------------------
- * Check harness (matches style of vfs_test.c)
- * ---------------------------------------------------------------------- */
+
 
 static int g_checks   = 0;
 static int g_failures = 0;
@@ -48,9 +25,7 @@ static int g_failures = 0;
         } \
     } while (0)
 
-/* -------------------------------------------------------------------------
- * 1. delta_lifecycle
- * ---------------------------------------------------------------------- */
+
 
 static void test_delta_lifecycle(void)
 {
@@ -101,9 +76,7 @@ static void test_delta_lifecycle(void)
     delta_free(NULL);
 }
 
-/* -------------------------------------------------------------------------
- * 2. delta_serialize — roundtrip for all 7 op kinds
- * ---------------------------------------------------------------------- */
+
 
 static void test_delta_serialize(void)
 {
@@ -185,9 +158,7 @@ static void test_delta_serialize(void)
     delta_free(empty);
 }
 
-/* -------------------------------------------------------------------------
- * 3. delta_deser_errors
- * ---------------------------------------------------------------------- */
+
 
 static void test_delta_deser_errors(void)
 {
@@ -261,9 +232,7 @@ static void test_delta_deser_errors(void)
     }
 }
 
-/* -------------------------------------------------------------------------
- * 4. delta_checksum
- * ---------------------------------------------------------------------- */
+
 
 static void test_delta_checksum(void)
 {
@@ -298,9 +267,7 @@ static void test_delta_checksum(void)
     (void)h;  /* value doesn't matter; just verify no crash */
 }
 
-/* -------------------------------------------------------------------------
- * 5. ensure_parents
- * ---------------------------------------------------------------------- */
+
 
 static void test_ensure_parents(void)
 {
@@ -332,9 +299,7 @@ static void test_ensure_parents(void)
     vfs_destroy(v);
 }
 
-/* -------------------------------------------------------------------------
- * 6. apply_basic — one op of each kind
- * ---------------------------------------------------------------------- */
+
 
 static void test_apply_basic(void)
 {
@@ -431,9 +396,7 @@ static void test_apply_basic(void)
     vfs_destroy(v);
 }
 
-/* -------------------------------------------------------------------------
- * 7. apply_ensure_parents — CREATE_FILE before MKDIR parent
- * ---------------------------------------------------------------------- */
+
 
 static void test_apply_ensure_parents(void)
 {
@@ -465,9 +428,7 @@ static void test_apply_ensure_parents(void)
     vfs_destroy(v);
 }
 
-/* -------------------------------------------------------------------------
- * 8. apply_rmdir_ordering — shallowest-first list reordered to succeed
- * ---------------------------------------------------------------------- */
+
 
 static void test_apply_rmdir_ordering(void)
 {
@@ -503,9 +464,7 @@ static void test_apply_rmdir_ordering(void)
     vfs_destroy(v);
 }
 
-/* -------------------------------------------------------------------------
- * 9. apply_errors — expected failures reported correctly
- * ---------------------------------------------------------------------- */
+
 
 static void test_apply_errors(void)
 {
@@ -555,9 +514,7 @@ static void test_apply_errors(void)
     vfs_destroy(v);
 }
 
-/* -------------------------------------------------------------------------
- * 10. apply_set_times — timestamps reach VFS and are readable
- * ---------------------------------------------------------------------- */
+
 
 static void test_apply_set_times(void)
 {
@@ -587,9 +544,7 @@ static void test_apply_set_times(void)
     vfs_destroy(v);
 }
 
-/* -------------------------------------------------------------------------
- * 11. apply_truncate — shrink and extend
- * ---------------------------------------------------------------------- */
+
 
 static void test_apply_truncate(void)
 {
@@ -648,9 +603,7 @@ static void test_apply_truncate(void)
     vfs_destroy(v);
 }
 
-/* -------------------------------------------------------------------------
- * 12. apply_dry_run — tree printed, VFS unchanged afterwards
- * ---------------------------------------------------------------------- */
+
 
 static void test_apply_dry_run(void)
 {
@@ -681,9 +634,7 @@ static void test_apply_dry_run(void)
     vfs_destroy(v);
 }
 
-/* -------------------------------------------------------------------------
- * 13. apply_mutate_reset — 10 iterations, no stale state
- * ---------------------------------------------------------------------- */
+
 
 static void test_apply_mutate_reset(void)
 {
@@ -731,9 +682,7 @@ static void test_apply_mutate_reset(void)
     vfs_destroy(v);
 }
 
-/* -------------------------------------------------------------------------
- * 14. vfs_checksum — stability and sensitivity
- * ---------------------------------------------------------------------- */
+
 
 static void test_vfs_checksum(void)
 {
@@ -802,9 +751,7 @@ static void test_vfs_checksum(void)
     vfs_destroy(v4); vfs_destroy(v5); vfs_destroy(v6);
 }
 
-/* -------------------------------------------------------------------------
- * Entry point
- * ---------------------------------------------------------------------- */
+
 
 int main(void)
 {

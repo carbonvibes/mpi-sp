@@ -1,12 +1,3 @@
-/*
- * ffi.rs — FFI bindings to the C control plane and VFS.
- *
- * The only entry point the rest of the crate needs is apply_delta(), which
- * translates a Rust FsDelta into a C fs_delta_t using the delta_add_*
- * convenience constructors, then calls cp_apply_delta() and returns the
- * per-op success/failure counts from cp_result_t.
- */
-
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 
@@ -14,23 +5,16 @@ use libc::timespec;
 
 use crate::delta::{FsDelta, FsOpKind};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// C types
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Opaque handle to C's vfs_t.
 #[repr(C)]
 pub struct VfsT {
     _private: [u8; 0],
 }
 
-/// Opaque handle to C's fs_delta_t.
 #[repr(C)]
 pub struct FsDeltaC {
     _private: [u8; 0],
 }
 
-/// Transparent layout matching C's cp_op_result_t.
 #[repr(C)]
 pub struct CpOpResultT {
     pub op_index: c_int,
@@ -38,8 +22,6 @@ pub struct CpOpResultT {
     pub message:  *const i8,
 }
 
-/// Transparent layout matching C's cp_result_t.
-/// Fields must stay in sync with control_plane/control_plane.h.
 #[repr(C)]
 pub struct CpResultT {
     pub total_ops: c_int,
@@ -48,12 +30,7 @@ pub struct CpResultT {
     pub results:   *mut CpOpResultT,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Raw C bindings
-// ─────────────────────────────────────────────────────────────────────────────
-
 extern "C" {
-    // ── VFS lifecycle ─────────────────────────────────────────────────────
     pub fn vfs_create() -> *mut VfsT;
     pub fn vfs_destroy(vfs: *mut VfsT);
     pub fn vfs_save_snapshot(vfs: *mut VfsT) -> c_int;
@@ -67,7 +44,6 @@ extern "C" {
     ) -> c_int;
     pub fn vfs_mkdir(vfs: *mut VfsT, path: *const i8) -> c_int;
 
-    // ── Delta lifecycle ───────────────────────────────────────────────────
     pub fn delta_create() -> *mut FsDeltaC;
     pub fn delta_free(d: *mut FsDeltaC);
 
@@ -94,61 +70,32 @@ extern "C" {
     ) -> c_int;
     pub fn delta_add_truncate(d: *mut FsDeltaC, path: *const i8, new_size: usize) -> c_int;
 
-    // ── Control plane ─────────────────────────────────────────────────────
     pub fn cp_apply_delta(
         vfs: *mut VfsT,
         d: *const FsDeltaC,
         dry_run: c_int,
     ) -> *mut CpResultT;
     pub fn cp_result_free(r: *mut CpResultT);
-
-    /// FNV-1a hash of the current VFS tree.  Used for semantic yield tracking.
     pub fn cp_vfs_checksum(vfs: *mut VfsT) -> u64;
 
-    /// Enumerate all VFS paths filtered by kind.
-    ///
-    /// filter: 0 = all, 1 = regular files only, 2 = directories only.
-    ///
-    /// On success, *paths_out is a heap-allocated array of *n_out heap-allocated
-    /// NUL-terminated path strings.  Free with cp_enumerate_paths_free().
     pub fn cp_enumerate_paths(
         vfs:       *mut VfsT,
         filter:    c_int,
         paths_out: *mut *mut *mut i8,
         n_out:     *mut usize,
     ) -> c_int;
-
-    /// Free the array returned by cp_enumerate_paths().
     pub fn cp_enumerate_paths_free(paths: *mut *mut i8, n: usize);
 }
 
-// ── fuse_vfs library API (compiled in when has_fuse3 is set) ─────────────────
 #[cfg(has_fuse3)]
 extern "C" {
-    /// Bind the VFS that the FUSE mount will serve.  Call once before
-    /// fuse_vfs_lib_run().
     pub fn fuse_vfs_lib_init(vfs: *mut VfsT);
-
-    /// Mount at `mountpoint` and block in the FUSE event loop until
-    /// fuse_vfs_lib_stop() is called.  Intended to run in a background thread.
     pub fn fuse_vfs_lib_run(mountpoint: *const c_char) -> c_int;
-
-    /// Returns 1 after fuse_mount() has succeeded inside fuse_vfs_lib_run().
     pub fn fuse_vfs_lib_is_mounted() -> c_int;
-
-    /// Signal the FUSE event loop to exit cleanly.
     pub fn fuse_vfs_lib_stop();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Public result type
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Per-call outcome of apply_delta().
-///
-/// Returned as `Ok(DeltaResult)` even when individual ops fail — that is
-/// expected fuzzer behaviour.  `Err(errno)` is reserved for catastrophic
-/// failures (OOM constructing the C delta, null return from cp_apply_delta).
+/// Per-call outcome of apply_delta(). `failed > 0` is normal fuzzer behaviour, not an error.
 #[derive(Debug, Clone, Copy)]
 pub struct DeltaResult {
     pub succeeded: usize,
@@ -161,12 +108,6 @@ impl DeltaResult {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal helper
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Assert structural invariants on a delta in debug builds.
-/// Called at the top of apply_delta so bad inputs are caught early.
 #[inline]
 fn validate_delta(delta: &FsDelta) {
     debug_assert!(!delta.ops.is_empty(), "delta must have at least one op");
@@ -187,21 +128,6 @@ fn validate_delta(delta: &FsDelta) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Safe wrapper
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Build a C-side fs_delta_t from a Rust FsDelta and apply it to the VFS.
-///
-/// Returns `Ok(DeltaResult)` on success.  `result.failed > 0` means that some
-/// ops were individually rejected by the VFS (e.g. ENOENT on a delete of a
-/// non-existent file); this is normal fuzzer behaviour and not an `Err`.
-///
-/// Returns `Err(errno)` only for catastrophic failures:
-///   - OOM constructing the C delta (`-ENOMEM`)
-///   - null pointer returned by cp_apply_delta (`-ENOMEM`)
-///   - interior NUL byte in an op path (`-EINVAL`)
-///   - delta_add_* returns a non-zero errno (`-errno`)
 pub fn apply_delta(vfs: *mut VfsT, delta: &FsDelta) -> Result<DeltaResult, i32> {
     validate_delta(delta);
 
@@ -275,10 +201,6 @@ pub fn apply_delta(vfs: *mut VfsT, delta: &FsDelta) -> Result<DeltaResult, i32> 
     Ok(dr)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Path enumeration helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
 fn collect_paths(vfs: *mut VfsT, filter: c_int) -> Vec<String> {
     let mut raw: *mut *mut i8 = std::ptr::null_mut();
     let mut n: usize = 0;
@@ -297,31 +219,23 @@ fn collect_paths(vfs: *mut VfsT, filter: c_int) -> Vec<String> {
     result
 }
 
-/// Return the absolute paths of all regular files currently in the VFS.
 pub fn enumerate_vfs_file_paths(vfs: *mut VfsT) -> Vec<String> {
     collect_paths(vfs, 1)
 }
 
-/// Return the absolute paths of all directories currently in the VFS.
 pub fn enumerate_vfs_dir_paths(vfs: *mut VfsT) -> Vec<String> {
     collect_paths(vfs, 2)
 }
 
-/// Return the absolute paths of all nodes (files + directories) in the VFS.
 pub fn enumerate_vfs_all_paths(vfs: *mut VfsT) -> Vec<String> {
     collect_paths(vfs, 0)
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// E2E integration tests
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::delta::{FsDelta, FsOp};
 
-    /// Create a VFS with the standard baseline and a saved snapshot.
     unsafe fn make_baseline_vfs() -> *mut VfsT {
         let vfs = vfs_create();
         assert!(!vfs.is_null(), "vfs_create() returned null");
@@ -373,7 +287,6 @@ mod tests {
     #[test]
     fn e2e_set_times_on_existing_file_succeeds() {
         let vfs = unsafe { make_baseline_vfs() };
-        // Set timestamps on /input which exists in the baseline.
         let delta = FsDelta::new(vec![
             FsOp::set_times("/input", 1_000_000_000, 0, 1_000_000_000, 0),
         ]);
@@ -385,10 +298,8 @@ mod tests {
     #[test]
     fn e2e_failed_op_is_counted_not_panicked() {
         let vfs = unsafe { make_baseline_vfs() };
-        // Delete a file that doesn't exist — should fail at VFS level, not crash.
         let delta = FsDelta::new(vec![FsOp::delete_file("/does_not_exist.txt")]);
         let dr = apply_delta(vfs, &delta).expect("apply_delta returned Err");
-        // The call succeeds (Ok) but the op itself fails.
         assert_eq!(dr.succeeded + dr.failed, 1, "should have exactly 1 op result");
         unsafe { vfs_destroy(vfs) };
     }

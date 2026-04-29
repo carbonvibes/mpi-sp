@@ -1,22 +1,3 @@
-/*
- * control_plane.c — In-process control plane implementation.
- *
- * See control_plane.h for the full API contract.
- *
- * Apply algorithm:
- *
- *   Phase 1: Walk ops in original order, skip RMDIR.
- *     Before every CREATE_FILE or MKDIR: call cp_ensure_parents().
- *     Apply the op; record result.
- *
- *   Phase 2: Collect all RMDIR ops, sort by path depth descending
- *     (deepest first so children are removed before their parents), apply.
- *
- * Dry-run:
- *   After both phases, print the VFS tree via cp_dump_vfs(), then call
- *   vfs_reset_to_snapshot() to undo.  Requires a saved snapshot.
- */
-
 #include "control_plane.h"
 
 #include <errno.h>
@@ -24,11 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* -------------------------------------------------------------------------
- * Internal helpers
- * ---------------------------------------------------------------------- */
-
-/* Count path depth as the number of '/' characters (root "/" → depth 1). */
 static int path_depth(const char *path)
 {
     int d = 0;
@@ -37,18 +13,13 @@ static int path_depth(const char *path)
     return d;
 }
 
-/* Entry for the RMDIR sort pass. */
 typedef struct { size_t idx; int depth; } rmdir_entry_t;
 
 static int cmp_rmdir_desc(const void *a, const void *b)
 {
     const rmdir_entry_t *ea = a, *eb = b;
-    return eb->depth - ea->depth;  /* descending depth */
+    return eb->depth - ea->depth;
 }
-
-/* -------------------------------------------------------------------------
- * cp_ensure_parents
- * ---------------------------------------------------------------------- */
 
 int cp_ensure_parents(vfs_t *vfs, const char *path)
 {
@@ -57,15 +28,6 @@ int cp_ensure_parents(vfs_t *vfs, const char *path)
     char *tmp = strdup(path);
     if (!tmp) return -ENOMEM;
 
-    /*
-     * Walk through each '/' separator.  For each prefix up to (but not
-     * including) the final component, call vfs_mkdir.  EEXIST is fine.
-     *
-     * Example: path = "/a/b/c"
-     *   i=2 → tmp[2]='\0' → mkdir("/a") → restore
-     *   i=4 → tmp[4]='\0' → mkdir("/a/b") → restore
-     *   i=6 = NUL → stop (don't create the final component)
-     */
     for (size_t i = 1; tmp[i] != '\0'; i++) {
         if (tmp[i] == '/') {
             tmp[i] = '\0';
@@ -81,10 +43,6 @@ int cp_ensure_parents(vfs_t *vfs, const char *path)
     free(tmp);
     return 0;
 }
-
-/* -------------------------------------------------------------------------
- * Apply a single op (no ensure_parents, no ordering fixup)
- * ---------------------------------------------------------------------- */
 
 static int apply_single_op(vfs_t *vfs, const fs_op_t *op)
 {
@@ -109,10 +67,6 @@ static int apply_single_op(vfs_t *vfs, const fs_op_t *op)
         return vfs_set_times(vfs, op->path, &op->mtime, &op->atime);
 
     case FS_OP_TRUNCATE: {
-        /*
-         * Read-modify-write: preserve existing bytes up to the new size,
-         * zero-fill on extension.  op->content_len is the new size.
-         */
         vfs_stat_t vs;
         int r = vfs_getattr(vfs, op->path, &vs);
         if (r != 0) return r;
@@ -141,20 +95,12 @@ static int apply_single_op(vfs_t *vfs, const fs_op_t *op)
     }
 }
 
-/* -------------------------------------------------------------------------
- * cp_result_free
- * ---------------------------------------------------------------------- */
-
 void cp_result_free(cp_result_t *r)
 {
     if (!r) return;
     free(r->results);
     free(r);
 }
-
-/* -------------------------------------------------------------------------
- * cp_apply_delta
- * ---------------------------------------------------------------------- */
 
 cp_result_t *cp_apply_delta(vfs_t *vfs, const fs_delta_t *d, int dry_run)
 {
@@ -169,14 +115,13 @@ cp_result_t *cp_apply_delta(vfs_t *vfs, const fs_delta_t *d, int dry_run)
             res->results[i].op_index = (int)i;
     }
 
-    /* --- Phase 1: non-RMDIR ops in original order --- */
+    /* phase 1: non-RMDIR ops in original order */
     for (size_t i = 0; i < d->n_ops; i++) {
         const fs_op_t *op = &d->ops[i];
         if (op->kind == FS_OP_RMDIR) continue;
 
         cp_op_result_t *rr = &res->results[i];
 
-        /* Ensure intermediate directories exist before create ops. */
         if (op->kind == FS_OP_CREATE_FILE || op->kind == FS_OP_MKDIR) {
             int er = cp_ensure_parents(vfs, op->path);
             if (er != 0) {
@@ -188,11 +133,7 @@ cp_result_t *cp_apply_delta(vfs_t *vfs, const fs_delta_t *d, int dry_run)
         }
 
         int r = apply_single_op(vfs, op);
-        /*
-         * EEXIST on MKDIR is treated as success: the directory already
-         * exists (possibly because ensure_parents() created it for a
-         * preceding CREATE_FILE op), so the user's intent is satisfied.
-         */
+        /* EEXIST on MKDIR is fine — directory already exists */
         if (r == -EEXIST && op->kind == FS_OP_MKDIR) r = 0;
 
         if (r == 0) {
@@ -206,7 +147,7 @@ cp_result_t *cp_apply_delta(vfs_t *vfs, const fs_delta_t *d, int dry_run)
         }
     }
 
-    /* --- Phase 2: RMDIR ops, deepest first --- */
+    /* phase 2: RMDIR ops, deepest first so children go before parents */
     size_t n_rmdir = 0;
     for (size_t i = 0; i < d->n_ops; i++)
         if (d->ops[i].kind == FS_OP_RMDIR) n_rmdir++;
@@ -214,7 +155,6 @@ cp_result_t *cp_apply_delta(vfs_t *vfs, const fs_delta_t *d, int dry_run)
     if (n_rmdir > 0) {
         rmdir_entry_t *rmdir_ops = malloc(n_rmdir * sizeof(*rmdir_ops));
         if (!rmdir_ops) {
-            /* Out of memory: mark remaining RMDIR ops as failed. */
             for (size_t i = 0; i < d->n_ops; i++) {
                 if (d->ops[i].kind == FS_OP_RMDIR) {
                     res->results[i].error   = -ENOMEM;
@@ -251,7 +191,6 @@ cp_result_t *cp_apply_delta(vfs_t *vfs, const fs_delta_t *d, int dry_run)
         }
     }
 
-    /* --- Dry-run: print result then restore --- */
     if (dry_run) {
         printf("\n[dry-run] VFS state after applying delta:\n");
         cp_dump_vfs(vfs);
@@ -267,14 +206,8 @@ cp_result_t *cp_apply_delta(vfs_t *vfs, const fs_delta_t *d, int dry_run)
     return res;
 }
 
-/* -------------------------------------------------------------------------
- * cp_vfs_checksum — FNV-1a walk of the VFS tree
- * ---------------------------------------------------------------------- */
-
-/* Forward declaration for recursive helper. */
 static void checksum_dir(vfs_t *vfs, const char *path, uint64_t *h);
 
-/* Mix bytes into FNV-1a hash. */
 static void fnv_mix(uint64_t *h, const void *data, size_t len)
 {
     const uint8_t *p = data;
@@ -282,19 +215,10 @@ static void fnv_mix(uint64_t *h, const void *data, size_t len)
         *h = (*h ^ p[i]) * 0x100000001b3ULL;
 }
 
-/*
- * Sorted checksum implementation.
- *
- * Children are collected into a flat array, sorted alphabetically by name,
- * then hashed in sorted order.  This makes the checksum insertion-order
- * independent: two VFS instances with the same files in different creation
- * orders produce the same hash.
- */
-
 typedef struct {
-    char       *name;        /* heap-allocated entry name              */
-    char       *child_path;  /* heap-allocated absolute path           */
-    vfs_stat_t  vs;          /* stat snapshot (kind, size, timestamps) */
+    char       *name;
+    char       *child_path;
+    vfs_stat_t  vs;
 } cksum_entry_t;
 
 typedef struct {
@@ -312,7 +236,7 @@ static int cksum_coll_cb(void *ctx, const char *name, const vfs_stat_t *vs)
     if (c->n >= c->cap) {
         size_t nc = c->cap ? c->cap * 2 : 8;
         cksum_entry_t *p = realloc(c->entries, nc * sizeof(*p));
-        if (!p) return 0;   /* skip on OOM; checksum still useful */
+        if (!p) return 0;
         c->entries = p;
         c->cap = nc;
     }
@@ -343,15 +267,12 @@ static int cmp_cksum_entry(const void *a, const void *b)
 
 static void checksum_dir(vfs_t *vfs, const char *path, uint64_t *h)
 {
-    /* Phase 1: collect all children. */
     cksum_coll_ctx_t coll = { .parent_path = path };
     vfs_readdir(vfs, path, cksum_coll_cb, &coll);
 
-    /* Phase 2: sort alphabetically — insertion-order independent. */
     if (coll.n > 1)
         qsort(coll.entries, coll.n, sizeof(cksum_entry_t), cmp_cksum_entry);
 
-    /* Phase 3: hash in sorted order. */
     for (size_t i = 0; i < coll.n; i++) {
         cksum_entry_t *e = &coll.entries[i];
 
@@ -386,32 +307,24 @@ static void checksum_dir(vfs_t *vfs, const char *path, uint64_t *h)
 uint64_t cp_vfs_checksum(vfs_t *vfs)
 {
     uint64_t h = 0xcbf29ce484222325ULL;
-    /* Hash the root marker so an empty VFS has a non-trivial hash. */
     fnv_mix(&h, "/", 1);
     checksum_dir(vfs, "/", &h);
     return h;
 }
 
-/* -------------------------------------------------------------------------
- * cp_enumerate_paths — collect all VFS paths filtered by kind
- * ---------------------------------------------------------------------- */
-
-/* Flat path list built across recursive calls. */
 typedef struct {
     char  **paths;
     size_t  n;
     size_t  cap;
-    int     filter;   /* 0=all, 1=files, 2=dirs */
+    int     filter;
 } enum_list_t;
 
-/* Per-readdir-call context (stack-allocated, not shared). */
 typedef struct {
     vfs_t       *vfs;
     const char  *parent_path;
     enum_list_t *list;
 } enum_cb_ctx_t;
 
-/* Forward declaration. */
 static void enum_dir(vfs_t *vfs, const char *parent, enum_list_t *list);
 
 static int enum_list_push(enum_list_t *l, const char *path)
@@ -477,17 +390,12 @@ void cp_enumerate_paths_free(char **paths, size_t n)
     free(paths);
 }
 
-/* -------------------------------------------------------------------------
- * cp_dump_vfs — indented tree listing
- * ---------------------------------------------------------------------- */
-
 typedef struct {
     vfs_t      *vfs;
     const char *parent_path;
     int         depth;
 } dump_ctx_t;
 
-/* Forward declaration for recursion. */
 static int dump_readdir_cb(void *ctx, const char *name, const vfs_stat_t *vs);
 
 static int dump_readdir_cb(void *ctx, const char *name, const vfs_stat_t *vs)
@@ -495,10 +403,8 @@ static int dump_readdir_cb(void *ctx, const char *name, const vfs_stat_t *vs)
     dump_ctx_t *dc = ctx;
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 0;
 
-    /* Print indentation. */
     for (int i = 0; i < dc->depth; i++) printf("  ");
 
-    /* Build child path. */
     size_t plen = strlen(dc->parent_path);
     size_t nlen = strlen(name);
     char *child_path = malloc(plen + nlen + 2);

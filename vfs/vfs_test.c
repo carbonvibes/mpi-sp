@@ -1,15 +1,4 @@
-/*
- * vfs_test.c — unit tests for the in-memory VFS core.
- *
- * Covers (per Week 2 requirements):
- *   - path parsing and normalization
- *   - successful and failing lookup cases
- *   - partial reads and offset behavior
- *   - create / update / delete sequences
- *   - invalid operations and error codes
- *   - reset-to-baseline behavior
- *   - a randomized mutation-sequence test
- */
+/* vfs_test.c — unit tests for the in-memory VFS core */
 
 #include "vfs.h"
 
@@ -19,9 +8,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* -------------------------------------------------------------------------
- * Minimal test framework
- * ---------------------------------------------------------------------- */
 
 static int g_pass  = 0;
 static int g_fail  = 0;
@@ -45,17 +31,10 @@ static const char *g_suite = "";
 #define CHECK_NULL(p)   CHECK((p) == NULL)
 #define CHECK_NOTNULL(p) CHECK((p) != NULL)
 
-/* -------------------------------------------------------------------------
- * Helpers
- * ---------------------------------------------------------------------- */
 
 static const uint8_t *S(const char *s) { return (const uint8_t *)s; }
 static size_t SL(const char *s) { return strlen(s); }
 
-/*
- * readdir accumulator: collect entry names into a flat buffer.
- * ctx must point to a readdir_result.
- */
 #define MAX_ENTRIES 64
 #define MAX_NAME_LEN 256
 
@@ -98,9 +77,6 @@ static char *read_all(vfs_t *vfs, const char *path)
     return buf;
 }
 
-/* -------------------------------------------------------------------------
- * Path parsing and normalization
- * ---------------------------------------------------------------------- */
 
 static void test_path_parsing(void)
 {
@@ -153,9 +129,7 @@ static void test_path_parsing(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * create_file: success and failure cases
- * ---------------------------------------------------------------------- */
+
 
 static void test_create_file(void)
 {
@@ -201,9 +175,7 @@ static void test_create_file(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * mkdir: success and failure cases
- * ---------------------------------------------------------------------- */
+
 
 static void test_mkdir(void)
 {
@@ -242,9 +214,7 @@ static void test_mkdir(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * readdir: listing behavior
- * ---------------------------------------------------------------------- */
+
 
 static void test_readdir(void)
 {
@@ -289,9 +259,7 @@ static void test_readdir(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * read: offsets and partial reads
- * ---------------------------------------------------------------------- */
+
 
 static void test_read(void)
 {
@@ -351,9 +319,7 @@ static void test_read(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * update_file
- * ---------------------------------------------------------------------- */
+
 
 static void test_update_file(void)
 {
@@ -387,9 +353,7 @@ static void test_update_file(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * delete_file
- * ---------------------------------------------------------------------- */
+
 
 static void test_delete_file(void)
 {
@@ -418,9 +382,7 @@ static void test_delete_file(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * rmdir
- * ---------------------------------------------------------------------- */
+
 
 static void test_rmdir(void)
 {
@@ -453,9 +415,7 @@ static void test_rmdir(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * Nested structure
- * ---------------------------------------------------------------------- */
+
 
 static void test_nested(void)
 {
@@ -497,9 +457,7 @@ static void test_nested(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * create / update / delete sequence
- * ---------------------------------------------------------------------- */
+
 
 static void test_mutation_sequence(void)
 {
@@ -551,9 +509,7 @@ static void test_mutation_sequence(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * Snapshot and reset
- * ---------------------------------------------------------------------- */
+
 
 static void test_snapshot_reset(void)
 {
@@ -618,9 +574,7 @@ static void test_snapshot_reset(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * Snapshot with nested structure
- * ---------------------------------------------------------------------- */
+
 
 static void test_snapshot_nested(void)
 {
@@ -657,9 +611,7 @@ static void test_snapshot_nested(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * Invariants
- * ---------------------------------------------------------------------- */
+
 
 static void test_invariants(void)
 {
@@ -732,7 +684,7 @@ static void test_random_sequence(void)
     uint32_t seed = 0xdeadbeef;
 
     /*
-     * Phase 1: Apply 200 random operations.
+     * step 1: apply 200 random operations
      * We keep a parallel boolean array tracking which paths are files,
      * which are dirs, and which are absent.
      */
@@ -810,13 +762,13 @@ static void test_random_sequence(void)
         }
     }
 
-    /* Phase 2: Save snapshot, record what currently exists. */
+    /* step 2: save snapshot, record what currently exists. */
     CHECK_EQ(vfs_save_snapshot(vfs), 0);
 
     int snapshot_state[N_PATHS];
     for (int i = 0; i < N_PATHS; i++) snapshot_state[i] = state[i];
 
-    /* Phase 3: Apply 100 more random mutations. */
+    /* step 3: apply 100 more random mutations */
     for (int op = 0; op < 100; op++) {
         seed ^= seed << 13;
         seed ^= seed >> 17;
@@ -851,7 +803,7 @@ static void test_random_sequence(void)
         }
     }
 
-    /* Phase 4: Reset to snapshot and verify structure matches snapshot_state. */
+    /* step 4: reset to snapshot and verify structure matches snapshot_state. */
     CHECK_EQ(vfs_reset_to_snapshot(vfs), 0);
 
     vfs_stat_t st;
@@ -875,9 +827,7 @@ static void test_random_sequence(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * rename
- * ---------------------------------------------------------------------- */
+
 
 static void test_rename(void)
 {
@@ -961,9 +911,7 @@ static void test_rename(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * symlink
- * ---------------------------------------------------------------------- */
+
 
 static void test_symlink(void)
 {
@@ -1027,9 +975,7 @@ static void test_symlink(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * main
- * ---------------------------------------------------------------------- */
+
 
 int main(void)
 {

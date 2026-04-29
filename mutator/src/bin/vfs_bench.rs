@@ -1,22 +1,3 @@
-/*
- * vfs_bench.rs — Direct VFS benchmark (no FUSE, no mutator, no FFI delta).
- *
- * Measures the raw cost of two operations that sit on the critical path of
- * every fuzzing iteration:
- *
- *   1. vfs_reset_to_snapshot  — restoring the VFS to baseline after each run.
- *   2. apply_delta            — applying a mutated delta to the live VFS.
- *
- * Both are measured over a tight loop with a warm snapshot so the numbers
- * reflect steady-state throughput, not first-call overhead.
- *
- * Usage:
- *   cargo run --release --bin vfs_bench -- [iterations]   (default: 1000)
- *
- * Output is written to stdout in a format that docs/benchmark_baseline.md
- * can be copy-pasted from directly.
- */
-
 use std::env;
 use std::time::{Duration, Instant};
 
@@ -27,10 +8,6 @@ use fs_mutator::{
         vfs_reset_to_snapshot, vfs_save_snapshot, VfsT,
     },
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 struct Stats {
     n: usize,
@@ -71,10 +48,6 @@ impl Stats {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Baseline population
-// ─────────────────────────────────────────────────────────────────────────────
-
 unsafe fn populate_baseline(vfs: *mut VfsT) {
     vfs_create_file(vfs, c"/input".as_ptr(), b"seed".as_ptr(), 4);
     vfs_mkdir(vfs, c"/etc".as_ptr());
@@ -88,10 +61,6 @@ unsafe fn populate_baseline(vfs: *mut VfsT) {
     let magic: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
     vfs_create_file(vfs, c"/data/a.bin".as_ptr(), magic.as_ptr(), magic.len());
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Representative deltas of varying complexity
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn delta_small() -> FsDelta {
     FsDelta::new(vec![
@@ -120,10 +89,6 @@ fn delta_large() -> FsDelta {
     FsDelta::new(ops)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Main
-// ─────────────────────────────────────────────────────────────────────────────
-
 fn main() {
     let n_iters: usize = env::args()
         .nth(1)
@@ -133,7 +98,6 @@ fn main() {
     println!("=== VFS Direct Benchmark ({n_iters} iterations each) ===\n");
     println!("  (no FUSE, no mutator overhead — raw C API cost)\n");
 
-    // ── Set up VFS ────────────────────────────────────────────────────────
     let vfs = unsafe { vfs_create() };
     assert!(!vfs.is_null(), "vfs_create() returned null");
 
@@ -142,9 +106,6 @@ fn main() {
     let snap_ret = unsafe { vfs_save_snapshot(vfs) };
     assert_eq!(snap_ret, 0, "vfs_save_snapshot() failed");
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Benchmark 1: vfs_reset_to_snapshot cost (no apply — pure reset)
-    // ─────────────────────────────────────────────────────────────────────
     println!("── Benchmark 1: vfs_reset_to_snapshot (baseline tree, no prior apply) ──");
     {
         let mut stats = Stats::new();
@@ -158,9 +119,6 @@ fn main() {
     }
     println!();
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Benchmark 2: apply_delta + reset  (small delta — 1 op)
-    // ─────────────────────────────────────────────────────────────────────
     println!("── Benchmark 2: apply_delta + reset  (small: 1 op) ──");
     {
         let delta = delta_small();
@@ -182,9 +140,6 @@ fn main() {
     }
     println!();
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Benchmark 3: apply_delta + reset  (medium delta — 3 ops)
-    // ─────────────────────────────────────────────────────────────────────
     println!("── Benchmark 3: apply_delta + reset  (medium: 3 ops) ──");
     {
         let delta = delta_medium();
@@ -206,9 +161,6 @@ fn main() {
     }
     println!();
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Benchmark 4: apply_delta + reset  (large delta — 10 ops)
-    // ─────────────────────────────────────────────────────────────────────
     println!("── Benchmark 4: apply_delta + reset  (large: 10 ops) ──");
     {
         let delta = delta_large();

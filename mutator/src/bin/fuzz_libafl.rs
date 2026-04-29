@@ -1,28 +1,3 @@
-/*
- * fuzz_libafl.rs — LibAFL harness with the full VFS + FUSE loop.
- *
- * Per-iteration flow:
- *   vfs_reset_to_snapshot(vfs)          ← restore baseline rootfs
- *   apply_delta(vfs, input)             ← mutate rootfs in-place → fs'
- *   <target reads from FUSE mountpoint> ← kernel → FUSE thread → VFS
- *   SanCov fires, MapFeedback records new edges → corpus grows
- *
- * Campaign selection (first CLI argument):
- *   foobar      — crash target: proves the loop works end-to-end (default)
- *   libarchive  — libarchive parses the FUSE-mounted archive file
- *   runc        — OCI container runtime reads rootfs through FUSE (the
- *                 intended real-world target from specs.txt)
- *
- * Usage:
- *   cargo run --release --bin fuzz_libafl -- foobar
- *   cargo run --release --bin fuzz_libafl -- libarchive
- *   cargo run --release --bin fuzz_libafl -- runc   (needs: runc + AppArmor fix)
- *
- * runc prerequisite (one-time, with root):
- *   sudo sed -i 's|/usr/sbin/runc|/usr/bin/runc|g' /etc/apparmor.d/runc
- *   sudo apparmor_parser -r /etc/apparmor.d/runc
- */
-
 use std::{
     cell::RefCell,
     env,
@@ -57,17 +32,8 @@ use libafl_targets::coverage::MAX_EDGES_FOUND;
 use libafl_targets::cmps::{CmpLogObserver, CMPLOG_ENABLED};
 use serde::{Deserialize, Serialize};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SerializableCmpLogObserver
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Newtype wrapper around [`CmpLogObserver`] that satisfies the
-/// `Serialize + DeserializeOwned` bounds required by [`InProcessExecutor`].
-///
-/// The CmpLog comparison map lives in a global static (`libafl_cmplog_map_ptr`),
-/// so the observer has no meaningful in-memory state to persist across
-/// restarts.  Serialising it as a unit type `{}` and reconstructing it from
-/// scratch on deserialisation is therefore correct.
+// Newtype so CmpLogObserver satisfies the Serialize+Deserialize bounds on InProcessExecutor.
+// The CmpLog map is global, so serializing as an empty map and reconstructing on deserialize is fine.
 #[derive(Debug)]
 struct SerializableCmpLogObserver {
     inner: CmpLogObserver,
@@ -79,7 +45,6 @@ impl SerializableCmpLogObserver {
     }
 }
 
-// Trivial Serialize: emit an empty map — no persistent state needed.
 impl Serialize for SerializableCmpLogObserver {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
@@ -87,10 +52,8 @@ impl Serialize for SerializableCmpLogObserver {
     }
 }
 
-// Trivial Deserialize: always reconstruct from the global CmpLog map.
 impl<'de> Deserialize<'de> for SerializableCmpLogObserver {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        // Consume whatever was serialised (expect an empty map `{}`).
         let _ = serde::de::IgnoredAny::deserialize(d)?;
         Ok(Self::new("cmplog", true))
     }
@@ -137,12 +100,7 @@ use fs_mutator::{
 #[cfg(has_fuse3)]
 use fs_mutator::ffi::{fuse_vfs_lib_init, fuse_vfs_lib_is_mounted, fuse_vfs_lib_run};
 
-// Per-iteration counter for unique container IDs (avoids runc state conflicts).
 static RUNC_ITER: AtomicU64 = AtomicU64::new(0);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// C target symbols
-// ─────────────────────────────────────────────────────────────────────────────
 
 extern "C" {
     fn fuzz_foobar_from_path(path: *const std::os::raw::c_char);
@@ -150,10 +108,6 @@ extern "C" {
     #[cfg(has_libarchive)]
     fn fuzz_libarchive_from_path(path: *const std::os::raw::c_char);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Campaign
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Campaign { Foobar, Libarchive, Runc }
@@ -174,10 +128,6 @@ impl Campaign {
         }
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Archive-shaped seeds (libarchive campaign)
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn libarchive_seeds() -> Vec<FsDelta> {
     let tar_empty = vec![0u8; 1024];
@@ -217,50 +167,31 @@ fn libarchive_seeds() -> Vec<FsDelta> {
     ]
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// runc rootfs seeds
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Seeds exercise distinct failure modes in runc's rootfs handling.  All paths
-// are under /rootfs/ since that is the VFS subtree the FUSE mount serves as
-// the container rootfs.  Every mutation class is covered:
-//   • missing mount-point directories  (proc, dev, sys) → runc mount failure
-//   • corrupted executable             → kernel exec failure
-//   • extra files / dirs               → runc path-walk and permission checks
-//   • deep nesting, hidden files       → edge cases in runc's tree traversal
 fn runc_rootfs_seeds(bin_true: &[u8]) -> Vec<FsDelta> {
     let mut seeds = Vec::new();
 
-    // Missing mount-point directories — runc fails to set up proc/dev/sys.
     seeds.push(FsDelta::new(vec![FsOp::rmdir("/rootfs/proc")]));
     seeds.push(FsDelta::new(vec![FsOp::rmdir("/rootfs/dev")]));
     seeds.push(FsDelta::new(vec![FsOp::rmdir("/rootfs/sys")]));
-
-    // Delete the container process — runc fails at exec stage.
     seeds.push(FsDelta::new(vec![FsOp::delete_file("/rootfs/bin/true")]));
 
-    // Corrupt the container executable (ELF magic broken).
     seeds.push(FsDelta::new(vec![
         FsOp::update_file("/rootfs/bin/true", b"not an elf".to_vec()),
     ]));
     seeds.push(FsDelta::new(vec![
-        FsOp::update_file("/rootfs/bin/true", b"\x7fELF".to_vec()),  // truncated ELF
+        FsOp::update_file("/rootfs/bin/true", b"\x7fELF".to_vec()),
     ]));
     if !bin_true.is_empty() {
-        // Bit-flip on a real ELF binary — kernel's ELF loader gets malformed input.
         let mut corrupt = bin_true.to_vec();
-        corrupt[4] ^= 0xff;  // flip EI_CLASS byte
+        corrupt[4] ^= 0xff;
         seeds.push(FsDelta::new(vec![FsOp::update_file("/rootfs/bin/true", corrupt)]));
     }
 
-    // Alternate /etc/passwd formats.
     seeds.push(FsDelta::new(vec![FsOp::update_file("/rootfs/etc/passwd",
         b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/:/usr/sbin/nologin\n".to_vec())]));
     seeds.push(FsDelta::new(vec![FsOp::delete_file("/rootfs/etc/passwd")]));
-    seeds.push(FsDelta::new(vec![FsOp::update_file("/rootfs/etc/passwd",
-        b"".to_vec())])); // empty
+    seeds.push(FsDelta::new(vec![FsOp::update_file("/rootfs/etc/passwd", b"".to_vec())]));
 
-    // Extra directories and files runc may encounter during setup.
     seeds.push(FsDelta::new(vec![
         FsOp::mkdir("/rootfs/usr"),
         FsOp::mkdir("/rootfs/usr/bin"),
@@ -272,7 +203,6 @@ fn runc_rootfs_seeds(bin_true: &[u8]) -> Vec<FsDelta> {
         FsOp::create_file("/rootfs/run/secrets", b"password=hunter2\n".to_vec()),
     ]));
 
-    // Deep nesting — exercises runc's recursive directory handling.
     seeds.push(FsDelta::new(vec![
         FsOp::mkdir("/rootfs/a"),
         FsOp::mkdir("/rootfs/a/b"),
@@ -280,18 +210,15 @@ fn runc_rootfs_seeds(bin_true: &[u8]) -> Vec<FsDelta> {
         FsOp::create_file("/rootfs/a/b/c/d", b"deeply nested".to_vec()),
     ]));
 
-    // Path-traversal-like names — runc should reject or sanitize these.
     seeds.push(FsDelta::new(vec![
         FsOp::mkdir("/rootfs/safe"),
         FsOp::create_file("/rootfs/safe/file.txt", b"../../../etc/passwd".to_vec()),
     ]));
 
-    // Truncate the executable to 0 bytes.
     seeds.push(FsDelta::new(vec![FsOp::truncate("/rootfs/bin/true", 0)]));
 
-    // Setuid-like metadata changes (timestamps edge cases).
     seeds.push(FsDelta::new(vec![
-        FsOp::set_times("/rootfs/bin/true", 0, 0, 0, 0),  // epoch timestamps
+        FsOp::set_times("/rootfs/bin/true", 0, 0, 0, 0),
     ]));
     seeds.push(FsDelta::new(vec![
         FsOp::set_times("/rootfs/etc/passwd", i32::MAX as i64, 0, i32::MAX as i64, 0),
@@ -300,11 +227,6 @@ fn runc_rootfs_seeds(bin_true: &[u8]) -> Vec<FsDelta> {
     seeds
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// VFS baseline helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Foobar / libarchive baseline: /input and /etc/config.
 unsafe fn populate_baseline(vfs: *mut VfsT) {
     vfs_create_file(vfs, c"/input".as_ptr(), b"seed".as_ptr(), 4);
     vfs_mkdir(vfs, c"/etc".as_ptr());
@@ -314,24 +236,8 @@ unsafe fn populate_baseline(vfs: *mut VfsT) {
     );
 }
 
-// runc baseline: a minimal Linux rootfs under /rootfs/.
-//
-// The FUSE mount exposes the entire VFS so runc reads the container's
-// filesystem through normal open/read/readdir syscalls.  Every delta
-// operation (mkdir, create, update, delete, truncate, set_times) changes
-// what runc finds when it sets up the container — all nine mutators are
-// therefore relevant to this campaign.
-//
-// /rootfs/bin/true is populated from the host binary so the baseline
-// container can execute successfully.  Mutations corrupt this binary,
-// which makes the kernel's ELF loader and runc's exec path interesting
-// fuzzing targets.
 unsafe fn populate_runc_rootfs(vfs: *mut VfsT, bin_true: &[u8]) {
-    // Root of the container filesystem.
     vfs_mkdir(vfs, c"/rootfs".as_ptr());
-
-    // Required mount-point directories.  runc mounts proc/dev/sys into
-    // the container; if these directories are missing, mount fails.
     vfs_mkdir(vfs, c"/rootfs/bin".as_ptr());
     vfs_mkdir(vfs, c"/rootfs/proc".as_ptr());
     vfs_mkdir(vfs, c"/rootfs/dev".as_ptr());
@@ -340,8 +246,6 @@ unsafe fn populate_runc_rootfs(vfs: *mut VfsT, bin_true: &[u8]) {
     vfs_mkdir(vfs, c"/rootfs/etc".as_ptr());
     vfs_mkdir(vfs, c"/rootfs/var".as_ptr());
 
-    // The container process.  Use the real /bin/true binary so the
-    // baseline run succeeds; mutations in the corpus will corrupt it.
     if !bin_true.is_empty() {
         vfs_create_file(
             vfs, c"/rootfs/bin/true".as_ptr(),
@@ -349,7 +253,6 @@ unsafe fn populate_runc_rootfs(vfs: *mut VfsT, bin_true: &[u8]) {
         );
     }
 
-    // Minimal /etc files that tools inside the container may read.
     let passwd = b"root:x:0:0:root:/root:/bin/sh\n";
     vfs_create_file(vfs, c"/rootfs/etc/passwd".as_ptr(), passwd.as_ptr(), passwd.len());
 
@@ -363,21 +266,6 @@ unsafe fn populate_runc_rootfs(vfs: *mut VfsT, bin_true: &[u8]) {
     vfs_create_file(vfs, c"/rootfs/etc/resolv.conf".as_ptr(), resolv.as_ptr(), resolv.len());
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// runc config.json helper
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Generate an OCI config.json that points the container rootfs at the
-// FUSE-mounted /rootfs/ directory.  Written once to disk at startup.
-//
-// Namespace selection: only pid + mount + user.  The ipc / uts / network
-// namespace types require additional privilege (or kernel tuning) that is
-// not available in the fuzzing environment, so we omit them.
-//
-// proc / dev / sys mounts are omitted for the same reason: mounting proc
-// inside a rootless user namespace still requires CAP_SYS_ADMIN which
-// we don't have.  The fuzzing target is /bin/true — it doesn't need any
-// of those mount-points, so this is fine.
 fn generate_runc_config(rootfs_path: &str, uid: u32, gid: u32) -> String {
     format!(r#"{{
   "ociVersion": "1.0.0",
@@ -405,10 +293,6 @@ fn generate_runc_config(rootfs_path: &str, uid: u32, gid: u32) -> String {
   }}
 }}"#)
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// FUSE mount helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(has_fuse3)]
 fn start_fuse(vfs: *mut VfsT, mountpoint: &str) {
@@ -439,10 +323,6 @@ fn start_fuse(_vfs: *mut VfsT, _mountpoint: &str) {
     std::process::exit(1);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Main
-// ─────────────────────────────────────────────────────────────────────────────
-
 fn main() {
     let args: Vec<String> = env::args().collect();
     let campaign = args.get(1).map(|s| Campaign::from_arg(s)).unwrap_or(Campaign::Foobar);
@@ -465,17 +345,14 @@ fn main() {
 
     println!("=== fuzz_libafl: campaign={} ===\n", campaign.name());
 
-    // ── Corpus and solutions directories ─────────────────────────────────────
     let corpus_dir    = PathBuf::from(format!("corpus_{}", campaign.name()));
     let solutions_dir = PathBuf::from(format!("solutions_{}", campaign.name()));
     std::fs::create_dir_all(&corpus_dir).ok();
     std::fs::create_dir_all(&solutions_dir).ok();
 
-    // ── FUSE mountpoint ───────────────────────────────────────────────────────
     let mountpoint = format!("/tmp/mpi-sp-fuse-{pid}");
     std::fs::create_dir_all(&mountpoint).expect("failed to create FUSE mountpoint");
 
-    // ── Read host /bin/true for the runc rootfs baseline ─────────────────────
     let bin_true: Vec<u8> = if campaign == Campaign::Runc {
         std::fs::read("/bin/true")
             .or_else(|_| std::fs::read("/usr/bin/true"))
@@ -484,7 +361,6 @@ fn main() {
         vec![]
     };
 
-    // ── VFS setup ─────────────────────────────────────────────────────────────
     let vfs = unsafe { vfs_create() };
     assert!(!vfs.is_null(), "vfs_create() returned null");
 
@@ -522,10 +398,8 @@ fn main() {
         baseline_file_paths.len(), baseline_dir_paths.len(), baseline_all_paths.len(),
     );
 
-    // ── FUSE mount ────────────────────────────────────────────────────────────
     start_fuse(vfs, &mountpoint);
 
-    // ── runc bundle setup (config.json on disk; rootfs through FUSE) ─────────
     let runc_bundle_dir = format!("/tmp/runc-bundle-{pid}");
     let runc_state_dir  = format!("/tmp/runc-state-{pid}");
 
@@ -533,7 +407,6 @@ fn main() {
         std::fs::create_dir_all(&runc_bundle_dir).expect("failed to create runc bundle dir");
         std::fs::create_dir_all(&runc_state_dir).expect("failed to create runc state dir");
 
-        // rootfs path = FUSE mountpoint + /rootfs (the subtree in our VFS).
         let rootfs_fuse_path = format!("{mountpoint}/rootfs");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
@@ -552,12 +425,10 @@ fn main() {
         println!();
     }
 
-    // Primary FUSE path for foobar / libarchive.
     let fuse_input_path = CString::new(format!("{mountpoint}/input"))
         .expect("path has nul byte");
     let fuse_input_ptr = fuse_input_path.as_ptr();
 
-    // ── Seed corpus ───────────────────────────────────────────────────────────
     let initial: Vec<FsDelta>;
     let seed_count: usize;
 
@@ -587,12 +458,6 @@ fn main() {
         initial.len(), seed_count, initial.len() - seed_count,
     );
 
-    // ── Coverage observer ─────────────────────────────────────────────────────
-    // MAX_EDGES_FOUND is set at startup by __sanitizer_cov_trace_pc_guard_init to the
-    // number of PC guards actually present in the binary (~12625 for the full build).
-    // Using EDGES_MAP_DEFAULT_SIZE (65536) instead forces MaxMapFeedback to compare
-    // 65536 slots of which ~12564 are from libarchive (never called in the foobar
-    // campaign) and 52911 have no guards at all — all permanent zeros, all noise.
     let map_size = unsafe {
         if MAX_EDGES_FOUND > 0 { MAX_EDGES_FOUND } else { EDGES_MAP_DEFAULT_SIZE }
     };
@@ -607,20 +472,12 @@ fn main() {
         ))
     };
 
-    // CmpLog: the observer lives in the main executor so its post_exec fires on
-    // every execution and writes comparison pairs into CmpValuesMetadata.
-    // pre_exec resets the CmpLog map; post_exec scans it — this costs ~5k exec/s
-    // vs running without CmpLog.  The tradeoff is worth it: FsDeltaI2SMutator
-    // resolves each gate in a handful of executions rather than thousands of
-    // random guesses, so the crash is found orders of magnitude faster overall.
     unsafe { CMPLOG_ENABLED = 1; }
     let cmplog_observer = SerializableCmpLogObserver::new("cmplog", true);
 
-    // ── Feedback + objective ──────────────────────────────────────────────────
     let mut feedback  = MaxMapFeedback::new(&edges_observer);
     let mut objective = CrashFeedback::new();
 
-    // ── State ─────────────────────────────────────────────────────────────────
     let mut state = StdState::new(
         StdRand::with_seed(current_nanos()),
         OnDiskCorpus::<FsDelta>::new(&corpus_dir).expect("failed to create on-disk corpus"),
@@ -630,29 +487,13 @@ fn main() {
     )
     .expect("failed to create StdState");
 
-    // Seed CmpValuesMetadata so the observer can update it from the first execution.
     state.add_metadata(CmpValuesMetadata::new());
 
-    // ── Event manager + monitor ───────────────────────────────────────────────
     let monitor = SimpleMonitor::new(|msg| println!("{msg}"));
     let mut mgr = SimpleEventManager::new(monitor);
 
-    // ── Mutator stages ────────────────────────────────────────────────────────
-    //
-    // Two-stage pipeline:
-    //
-    //   Stage 1 — i2s_stage (dedicated, single mutator)
-    //     Runs FsDeltaI2SMutator in isolation.  Because it is the ONLY mutator
-    //     in this stage, no subsequent ByteFlip/Replace/etc. can overwrite its
-    //     substitution before the harness executes the input.  The CmpLog pairs
-    //     it reads were written by the previous execution of the same corpus
-    //     entry — a much tighter coupling than mixing I2S into the havoc pool.
-    //
-    //   Stage 2 — havoc_stage (all structural mutators)
-    //     The normal exploration engine.  FsDeltaI2SMutator is intentionally
-    //     absent here; it lives only in stage 1.
-    //
-    // CmpLog disabled — uncomment to re-enable:
+    // i2s_stage runs FsDeltaI2SMutator in isolation so its substitution isn't overwritten
+    // by havoc before the harness executes. havoc_stage handles all structural mutations.
     let i2s_scheduled = HavocScheduledMutator::new(tuple_list!(FsDeltaI2SMutator::new()));
     let i2s_stage     = StdMutationalStage::new(i2s_scheduled);
 
@@ -674,18 +515,11 @@ fn main() {
     );
     let scheduled    = HavocScheduledMutator::new(mutators);
     let havoc_stage  = StdMutationalStage::new(scheduled);
-    let mut stages   = tuple_list!(i2s_stage, havoc_stage);  // CmpLog disabled — swap to tuple_list!(i2s_stage, havoc_stage) to re-enable
+    let mut stages   = tuple_list!(i2s_stage, havoc_stage);
 
-    // ── Scheduler + fuzzer ────────────────────────────────────────────────────
     let scheduler  = QueueScheduler::new();
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
-    // ── Harness ───────────────────────────────────────────────────────────────
-    // Per-iteration sequence:
-    //   1. Reset VFS → baseline rootfs       (handles stale state from prior crash)
-    //   2. Apply delta → rootfs becomes fs'  (FUSE reflects change immediately)
-    //   3. Target reads from FUSE mount      (kernel → FUSE thread → VFS)
-    //   4. SanCov records edges; MapFeedback decides whether to promote
     let campaign_copy      = campaign;
     let runc_bundle_clone  = runc_bundle_dir.clone();
     let runc_state_clone   = runc_state_dir.clone();
@@ -708,19 +542,8 @@ fn main() {
             }
 
             Campaign::Runc => {
-                // Unique container ID per iteration avoids runc state conflicts.
                 let cid = format!("fuzz-{pid}-{}", RUNC_ITER.fetch_add(1, Ordering::Relaxed));
 
-                // runc reads config.json (from disk, static) then traverses
-                // the rootfs (through FUSE, mutated).  Every file system
-                // operation on the FUSE mount hits our SanCov-instrumented
-                // fuse_vfs.c: getattr (file-exists checks), open (file reads),
-                // read (content reads), readdir (directory traversal).
-                //
-                // Crash classes to find:
-                //   • runc null-deref on malformed rootfs structure
-                //   • runc assertion failure on unexpected file types
-                //   • kernel ELF loader crash on corrupted /rootfs/bin/true
                 let Ok(output) = Command::new("/usr/bin/runc")
                     .args([
                         "--root",   &runc_state_clone,
@@ -735,14 +558,10 @@ fn main() {
                     return ExitKind::Ok;
                 };
 
-                // Always clean up container state so the next iteration can
-                // reuse names without "container already exists" errors.
                 let _ = Command::new("/usr/bin/runc")
                     .args(["--root", &runc_state_clone, "delete", "--force", &cid])
                     .output();
 
-                // Crash detection: runc itself exited via a fatal signal,
-                // or its child (the container process) did and runc surfaced it.
                 if let Some(sig) = output.status.signal() {
                     if [libc::SIGSEGV, libc::SIGABRT, libc::SIGBUS, libc::SIGFPE]
                         .contains(&sig)
@@ -755,19 +574,13 @@ fn main() {
         }
     };
 
-    // ── Executor ──────────────────────────────────────────────────────────────
     let timeout = match campaign {
         Campaign::Runc => Duration::from_secs(10),
         _              => Duration::from_secs(5),
     };
     let mut executor = InProcessExecutor::with_timeout(
         &mut harness,
-        // Both observers live here:
-        //   edges_observer   — hitcount map → MaxMapFeedback drives corpus growth
-        //   cmplog_observer  — resets CmpLog map (pre_exec) and writes comparison
-        //                      pairs into CmpValuesMetadata (post_exec) so that
-        //                      FsDeltaI2SMutator in i2s_stage can read them.
-        tuple_list!(edges_observer, cmplog_observer),  // CmpLog disabled — swap to tuple_list!(edges_observer, cmplog_observer) to re-enable
+        tuple_list!(edges_observer, cmplog_observer),
         &mut fuzzer,
         &mut state,
         &mut mgr,
@@ -775,7 +588,6 @@ fn main() {
     )
     .expect("failed to create InProcessExecutor");
 
-    // ── Seed the LibAFL corpus ────────────────────────────────────────────────
     for delta in &initial {
         fuzzer
             .add_input(&mut state, &mut executor, &mut mgr, delta.clone())
@@ -796,12 +608,6 @@ fn main() {
                  campaign.name());
     }
 
-    // ── Fuzz loop ─────────────────────────────────────────────────────────────
-    // Manual loop instead of fuzz_loop so we can sync newly promoted corpus
-    // entries into LiveCorpus after every iteration.  Without this, SpliceDelta
-    // would only ever see the original 11 seed entries as splice donors —
-    // it would never splice from the evolved "foobar..." inputs that I2S and
-    // havoc discover, defeating the purpose of having a "live" corpus.
     loop {
         let count_before = state.corpus().count();
 
@@ -809,8 +615,6 @@ fn main() {
             .fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr)
             .expect("fuzzing iteration failed");
 
-        // Push any newly promoted entries into LiveCorpus so SpliceDelta
-        // immediately sees them as splice donors in subsequent iterations.
         let count_after = state.corpus().count();
         for idx in count_before..count_after {
             let cid = CorpusId::from(idx);
@@ -821,5 +625,4 @@ fn main() {
             }
         }
     }
-
 }

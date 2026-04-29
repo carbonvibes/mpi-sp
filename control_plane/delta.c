@@ -1,27 +1,9 @@
-/*
- * delta.c — fs_delta_t implementation: lifecycle, convenience constructors,
- *            serialization, deserialization, checksum, and dump utilities.
- *
- * Wire format header:  n_ops(4)
- * Wire format per op:
- *   kind(1) | path_len(2) | path(path_len) |
- *   size(4) | data_len(4) | data(data_len) |
- *   has_ts(1) | [if has_ts: mtime_sec(8) | mtime_nsec(8) | atime_sec(8) | atime_nsec(8)]
- *
- * Minimum fixed overhead per op (no timestamps): 1+2+4+4+1 = 12 bytes.
- * SET_TIMES ops additionally carry 32 bytes of timestamp data.
- */
-
 #include "delta.h"
 
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* -------------------------------------------------------------------------
- * Big-endian read/write helpers
- * ---------------------------------------------------------------------- */
 
 static uint32_t r32be(const uint8_t *p)
 {
@@ -60,10 +42,6 @@ static void w64be(uint8_t *p, int64_t v)
     uint64_t u = (uint64_t)v;
     for (int i = 7; i >= 0; i--) { p[i] = (uint8_t)(u & 0xff); u >>= 8; }
 }
-
-/* -------------------------------------------------------------------------
- * Lifecycle
- * ---------------------------------------------------------------------- */
 
 fs_delta_t *delta_create(void)
 {
@@ -113,10 +91,6 @@ int delta_add_op(fs_delta_t *d, const fs_op_t *op)
     d->n_ops++;
     return 0;
 }
-
-/* -------------------------------------------------------------------------
- * Convenience constructors
- * ---------------------------------------------------------------------- */
 
 int delta_add_create_file(fs_delta_t *d, const char *path,
                           const uint8_t *content, size_t content_len)
@@ -179,41 +153,34 @@ int delta_add_truncate(fs_delta_t *d, const char *path, size_t new_size)
     fs_op_t op = {
         .kind        = FS_OP_TRUNCATE,
         .path        = (char *)path,
-        .content_len = new_size,   /* content_len holds new size for TRUNCATE */
+        .content_len = new_size,
     };
     return delta_add_op(d, &op);
 }
-
-/* -------------------------------------------------------------------------
- * Serialization
- * ---------------------------------------------------------------------- */
 
 uint8_t *delta_serialize(const fs_delta_t *d, size_t *out_len)
 {
     *out_len = 0;
     if (!d || d->n_ops == 0) return NULL;
 
-    /* Calculate total buffer size. */
-    size_t total = 4; /* n_ops(4) */
+    size_t total = 4;
     for (size_t i = 0; i < d->n_ops; i++) {
         const fs_op_t *op = &d->ops[i];
         size_t path_len = op->path ? strlen(op->path) : 0;
-        if (path_len > 0xFFFFu) return NULL;  /* path too long for u16 */
+        if (path_len > 0xFFFFu) return NULL;
 
-        /* data_len: only for CREATE_FILE and UPDATE_FILE */
         size_t data_len = (op->kind == FS_OP_CREATE_FILE ||
                            op->kind == FS_OP_UPDATE_FILE)
                           ? op->content_len : 0;
 
         total += DELTA_OP_FIXED + path_len + data_len;
         if (op->kind == FS_OP_SET_TIMES)
-            total += DELTA_TS_SIZE;  /* timestamps only for SET_TIMES */
+            total += DELTA_TS_SIZE;
     }
 
     uint8_t *buf = calloc(1, total);
     if (!buf) return NULL;
 
-    /* Header: just n_ops */
     w32be(buf + 0, (uint32_t)d->n_ops);
 
     size_t pos = 4;
@@ -221,10 +188,8 @@ uint8_t *delta_serialize(const fs_delta_t *d, size_t *out_len)
         const fs_op_t *op = &d->ops[i];
         size_t path_len = op->path ? strlen(op->path) : 0;
 
-        /* Semantic size: content_len for data ops, new_size for TRUNCATE, 0 otherwise */
         uint32_t size_field = (uint32_t)op->content_len;
 
-        /* Data bytes: only for CREATE_FILE / UPDATE_FILE */
         size_t data_len = (op->kind == FS_OP_CREATE_FILE ||
                            op->kind == FS_OP_UPDATE_FILE)
                           ? op->content_len : 0;
@@ -241,7 +206,6 @@ uint8_t *delta_serialize(const fs_delta_t *d, size_t *out_len)
         }
         pos += data_len;
 
-        /* has_ts flag: 1 only for SET_TIMES, 0 for all other kinds */
         if (op->kind == FS_OP_SET_TIMES) {
             buf[pos++] = 1;
             w64be(buf + pos, (int64_t)op->mtime.tv_sec);  pos += 8;
@@ -249,7 +213,7 @@ uint8_t *delta_serialize(const fs_delta_t *d, size_t *out_len)
             w64be(buf + pos, (int64_t)op->atime.tv_sec);  pos += 8;
             w64be(buf + pos, (int64_t)op->atime.tv_nsec); pos += 8;
         } else {
-            buf[pos++] = 0;  /* no timestamps */
+            buf[pos++] = 0;
         }
     }
 
@@ -257,13 +221,7 @@ uint8_t *delta_serialize(const fs_delta_t *d, size_t *out_len)
     return buf;
 }
 
-/* -------------------------------------------------------------------------
- * Deserialization
- *
- * NEED(n): verify n bytes remain at pos, fail with -EINVAL if not.
- * Uses goto-based cleanup with per-op path/content pointers tracked locally.
- * ---------------------------------------------------------------------- */
-
+/* NEED(n): verify n bytes remain at pos before reading */
 #define NEED(n) \
     do { \
         if ((size_t)(n) > len - pos) { err = -EINVAL; goto fail_op; } \
@@ -273,7 +231,6 @@ fs_delta_t *delta_deserialize(const uint8_t *buf, size_t len, int *err_out)
 {
     *err_out = 0;
 
-    /* Minimum: n_ops(4) */
     if (len < 4) { *err_out = -EINVAL; return NULL; }
 
     uint32_t n_ops = r32be(buf + 0);
@@ -289,14 +246,12 @@ fs_delta_t *delta_deserialize(const uint8_t *buf, size_t len, int *err_out)
         char    *path    = NULL;
         uint8_t *content = NULL;
 
-        /* kind */
         NEED(1);
         uint8_t kind_raw = buf[pos++];
         if (kind_raw < FS_OP_KIND_MIN || kind_raw > FS_OP_KIND_MAX) {
             err = -EINVAL; goto fail_op;
         }
 
-        /* path_len + path */
         NEED(2);
         uint16_t path_len = r16be(buf + pos); pos += 2;
         if (path_len == 0) { err = -EINVAL; goto fail_op; }
@@ -308,7 +263,6 @@ fs_delta_t *delta_deserialize(const uint8_t *buf, size_t len, int *err_out)
         path[path_len] = '\0';
         pos += path_len;
 
-        /* size (semantic) + data_len (actual bytes following) */
         NEED(4);
         uint32_t size_field = r32be(buf + pos); pos += 4;
         NEED(4);
@@ -322,7 +276,6 @@ fs_delta_t *delta_deserialize(const uint8_t *buf, size_t len, int *err_out)
         }
         pos += data_len;
 
-        /* has_ts flag: timestamps follow only for SET_TIMES ops */
         NEED(1);
         uint8_t has_ts = buf[pos++];
 
@@ -335,12 +288,6 @@ fs_delta_t *delta_deserialize(const uint8_t *buf, size_t len, int *err_out)
             atime_nsec = r64be(buf + pos); pos += 8;
         }
 
-        /*
-         * content_len semantics:
-         *   CREATE_FILE / UPDATE_FILE  → data_len (bytes in content buffer)
-         *   TRUNCATE                   → size_field (new file size; no data)
-         *   others                     → 0
-         */
         size_t content_len;
         fs_op_kind_t kind = (fs_op_kind_t)kind_raw;
         if (kind == FS_OP_TRUNCATE)
@@ -350,7 +297,6 @@ fs_delta_t *delta_deserialize(const uint8_t *buf, size_t len, int *err_out)
         else
             content_len = 0;
 
-        /* Grow ops array directly to steal pointers without extra copy. */
         if (d->n_ops == d->cap) {
             size_t newcap = d->cap ? d->cap * 2 : 4;
             fs_op_t *p = realloc(d->ops, newcap * sizeof(*p));
@@ -381,10 +327,6 @@ fail_op:
 
 #undef NEED
 
-/* -------------------------------------------------------------------------
- * Checksum  (FNV-1a 64-bit)
- * ---------------------------------------------------------------------- */
-
 uint64_t delta_checksum(const uint8_t *buf, size_t len)
 {
     uint64_t h = 0xcbf29ce484222325ULL;
@@ -392,10 +334,6 @@ uint64_t delta_checksum(const uint8_t *buf, size_t len)
         h = (h ^ buf[i]) * 0x100000001b3ULL;
     return h;
 }
-
-/* -------------------------------------------------------------------------
- * Utilities
- * ---------------------------------------------------------------------- */
 
 const char *op_kind_name(fs_op_kind_t kind)
 {

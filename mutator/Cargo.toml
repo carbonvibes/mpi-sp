@@ -14,10 +14,21 @@ path = "src/bin/fuzz.rs"
 name = "vfs_bench"
 path = "src/bin/vfs_bench.rs"
 
-# Phase B: LibAFL harness — foobar demo + libarchive campaign.
+# LibAFL harness — foobar only, no CmpLog (speed baseline).
+[[bin]]
+name = "fuzz_foobar"
+path = "src/bin/fuzz_foobar.rs"
+
+# LibAFL harness — foobar with CmpLog + I2S stage.
+[[bin]]
+name = "fuzz_foobar_cmplog"
+path = "src/bin/fuzz_foobar_cmplog.rs"
+
+# LibAFL harness — foobar + libarchive + runc campaigns.
 # Usage:
 #   cargo run --bin fuzz_libafl -- foobar        (default demo)
 #   cargo run --bin fuzz_libafl -- libarchive    (needs libarchive-dev)
+#   cargo run --bin fuzz_libafl -- runc          (needs runc)
 [[bin]]
 name = "fuzz_libafl"
 path = "src/bin/fuzz_libafl.rs"

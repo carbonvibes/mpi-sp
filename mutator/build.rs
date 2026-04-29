@@ -38,7 +38,7 @@ fn main() {
         .compiler("clang")
         .file("../demo/foobar_target.c")
         .flag("-fsanitize-coverage=trace-pc-guard,trace-cmp")
-        .opt_level(1)
+        .opt_level(0)
         .compile("foobar_target");
 
     println!("cargo:rerun-if-changed=../demo/foobar_target.c");
