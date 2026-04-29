@@ -1058,4 +1058,4 @@ Right now feedback is purely SanCov edges in the target. But your VFS/FUSE layer
 
 5. Dynamic content dictionary from corpus — simple, solid gain
 
-Whenever a corpus entry is promoted, extract its file content bytes as dictionary tokens. Feed those into TokenInsert/TokenReplace mutators. Cheaper than CmpLog, same basic idea — builds an evolving vocabulary of "bytes that matter" from what coverage feedback already validated. LibAFL has TokenInsert and TokenReplace mutators ready to use.
+Whenever a corpus entry is promoted, extract its file content bytes as dictionary tokens. Feed those into TokenInsert/TokenReplace mutators. Cheaper than CmpLog, same basic idea — builds an evolving vocabulary of "bytes that matter" from what coverage feedback already validated. LibAFL has TokenInsert and TokenReplace mutators ready to use..
