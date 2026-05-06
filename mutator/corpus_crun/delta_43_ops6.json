@@ -1,0 +1,79 @@
+{
+  "ops": [
+    {
+      "kind": "Rmdir",
+      "path": "/rootfs/sys",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "CreateFile",
+      "path": "/test/usr/lib",
+      "content": [
+        228
+      ],
+      "size": 1,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "UpdateFile",
+      "path": "/config.json",
+      "content": [
+        123,
+        34,
+        111,
+        99,
+        105,
+        86,
+        101,
+        114,
+        115,
+        82,
+        111,
+        110,
+        34,
+        58,
+        34,
+        49,
+        243,
+        48,
+        46,
+        48,
+        34,
+        125
+      ],
+      "size": 22,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Rmdir",
+      "path": "/rootfs/dev",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Mkdir",
+      "path": "/config/input",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    }
+  ]
+}

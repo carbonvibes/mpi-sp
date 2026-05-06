@@ -1,12 +1,6 @@
-use std::{
-    cell::RefCell,
-    ffi::CString,
-    path::PathBuf,
-    rc::Rc,
-    thread,
-    time::Duration,
-};
+use std::{cell::RefCell, ffi::CString, path::PathBuf, rc::Rc, thread, time::Duration};
 
+use libafl::observers::{HitcountsMapObserver, StdMapObserver};
 use libafl::{
     corpus::{Corpus, CorpusId, OnDiskCorpus},
     events::{ProgressReporter, SimpleEventManager},
@@ -19,22 +13,19 @@ use libafl::{
     stages::StdMutationalStage,
     state::{HasCorpus, StdState},
 };
-use libafl::observers::{HitcountsMapObserver, StdMapObserver};
 use libafl_bolts::{current_nanos, rands::StdRand, tuples::tuple_list};
-use libafl_targets::{EDGES_MAP, EDGES_MAP_DEFAULT_SIZE};
 use libafl_targets::coverage::MAX_EDGES_FOUND;
+use libafl_targets::{EDGES_MAP, EDGES_MAP_DEFAULT_SIZE};
 
 use fs_mutator::{
     delta::{generate_seed_corpus, initial_corpus_pool, FsDelta},
     ffi::{
-        apply_delta, enumerate_vfs_all_paths, enumerate_vfs_dir_paths,
-        enumerate_vfs_file_paths, vfs_create, vfs_create_file, vfs_mkdir,
-        vfs_reset_to_snapshot, vfs_save_snapshot, VfsT,
+        apply_delta, enumerate_vfs_all_paths, enumerate_vfs_dir_paths, enumerate_vfs_file_paths,
+        vfs_create, vfs_create_file, vfs_mkdir, vfs_reset_to_snapshot, vfs_save_snapshot, VfsT,
     },
     mutators::{
-        AddFileOp, ByteFlipFileContent, DestructiveMutator, LiveCorpus,
-        MutatePath, RemoveOp, ReplaceFileContent, ReplayWriteFile, SpliceDelta,
-        UpdateExistingFile,
+        AddFileOp, ByteFlipFileContent, DestructiveMutator, LiveCorpus, MutatePath, RemoveOp,
+        ReplaceFileContent, ReplayWriteFile, SpliceDelta, UpdateExistingFile,
     },
 };
 
@@ -49,8 +40,10 @@ unsafe fn populate_baseline(vfs: *mut VfsT) {
     vfs_create_file(vfs, c"/input".as_ptr(), b"seed".as_ptr(), 4);
     vfs_mkdir(vfs, c"/etc".as_ptr());
     vfs_create_file(
-        vfs, c"/etc/config".as_ptr(),
-        b"[settings]\nverbose=0\n".as_ptr(), 20,
+        vfs,
+        c"/etc/config".as_ptr(),
+        b"[settings]\nverbose=0\n".as_ptr(),
+        20,
     );
 }
 
@@ -66,7 +59,9 @@ fn start_fuse(vfs: *mut VfsT, mountpoint: &str) {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        if unsafe { fuse_vfs_lib_is_mounted() } != 0 { break; }
+        if unsafe { fuse_vfs_lib_is_mounted() } != 0 {
+            break;
+        }
         if std::time::Instant::now() > deadline {
             eprintln!("FUSE mount timed out on {mountpoint}");
             std::process::exit(1);
@@ -88,7 +83,7 @@ fn main() {
 
     println!("=== fuzz_foobar ===\n");
 
-    let corpus_dir    = PathBuf::from("corpus_foobar");
+    let corpus_dir = PathBuf::from("corpus_foobar");
     let solutions_dir = PathBuf::from("solutions_foobar");
     std::fs::create_dir_all(&corpus_dir).ok();
     std::fs::create_dir_all(&solutions_dir).ok();
@@ -103,23 +98,27 @@ fn main() {
     unsafe { vfs_save_snapshot(vfs) };
 
     let baseline_file_paths = enumerate_vfs_file_paths(vfs);
-    let baseline_dir_paths  = enumerate_vfs_dir_paths(vfs);
-    let baseline_all_paths  = enumerate_vfs_all_paths(vfs);
+    let baseline_dir_paths = enumerate_vfs_dir_paths(vfs);
+    let baseline_all_paths = enumerate_vfs_all_paths(vfs);
 
     let baseline_contents: Vec<(String, Vec<u8>)> = vec![
-        ("/input".to_string(),      b"seed".to_vec()),
-        ("/etc/config".to_string(), b"[settings]\nverbose=0\n".to_vec()),
+        ("/input".to_string(), b"seed".to_vec()),
+        (
+            "/etc/config".to_string(),
+            b"[settings]\nverbose=0\n".to_vec(),
+        ),
     ];
 
     println!(
         "Baseline: {} file(s), {} dir(s), {} total",
-        baseline_file_paths.len(), baseline_dir_paths.len(), baseline_all_paths.len(),
+        baseline_file_paths.len(),
+        baseline_dir_paths.len(),
+        baseline_all_paths.len(),
     );
 
     start_fuse(vfs, &mountpoint);
 
-    let fuse_input_path = CString::new(format!("{mountpoint}/input"))
-        .expect("path has nul byte");
+    let fuse_input_path = CString::new(format!("{mountpoint}/input")).expect("path has nul byte");
     let fuse_input_ptr = fuse_input_path.as_ptr();
 
     let mut v = generate_seed_corpus(&baseline_file_paths);
@@ -131,11 +130,17 @@ fn main() {
 
     println!(
         "Corpus: {} entries ({} seed families + {} donors)\n",
-        initial.len(), seed_count, initial.len() - seed_count,
+        initial.len(),
+        seed_count,
+        initial.len() - seed_count,
     );
 
     let map_size = unsafe {
-        if MAX_EDGES_FOUND > 0 { MAX_EDGES_FOUND } else { EDGES_MAP_DEFAULT_SIZE }
+        if MAX_EDGES_FOUND > 0 {
+            MAX_EDGES_FOUND
+        } else {
+            EDGES_MAP_DEFAULT_SIZE
+        }
     };
     println!("Coverage map: {map_size} guards active");
 
@@ -148,7 +153,7 @@ fn main() {
         ))
     };
 
-    let mut feedback  = MaxMapFeedback::new(&edges_observer);
+    let mut feedback = MaxMapFeedback::new(&edges_observer);
     let mut objective = CrashFeedback::new();
 
     let mut state = StdState::new(
@@ -168,7 +173,11 @@ fn main() {
         ReplaceFileContent::new(),
         AddFileOp::new(),
         RemoveOp::new(),
-        MutatePath::with_baseline(baseline_all_paths.clone()),
+        MutatePath::with_baseline(
+            baseline_file_paths.clone(),
+            baseline_dir_paths.clone(),
+            baseline_all_paths.clone(),
+        ),
         SpliceDelta::new(live_corpus.clone()),
         DestructiveMutator::with_baseline(
             baseline_file_paths.clone(),
@@ -179,11 +188,11 @@ fn main() {
             .with_baseline_contents(baseline_contents.clone()),
         ReplayWriteFile::new(baseline_file_paths.clone()),
     );
-    let scheduled   = HavocScheduledMutator::new(mutators);
+    let scheduled = HavocScheduledMutator::new(mutators);
     let havoc_stage = StdMutationalStage::new(scheduled);
-    let mut stages  = tuple_list!(havoc_stage);
+    let mut stages = tuple_list!(havoc_stage);
 
-    let scheduler  = QueueScheduler::new();
+    let scheduler = QueueScheduler::new();
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
     let mut harness = |input: &FsDelta| -> ExitKind {

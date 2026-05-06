@@ -1,20 +1,3 @@
-/*
- * bench_heavy.c — heavy filesystem workload for FUSE vs native comparison.
- *
- * Usage: ./bench_heavy <directory>
- *
- * Phases (all timed individually and in total):
- *   1. create  — create FILE_COUNT files
- *   2. write   — write FILE_SIZE bytes into each file
- *   3. read    — read every file back fully
- *   4. rename  — rename every file to a new name
- *   5. delete  — unlink every file
- *
- * Sustained mode (60 s):
- *   Loops create→write→read→rename→delete on a single file for 60 seconds
- *   and reports how many full cycles completed per second.
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,11 +8,10 @@
 #include <errno.h>
 
 #define FILE_COUNT  2000
-#define FILE_SIZE   4096   /* bytes per file */
+#define FILE_SIZE   4096
 
 static char g_payload[FILE_SIZE];
 
-/* Returns monotonic time in milliseconds. */
 static long now_ms(void)
 {
     struct timespec ts;
@@ -58,7 +40,6 @@ int main(int argc, char *argv[])
 
     total_start = now_ms();
 
-    /* ── Phase 1: create ──────────────────────────────────────────────── */
     t0 = now_ms();
     for (int i = 0; i < FILE_COUNT; i++) {
         snprintf(path, sizeof(path), "%s/file_%04d.dat", dir, i);
@@ -69,7 +50,6 @@ int main(int argc, char *argv[])
     t1 = now_ms();
     printf("  create  %d files:         %4ld ms\n", FILE_COUNT, t1 - t0);
 
-    /* ── Phase 2: write ───────────────────────────────────────────────── */
     t0 = now_ms();
     for (int i = 0; i < FILE_COUNT; i++) {
         snprintf(path, sizeof(path), "%s/file_%04d.dat", dir, i);
@@ -82,7 +62,6 @@ int main(int argc, char *argv[])
     t1 = now_ms();
     printf("  write   %d x %d B:    %4ld ms\n", FILE_COUNT, FILE_SIZE, t1 - t0);
 
-    /* ── Phase 3: read ────────────────────────────────────────────────── */
     char *rbuf = malloc(FILE_SIZE);
     if (!rbuf) die("malloc");
 
@@ -99,7 +78,6 @@ int main(int argc, char *argv[])
     free(rbuf);
     printf("  read    %d files:         %4ld ms\n", FILE_COUNT, t1 - t0);
 
-    /* ── Phase 4: rename ──────────────────────────────────────────────── */
     t0 = now_ms();
     for (int i = 0; i < FILE_COUNT; i++) {
         snprintf(path,    sizeof(path),    "%s/file_%04d.dat",    dir, i);
@@ -109,7 +87,6 @@ int main(int argc, char *argv[])
     t1 = now_ms();
     printf("  rename  %d files:         %4ld ms\n", FILE_COUNT, t1 - t0);
 
-    /* ── Phase 5: delete ──────────────────────────────────────────────── */
     t0 = now_ms();
     for (int i = 0; i < FILE_COUNT; i++) {
         snprintf(path, sizeof(path), "%s/renamed_%04d.dat", dir, i);
@@ -121,7 +98,6 @@ int main(int argc, char *argv[])
     printf("  ─────────────────────────────────────\n");
     printf("  total                     %4ld ms\n", t1 - total_start);
 
-    /* ── Sustained mode: full cycle for 60 s ─────────────────────────── */
     printf("\n  [sustained 60s] create→write→read→rename→delete ...\n");
 
     snprintf(path,    sizeof(path),    "%s/sustained.dat",         dir);
@@ -131,21 +107,16 @@ int main(int argc, char *argv[])
     long sustained_start = now_ms();
 
     while (now_ms() - sustained_start < 60000) {
-        /* create */
         int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
         if (fd < 0) die("sustained open(create)");
-        /* write */
         if (write(fd, g_payload, FILE_SIZE) != FILE_SIZE) die("sustained write");
         close(fd);
-        /* read */
         fd = open(path, O_RDONLY);
         if (fd < 0) die("sustained open(read)");
         char tmp[FILE_SIZE];
         if (read(fd, tmp, FILE_SIZE) < 0) die("sustained read");
         close(fd);
-        /* rename */
         if (rename(path, newpath) < 0) die("sustained rename");
-        /* delete */
         if (unlink(newpath) < 0) die("sustained unlink");
 
         count++;

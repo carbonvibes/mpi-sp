@@ -1,18 +1,3 @@
-/*
- * foobar_target.c — minimal crash target for LibAFL harness validation.
- *
- * Compiled with -fsanitize-coverage=trace-pc-guard and linked directly into
- * the Rust fuzzer binary.  The Rust harness calls fuzz_foobar() in-process
- * with the primary content bytes extracted from each FsDelta.  SanCov
- * instrumentation on this file feeds the edge-coverage map that MapFeedback
- * uses to drive corpus evolution.
- *
- * Crash condition: content starts with the 6-byte string "foobar".
- * This is the canonical LibAFL end-to-end proof-of-life: a cold corpus of
- * semantic deltas (UpdateFile("/input", random bytes)) must evolve to produce
- * "foobar" content and trigger abort() within a bounded iteration budget.
- */
-
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>

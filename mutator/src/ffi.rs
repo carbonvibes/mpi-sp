@@ -18,16 +18,16 @@ pub struct FsDeltaC {
 #[repr(C)]
 pub struct CpOpResultT {
     pub op_index: c_int,
-    pub error:    c_int,
-    pub message:  *const i8,
+    pub error: c_int,
+    pub message: *const i8,
 }
 
 #[repr(C)]
 pub struct CpResultT {
     pub total_ops: c_int,
     pub succeeded: c_int,
-    pub failed:    c_int,
-    pub results:   *mut CpOpResultT,
+    pub failed: c_int,
+    pub results: *mut CpOpResultT,
 }
 
 extern "C" {
@@ -70,19 +70,15 @@ extern "C" {
     ) -> c_int;
     pub fn delta_add_truncate(d: *mut FsDeltaC, path: *const i8, new_size: usize) -> c_int;
 
-    pub fn cp_apply_delta(
-        vfs: *mut VfsT,
-        d: *const FsDeltaC,
-        dry_run: c_int,
-    ) -> *mut CpResultT;
+    pub fn cp_apply_delta(vfs: *mut VfsT, d: *const FsDeltaC, dry_run: c_int) -> *mut CpResultT;
     pub fn cp_result_free(r: *mut CpResultT);
     pub fn cp_vfs_checksum(vfs: *mut VfsT) -> u64;
 
     pub fn cp_enumerate_paths(
-        vfs:       *mut VfsT,
-        filter:    c_int,
+        vfs: *mut VfsT,
+        filter: c_int,
         paths_out: *mut *mut *mut i8,
-        n_out:     *mut usize,
+        n_out: *mut usize,
     ) -> c_int;
     pub fn cp_enumerate_paths_free(paths: *mut *mut i8, n: usize);
 }
@@ -99,7 +95,7 @@ extern "C" {
 #[derive(Debug, Clone, Copy)]
 pub struct DeltaResult {
     pub succeeded: usize,
-    pub failed:    usize,
+    pub failed: usize,
 }
 
 impl DeltaResult {
@@ -160,16 +156,16 @@ pub fn apply_delta(vfs: *mut VfsT, delta: &FsDelta) -> Result<DeltaResult, i32> 
                     op.content.len(),
                 ),
                 FsOpKind::DeleteFile => delta_add_delete_file(c_delta, path.as_ptr()),
-                FsOpKind::Mkdir      => delta_add_mkdir(c_delta, path.as_ptr()),
-                FsOpKind::Rmdir      => delta_add_rmdir(c_delta, path.as_ptr()),
-                FsOpKind::Truncate   => delta_add_truncate(c_delta, path.as_ptr(), op.size),
-                FsOpKind::SetTimes   => {
+                FsOpKind::Mkdir => delta_add_mkdir(c_delta, path.as_ptr()),
+                FsOpKind::Rmdir => delta_add_rmdir(c_delta, path.as_ptr()),
+                FsOpKind::Truncate => delta_add_truncate(c_delta, path.as_ptr(), op.size),
+                FsOpKind::SetTimes => {
                     let mtime = timespec {
-                        tv_sec:  op.mtime_sec  as libc::time_t,
+                        tv_sec: op.mtime_sec as libc::time_t,
                         tv_nsec: op.mtime_nsec as libc::c_long,
                     };
                     let atime = timespec {
-                        tv_sec:  op.atime_sec  as libc::time_t,
+                        tv_sec: op.atime_sec as libc::time_t,
                         tv_nsec: op.atime_nsec as libc::c_long,
                     };
                     delta_add_set_times(c_delta, path.as_ptr(), &mtime, &atime)
@@ -193,7 +189,7 @@ pub fn apply_delta(vfs: *mut VfsT, delta: &FsDelta) -> Result<DeltaResult, i32> 
     let dr = unsafe {
         DeltaResult {
             succeeded: (*result_ptr).succeeded as usize,
-            failed:    (*result_ptr).failed    as usize,
+            failed: (*result_ptr).failed as usize,
         }
     };
     unsafe { cp_result_free(result_ptr) };
@@ -277,7 +273,10 @@ mod tests {
     #[test]
     fn e2e_update_existing_file_succeeds() {
         let vfs = unsafe { make_baseline_vfs() };
-        let delta = FsDelta::new(vec![FsOp::update_file("/input", b"mutated_content".to_vec())]);
+        let delta = FsDelta::new(vec![FsOp::update_file(
+            "/input",
+            b"mutated_content".to_vec(),
+        )]);
         let dr = apply_delta(vfs, &delta).expect("apply_delta returned Err");
         assert_eq!(dr.succeeded, 1);
         assert_eq!(dr.failed, 0);
@@ -287,9 +286,13 @@ mod tests {
     #[test]
     fn e2e_set_times_on_existing_file_succeeds() {
         let vfs = unsafe { make_baseline_vfs() };
-        let delta = FsDelta::new(vec![
-            FsOp::set_times("/input", 1_000_000_000, 0, 1_000_000_000, 0),
-        ]);
+        let delta = FsDelta::new(vec![FsOp::set_times(
+            "/input",
+            1_000_000_000,
+            0,
+            1_000_000_000,
+            0,
+        )]);
         let dr = apply_delta(vfs, &delta).expect("apply_delta returned Err");
         assert!(dr.succeeded > 0, "set_times op should have succeeded");
         unsafe { vfs_destroy(vfs) };
@@ -300,7 +303,11 @@ mod tests {
         let vfs = unsafe { make_baseline_vfs() };
         let delta = FsDelta::new(vec![FsOp::delete_file("/does_not_exist.txt")]);
         let dr = apply_delta(vfs, &delta).expect("apply_delta returned Err");
-        assert_eq!(dr.succeeded + dr.failed, 1, "should have exactly 1 op result");
+        assert_eq!(
+            dr.succeeded + dr.failed,
+            1,
+            "should have exactly 1 op result"
+        );
         unsafe { vfs_destroy(vfs) };
     }
 }

@@ -24,6 +24,11 @@ path = "src/bin/fuzz_foobar.rs"
 name = "fuzz_foobar_cmplog"
 path = "src/bin/fuzz_foobar_cmplog.rs"
 
+# LibAFL harness — dedicated runc/crun OCI runtime campaign.
+[[bin]]
+name = "fuzz_runc"
+path = "src/bin/fuzz_runc.rs"
+
 # LibAFL harness — foobar + libarchive + runc campaigns.
 # Usage:
 #   cargo run --bin fuzz_libafl -- foobar        (default demo)
@@ -32,6 +37,13 @@ path = "src/bin/fuzz_foobar_cmplog.rs"
 [[bin]]
 name = "fuzz_libafl"
 path = "src/bin/fuzz_libafl.rs"
+
+# Phase C: in-process crun with real SanCov coverage.
+# libcrun.a must be built first — see build.rs for the one-time command.
+# Usage: cargo run --release --bin fuzz_crun
+[[bin]]
+name = "fuzz_crun"
+path = "src/bin/fuzz_crun.rs"
 
 [dependencies]
 libafl         = "0.15"

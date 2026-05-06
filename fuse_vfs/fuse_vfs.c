@@ -1,23 +1,3 @@
-/*
- * Exposes a read-write FUSE mount backed entirely by the in-memory VFS.
- * No data is ever written to disk; all state lives in heap memory.
- *
- * Supported operations:
- *   Read:   getattr, readdir, open, read
- *   Write:  create, write, truncate, mkdir, unlink, rmdir
- *
- * Write semantics:
- *   write()    — read-modify-write on the VFS content buffer; handles
- *                partial writes and appends (gaps filled with zeros).
- *   truncate() — shrink or extend the content buffer (zeros on extension).
- *   create()   — creates an empty file; FUSE calls this for O_CREAT on new paths.
- *
- * Build:    make            (inside fuse_vfs/)
- * Mount:    ./fuse_vfs <mountpoint>
- * Unmount:  fusermount3 -u <mountpoint>
- * Test:     make test
- */
-
 #define FUSE_USE_VERSION 31
 
 #include <fuse3/fuse.h>
@@ -42,7 +22,7 @@ static void vfs_stat_to_stat(const vfs_stat_t *vs, struct stat *st)
     } else if (vs->kind == VFS_SYMLINK) {
         st->st_mode  = S_IFLNK | 0777;
         st->st_nlink = 1;
-        st->st_size  = (off_t)vs->size;   /* strlen(target) */
+        st->st_size  = (off_t)vs->size;
     } else {
         st->st_mode  = S_IFREG | 0644;
         st->st_nlink = 1;
@@ -58,7 +38,7 @@ static int fvfs_getattr(const char *path, struct stat *st,
     (void)fi;
     vfs_stat_t vs;
     int r = vfs_getattr(g_vfs, path, &vs);
-    if (r != 0) return r;   /* already a negative errno */
+    if (r != 0) return r;
     vfs_stat_to_stat(&vs, st);
     return 0;
 }
@@ -73,8 +53,8 @@ static int readdir_bridge(void *ctx, const char *name, const vfs_stat_t *vs)
     readdir_ctx_t *rc = ctx;
     struct stat st;
     vfs_stat_to_stat(vs, &st);
-    /* filler returns 1 when the buffer is full; we ignore it because our
-     * directories are small and we use the non-offset readdir mode. */
+    /* filler returns 1 when the buffer is full; ignored because directories
+     * are small and we use the non-offset readdir mode. */
     rc->filler(rc->buf, name, &st, 0, 0);
     return 0;
 }
@@ -91,12 +71,9 @@ static int fvfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 static void *fvfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 {
     (void)conn;
-    /*
-     * Disable all kernel-side caching so every read/stat goes through FUSE.
-     * Without this the kernel page cache serves stale bytes after the fuzzer
-     * mutates the VFS in-place — the target sees the same content every
-     * iteration regardless of what apply_delta wrote.
-     */
+    /* Zero all cache timeouts so every read/stat goes through FUSE.
+     * Without this the kernel page cache serves stale bytes after apply_delta
+     * mutates the VFS in-place — the target sees the same content every iteration. */
     cfg->attr_timeout     = 0;
     cfg->entry_timeout    = 0;
     cfg->negative_timeout = 0;
@@ -109,8 +86,7 @@ static int fvfs_open(const char *path, struct fuse_file_info *fi)
     int r = vfs_getattr(g_vfs, path, &vs);
     if (r != 0) return r;
     if (vs.kind == VFS_DIR) return -EISDIR;
-    /* Bypass the kernel page cache so each fread() hits fvfs_read() fresh. */
-    fi->direct_io = 1;
+    fi->direct_io = 1;  /* bypass page cache so each fread() hits fvfs_read() fresh */
     return 0;
 }
 
@@ -208,10 +184,8 @@ static int fvfs_rename(const char *oldpath, const char *newpath,
     return vfs_rename(g_vfs, oldpath, newpath);
 }
 
-/*
- * symlink: note that FUSE's argument order is (target, linkpath) —
- * the reverse of the intuitive order.  vfs_symlink takes (vfs, linkpath, target).
- */
+/* FUSE argument order is (target, linkpath) — opposite of the intuitive order.
+ * vfs_symlink takes (vfs, linkpath, target). */
 static int fvfs_symlink(const char *target, const char *linkpath)
 {
     return vfs_symlink(g_vfs, linkpath, target);
@@ -259,22 +233,6 @@ static const struct fuse_operations fvfs_ops = {
     .utimens  = fvfs_utimens,
 };
 
-/* ── Library API (used by the LibAFL fuzzer harness) ─────────────────────────
- *
- * Call sequence from the fuzzer:
- *   fuse_vfs_lib_init(vfs)          — bind the VFS to serve
- *   // spawn thread:
- *   fuse_vfs_lib_run(mountpoint)    — mount + block in event loop
- *   // main thread polls:
- *   while (!fuse_vfs_lib_is_mounted()) sleep(5ms);
- *   // per iteration:
- *   apply_delta(vfs, delta)
- *   <target reads from mountpoint>
- *   vfs_reset_to_snapshot(vfs)
- *   // on exit:
- *   fuse_vfs_lib_stop()
- */
-
 static struct fuse   *g_fuse_handle = NULL;
 static volatile int   g_mounted     = 0;
 
@@ -283,11 +241,8 @@ void fuse_vfs_lib_init(vfs_t *vfs)
     g_vfs = vfs;
 }
 
-/* Blocking: mounts the FUSE filesystem and runs the event loop.
- * Returns when fuse_vfs_lib_stop() signals the session to exit. */
 int fuse_vfs_lib_run(const char *mountpoint)
 {
-    /* Minimal args — just the program name; no extra FUSE options needed. */
     char *argv0 = "fvfs_lib";
     struct fuse_args args = FUSE_ARGS_INIT(1, &argv0);
 
@@ -305,8 +260,8 @@ int fuse_vfs_lib_run(const char *mountpoint)
         return -1;
     }
 
-    g_mounted = 1;                         /* signal readiness to main thread */
-    int ret = fuse_loop(g_fuse_handle);    /* blocks until fuse_vfs_lib_stop() */
+    g_mounted = 1;
+    int ret = fuse_loop(g_fuse_handle);
     g_mounted = 0;
 
     fuse_unmount(g_fuse_handle);
@@ -326,7 +281,6 @@ void fuse_vfs_lib_stop(void)
         fuse_exit(g_fuse_handle);
 }
 
-/* ── Standalone binary (not compiled when FUSE_VFS_LIBRARY is defined) ─────── */
 #ifndef FUSE_VFS_LIBRARY
 
 static void populate_vfs(void)

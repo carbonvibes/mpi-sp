@@ -44,11 +44,7 @@ static void node_free(node_t *n)
     memset(n, 0, sizeof(*n));
 }
 
-/*
- * Return the parent directory path of a given path.
- * "/foo/bar" → "/foo",  "/foo" → "/"
- * Result written into buf (must be MAX_PATH bytes).
- */
+/* "/foo/bar" → "/foo",  "/foo" → "/" — result in buf (MAX_PATH bytes) */
 static void parent_of(const char *path, char *buf)
 {
     const char *last = strrchr(path, '/');
@@ -60,8 +56,6 @@ static void parent_of(const char *path, char *buf)
         buf[len] = '\0';
     }
 }
-
-// callbacks
 
 static int fbfs_getattr(const char *path, struct stat *st,
                         struct fuse_file_info *fi)
@@ -243,7 +237,6 @@ static int fbfs_rename(const char *from, const char *to, unsigned int flags)
     node_t *src = node_find(from);
     if (!src) return -ENOENT;
 
-    /* Remove destination if it exists. */
     node_t *dst = node_find(to);
     if (dst) node_free(dst);
 

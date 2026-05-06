@@ -1,0 +1,68 @@
+{
+  "ops": [
+    {
+      "kind": "UpdateFile",
+      "path": "/input",
+      "content": [
+        102,
+        111,
+        111,
+        98,
+        79,
+        98,
+        99,
+        101
+      ],
+      "size": 8,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Rmdir",
+      "path": "/test/run",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "CreateFile",
+      "path": "/c/d",
+      "content": [
+        99,
+        111,
+        110,
+        101,
+        95,
+        105,
+        99,
+        101
+      ],
+      "size": 8,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "CreateFile",
+      "path": "/tmp/output/output",
+      "content": [
+        201,
+        119,
+        149,
+        190,
+        109
+      ],
+      "size": 5,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    }
+  ]
+}

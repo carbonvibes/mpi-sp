@@ -29,4 +29,3 @@ echo "--- Native /tmp ---"
 
 echo ""
 rmdir -rf "$FUSE_MOUNT"/* "$NATIVE_DIR"/*
-

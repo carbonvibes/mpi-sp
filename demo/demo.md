@@ -8,6 +8,7 @@ python3 /home/arjun/mpi-sp/fuzz_dashboard/server.py /tmp/foobar_fuzz.log foobar
 
 cd /home/arjun/mpi-sp/mutator && cargo build --release 2>&1 
 
+cargo run --release --features libcrun-fuzz --bin fuzz_crun  # crun fuzzer
 
 cargo run --release --bin fuzz_foobar 2>&1 | tee /tmp/foobar_fuzz.log
 cargo run --release --bin fuzz_foobar_cmplog 2>&1 | tee /tmp/foobar_fuzz.log

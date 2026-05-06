@@ -1,0 +1,88 @@
+{
+  "ops": [
+    {
+      "kind": "UpdateFile",
+      "path": "/config.json",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "CreateFile",
+      "path": "/b/run",
+      "content": [
+        30,
+        171,
+        137,
+        198,
+        172,
+        150,
+        150,
+        237,
+        204,
+        152,
+        188,
+        128,
+        181
+      ],
+      "size": 13,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "CreateFile",
+      "path": "/a",
+      "content": [
+        130,
+        116,
+        239,
+        116,
+        60,
+        239,
+        98,
+        201,
+        211
+      ],
+      "size": 9,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Rmdir",
+      "path": "/rootfs",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Mkdir",
+      "path": "/output",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Truncate",
+      "path": "/rootfs/etc/hostname",
+      "content": [],
+      "size": 46,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    }
+  ]
+}

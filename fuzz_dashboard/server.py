@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Fuzz Dashboard — live web UI for fuzz_libafl campaigns.
+Fuzz Dashboard — live web UI for fuzz_libafl / fuzz_runc campaigns.
 Usage:
-    python3 server.py [log_file] [campaign]
+    python3 server.py [log_file] [campaign] [port]
     python3 server.py /tmp/runc_fuzz.log runc
     python3 server.py /tmp/foobar_fuzz.log foobar
+    python3 server.py /tmp/runc_fuzz.log runc 8081
 """
 
-import http.server, json, re, os, sys, glob, time, threading
+import http.server, json, re, os, sys, glob, time, threading, socket
 from pathlib import Path
 
 LOG_FILE  = sys.argv[1] if len(sys.argv) > 1 else "/tmp/runc_fuzz.log"
@@ -51,13 +52,15 @@ def parse_log(path):
                 line = line.rstrip()
                 log_lines.append(line)
 
-                m = re.search(r'campaign=(\w+)', line)
+                # fuzz_libafl prints  campaign=runc
+                # fuzz_runc   prints  target=runc
+                m = re.search(r'(?:campaign|target)=(\w+)', line)
                 if m:
                     campaign_name = m.group(1)
 
                 m = re.search(r'FUSE mounted at (.+)', line)
                 if m:
-                    fuse_mount = m.group(1)
+                    fuse_mount = m.group(1).strip()
 
                 m = HEARTBEAT_RE.search(line)
                 if m:
@@ -149,4 +152,12 @@ if __name__ == "__main__":
     print(f"  log file : {LOG_FILE}")
     print(f"  corpus   : {CORPUS_DIR}")
     print(f"  solutions: {SOLUTIONS_DIR}")
-    http.server.HTTPServer(("", PORT), Handler).serve_forever()
+    # SO_REUSEADDR: lets us restart immediately without 'Address already in use'.
+    # We must set the socket option before bind(), hence overriding server_bind.
+    import socket as _socket
+    class ReusableHTTPServer(http.server.HTTPServer):
+        def server_bind(self):
+            self.socket.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            super().server_bind()
+    ReusableHTTPServer(("", PORT), Handler).serve_forever()
+

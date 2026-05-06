@@ -1,0 +1,14 @@
+{
+  "ops": [
+    {
+      "kind": "DeleteFile",
+      "path": "/rootfs/etc/passwd",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    }
+  ]
+}

@@ -110,8 +110,10 @@ impl FsOp {
 
     pub fn set_times(
         path: impl Into<String>,
-        mtime_sec: i64, mtime_nsec: i64,
-        atime_sec: i64, atime_nsec: i64,
+        mtime_sec: i64,
+        mtime_nsec: i64,
+        atime_sec: i64,
+        atime_nsec: i64,
     ) -> Self {
         Self {
             kind: FsOpKind::SetTimes,
@@ -155,12 +157,13 @@ impl FsDelta {
             }
         }
 
-        let ops = self.ops.iter().enumerate()
-            .filter(|(i, op)| {
-                match last_content_idx.get(op.path.as_str()) {
-                    Some(last) => *i == *last,
-                    None       => true,
-                }
+        let ops = self
+            .ops
+            .iter()
+            .enumerate()
+            .filter(|(i, op)| match last_content_idx.get(op.path.as_str()) {
+                Some(last) => *i == *last,
+                None => true,
             })
             .map(|(_, op)| op.clone())
             .collect();
@@ -173,7 +176,7 @@ impl Input for FsDelta {
     fn generate_name(&self, id: Option<CorpusId>) -> String {
         match id {
             Some(id) => format!("delta_{}_ops{}.json", id.0, self.ops.len()),
-            None     => format!("delta_ops{}.json", self.ops.len()),
+            None => format!("delta_ops{}.json", self.ops.len()),
         }
     }
 
@@ -186,10 +189,9 @@ impl Input for FsDelta {
     }
 
     fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, libafl::Error> {
-        let data = std::fs::read(path)
-            .map_err(|e| libafl::Error::os_error(e, "reading corpus entry"))?;
-        serde_json::from_slice(&data)
-            .map_err(|e| libafl::Error::serialize(e.to_string()))
+        let data =
+            std::fs::read(path).map_err(|e| libafl::Error::os_error(e, "reading corpus entry"))?;
+        serde_json::from_slice(&data).map_err(|e| libafl::Error::serialize(e.to_string()))
     }
 }
 
@@ -201,14 +203,29 @@ pub fn generate_seed() -> FsDelta {
 
 /// Generate a set of structurally diverse seed deltas against known baseline paths.
 pub fn generate_seed_corpus(baseline_files: &[String]) -> Vec<FsDelta> {
-    let primary   = baseline_files.first().map(String::as_str).unwrap_or("/input");
-    let secondary = baseline_files.get(1).map(String::as_str).unwrap_or("/etc/config");
+    let primary = baseline_files
+        .first()
+        .map(String::as_str)
+        .unwrap_or("/input");
+    let secondary = baseline_files
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or("/etc/config");
 
     vec![
         FsDelta::new(vec![FsOp::update_file(primary, b"seed".to_vec())]),
-        FsDelta::new(vec![FsOp::update_file(secondary, b"[settings]\nverbose=1\n".to_vec())]),
+        FsDelta::new(vec![FsOp::update_file(
+            secondary,
+            b"[settings]\nverbose=1\n".to_vec(),
+        )]),
         FsDelta::new(vec![FsOp::truncate(primary, 2)]),
-        FsDelta::new(vec![FsOp::set_times(primary, 1_700_000_000, 0, 1_700_000_000, 0)]),
+        FsDelta::new(vec![FsOp::set_times(
+            primary,
+            1_700_000_000,
+            0,
+            1_700_000_000,
+            0,
+        )]),
         FsDelta::new(vec![
             FsOp::update_file(primary, b"fuzzed content".to_vec()),
             FsOp::set_times(primary, 1_000_000_000, 0, 1_000_000_000, 0),
@@ -224,17 +241,19 @@ pub fn generate_seed_corpus(baseline_files: &[String]) -> Vec<FsDelta> {
 /// Fixed donor pool for SpliceDelta before a real corpus has accumulated.
 pub fn initial_corpus_pool() -> Vec<FsDelta> {
     vec![
-        FsDelta::new(vec![
-            FsOp::update_file("/etc/config", b"[settings]\nverbose=1\n".to_vec()),
-        ]),
+        FsDelta::new(vec![FsOp::update_file(
+            "/etc/config",
+            b"[settings]\nverbose=1\n".to_vec(),
+        )]),
         FsDelta::new(vec![
             FsOp::mkdir("/data"),
             FsOp::create_file("/data/a.bin", vec![0xde, 0xad, 0xbe, 0xef]),
             FsOp::create_file("/data/b.txt", b"hello\n".to_vec()),
         ]),
-        FsDelta::new(vec![
-            FsOp::update_file("/input", b"AAAAAAAAAAAAAAAA".to_vec()),
-        ]),
+        FsDelta::new(vec![FsOp::update_file(
+            "/input",
+            b"AAAAAAAAAAAAAAAA".to_vec(),
+        )]),
         FsDelta::new(vec![
             FsOp::set_times("/input", 1_700_000_000, 0, 1_700_000_000, 0),
             FsOp::truncate("/input", 2),

@@ -1,30 +1,8 @@
-/*
- * libarchive_harness.c — in-process libarchive fuzzing harness.
- *
- * The Rust fuzzer calls fuzz_libarchive() with the primary content bytes from
- * each FsDelta.  libarchive tries to parse those bytes as any supported archive
- * format (tar, zip, cpio, 7z, xz, bz2, gz, ...) in-process.  Memory errors are
- * caught by AddressSanitizer; hangs are caught by the InProcessExecutor timeout.
- *
- * archive_read_open_memory() avoids any filesystem I/O — the input bytes are
- * fed directly from the FsDelta content buffer.  This makes libarchive the ideal
- * first real-world campaign: our content mutations (bit-flip, perturb, dictionary
- * draws of ELF/binary magic bytes) map directly to what archive parsers consume.
- *
- * Build requirements:
- *   apt install libarchive-dev   (Ubuntu/Debian)
- *   dnf install libarchive-devel (Fedora/RHEL)
- * Link: -larchive
- */
-
 #include <stdint.h>
 #include <stddef.h>
 #include <archive.h>
 #include <archive_entry.h>
 
-/* Read an archive from a filesystem path (used with the FUSE mount).
- * The target opens the file through the kernel → FUSE → VFS path, so the full
- * FsDelta (not just raw bytes) drives what libarchive parses. */
 void fuzz_libarchive_from_path(const char *path)
 {
     struct archive *a = archive_read_new();

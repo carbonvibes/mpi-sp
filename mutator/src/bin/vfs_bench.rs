@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use fs_mutator::{
     delta::{FsDelta, FsOp},
     ffi::{
-        apply_delta, vfs_create, vfs_create_file, vfs_destroy, vfs_mkdir,
-        vfs_reset_to_snapshot, vfs_save_snapshot, VfsT,
+        apply_delta, vfs_create, vfs_create_file, vfs_destroy, vfs_mkdir, vfs_reset_to_snapshot,
+        vfs_save_snapshot, VfsT,
     },
 };
 
@@ -18,24 +18,41 @@ struct Stats {
 
 impl Stats {
     fn new() -> Self {
-        Self { n: 0, total: Duration::ZERO, min: Duration::MAX, max: Duration::ZERO }
+        Self {
+            n: 0,
+            total: Duration::ZERO,
+            min: Duration::MAX,
+            max: Duration::ZERO,
+        }
     }
 
     fn record(&mut self, d: Duration) {
         self.n += 1;
         self.total += d;
-        if d < self.min { self.min = d; }
-        if d > self.max { self.max = d; }
+        if d < self.min {
+            self.min = d;
+        }
+        if d > self.max {
+            self.max = d;
+        }
     }
 
     fn mean_ns(&self) -> u128 {
-        if self.n == 0 { 0 } else { self.total.as_nanos() / self.n as u128 }
+        if self.n == 0 {
+            0
+        } else {
+            self.total.as_nanos() / self.n as u128
+        }
     }
 
     fn print(&self, label: &str) {
         println!("  {label}");
         println!("    n     : {}", self.n);
-        println!("    mean  : {:>9} ns  ({:.2} µs)", self.mean_ns(), self.mean_ns() as f64 / 1000.0);
+        println!(
+            "    mean  : {:>9} ns  ({:.2} µs)",
+            self.mean_ns(),
+            self.mean_ns() as f64 / 1000.0
+        );
         println!("    min   : {:>9} ns", self.min.as_nanos());
         println!("    max   : {:>9} ns", self.max.as_nanos());
         println!("    total : {:>9} µs", self.total.as_micros());
@@ -63,9 +80,10 @@ unsafe fn populate_baseline(vfs: *mut VfsT) {
 }
 
 fn delta_small() -> FsDelta {
-    FsDelta::new(vec![
-        FsOp::update_file("/input", b"mutated_content_12345".to_vec()),
-    ])
+    FsDelta::new(vec![FsOp::update_file(
+        "/input",
+        b"mutated_content_12345".to_vec(),
+    )])
 }
 
 fn delta_medium() -> FsDelta {

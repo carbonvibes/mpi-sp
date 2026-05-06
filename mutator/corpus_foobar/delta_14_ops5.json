@@ -1,0 +1,67 @@
+{
+  "ops": [
+    {
+      "kind": "CreateFile",
+      "path": "/lib",
+      "content": [
+        91,
+        226,
+        179,
+        187,
+        84,
+        64,
+        240,
+        250,
+        22,
+        149,
+        180,
+        13,
+        154
+      ],
+      "size": 13,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "UpdateFile",
+      "path": "/input",
+      "content": [
+        102,
+        111,
+        110,
+        245,
+        95,
+        105,
+        99,
+        101
+      ],
+      "size": 8,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Rmdir",
+      "path": "/output/run",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "SetTimes",
+      "path": "/etc",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 2718811501,
+      "mtime_nsec": 0,
+      "atime_sec": 21248827,
+      "atime_nsec": 0
+    }
+  ]
+}

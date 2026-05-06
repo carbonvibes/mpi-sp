@@ -15,7 +15,6 @@ mount_fuse() {
     mkdir -p "$FUSE_MOUNT"
     "$FUSE_BIN" -f "$FUSE_MOUNT" &
     FUSE_PID=$!
-    # wait until the mountpoint is actually live
     for i in $(seq 1 20); do
         mountpoint -q "$FUSE_MOUNT" && return 0
         sleep 0.1

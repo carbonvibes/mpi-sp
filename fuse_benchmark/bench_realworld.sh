@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# bench_realworld.sh — real-world FS benchmark: FUSE vs native /tmp
-#
-# Uses the Python 3.12 stdlib (~5100 files, ~106 MB) as a realistic workload.
-#
-# Three phases:
-#   1. tar extract   — mkdir + create + write for every file (write-heavy)
-#   2. grep -r       — open + read every .py file (read-heavy)
-#   3. find traverse — stat + readdir the whole tree (metadata-heavy)
-#
-# Usage: bash bench_realworld.sh
-
 set -euo pipefail
 
 FUSE_BIN="./fuse_bench_fs"
@@ -40,7 +29,6 @@ ms() {
     echo $(( (end - start) / 1000000 ))
 }
 
-# ── prepare tarball once ────────────────────────────────────────────────────
 if [[ ! -f "$TARBALL" ]]; then
     echo "  preparing tarball from $SOURCE ..."
     tar cf "$TARBALL" --no-same-permissions --no-same-owner -C "$(dirname "$SOURCE")" \
@@ -61,30 +49,25 @@ run_workload() {
 
     rm -rf "$extract_dir"
 
-    # phase 1: tar extract
     local t0 t1
     t0=$(date +%s%N)
     tar xf "$TARBALL" --no-same-permissions --no-same-owner -C "$dir"
     t1=$(date +%s%N)
     printf "  tar extract:    %5d ms\n" "$(ms $t0 $t1)"
 
-    # phase 2: grep -r (read every .py file)
     t0=$(date +%s%N)
     grep -r "def __init__" "$extract_dir" --include="*.py" -l > /dev/null 2>&1 || true
     t1=$(date +%s%N)
     printf "  grep -r:        %5d ms\n" "$(ms $t0 $t1)"
 
-    # phase 3: find traversal
     t0=$(date +%s%N)
     find "$extract_dir" -type f > /dev/null
     t1=$(date +%s%N)
     printf "  find traversal: %5d ms\n" "$(ms $t0 $t1)"
 
-    # total
     rm -rf "$extract_dir"
 }
 
-# ── FUSE ────────────────────────────────────────────────────────────────────
 echo ""
 echo "  [FUSE]"
 umount_fuse
@@ -96,7 +79,6 @@ printf "  ───────────────────────�
 printf "  total:          %5d ms\n" "$(ms $FUSE_START $FUSE_END)"
 umount_fuse
 
-# ── Native ──────────────────────────────────────────────────────────────────
 echo ""
 echo "  [Native /tmp]"
 mkdir -p "$NATIVE_DIR"
@@ -106,7 +88,6 @@ NATIVE_END=$(date +%s%N)
 printf "  ─────────────────────────\n"
 printf "  total:          %5d ms\n" "$(ms $NATIVE_START $NATIVE_END)"
 
-# ── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 FUSE_TOTAL=$(ms $FUSE_START $FUSE_END)
 NATIVE_TOTAL=$(ms $NATIVE_START $NATIVE_END)
