@@ -1,0 +1,58 @@
+{
+  "ops": [
+    {
+      "kind": "Rmdir",
+      "path": "/rootfs/dev",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Rmdir",
+      "path": "/rootfs/proc",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Mkdir",
+      "path": "/input/b",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "UpdateFile",
+      "path": "/config.json",
+      "content": [
+        53
+      ],
+      "size": 1,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "UpdateFile",
+      "path": "/rootfs/etc/hostname",
+      "content": [
+        65
+      ],
+      "size": 1,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    }
+  ]
+}

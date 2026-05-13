@@ -1,0 +1,68 @@
+{
+  "ops": [
+    {
+      "kind": "UpdateFile",
+      "path": "/rootfs/bin/true",
+      "content": [
+        110,
+        111,
+        116,
+        32,
+        97,
+        110,
+        32,
+        101,
+        108,
+        102
+      ],
+      "size": 10,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Truncate",
+      "path": "/rootfs/etc/hosts",
+      "content": [],
+      "size": 209,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "UpdateFile",
+      "path": "/config.json",
+      "content": [
+        123,
+        34,
+        111,
+        99,
+        105,
+        86,
+        101,
+        114,
+        115,
+        105,
+        111,
+        110,
+        34,
+        58,
+        34,
+        219,
+        178,
+        48,
+        46,
+        48,
+        54,
+        176
+      ],
+      "size": 22,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    }
+  ]
+}

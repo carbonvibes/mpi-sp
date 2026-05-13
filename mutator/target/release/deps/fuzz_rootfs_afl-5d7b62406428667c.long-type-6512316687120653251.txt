@@ -1,0 +1,1 @@
+SimpleEventManager<FsDelta, SimpleMonitor<{closure@src/bin/fuzz_rootfs_afl.rs:354:38: 354:41}>, StdState<OnDiskCorpus<FsDelta>, FsDelta, RomuDuoJrRand, OnDiskCorpus<FsDelta>>>

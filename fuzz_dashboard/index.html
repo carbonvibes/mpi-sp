@@ -160,6 +160,49 @@
   .refresh-info { font-size: 12px; color: var(--muted); }
   .refresh-info span { color: var(--green); }
 
+  /* ── Tab navigation ── */
+  .tab-nav {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 0;
+    padding: 0 24px;
+  }
+  .tab-btn {
+    background: none;
+    border: none;
+    border-bottom: 3px solid transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-family: 'Inter', sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 10px 18px;
+    transition: color .15s, border-color .15s;
+  }
+  .tab-btn:hover  { color: var(--text); }
+  .tab-btn.active { color: var(--green); border-bottom-color: var(--green); }
+
+  /* ── Compare charts ── */
+  .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .compare-chart-wrap { height: 280px; position: relative; }
+  .compare-chart-wrap canvas { position: absolute; inset: 0; width: 100% !important; height: 100% !important; }
+
+  /* ── Summary table ── */
+  .summary-table { width: 100%; border-collapse: collapse; }
+  .summary-table th {
+    padding: 9px 14px; text-align: left;
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--muted); border-bottom: 1px solid var(--border);
+  }
+  .summary-table td { padding: 10px 14px; border-bottom: 1px solid #1a1f27; font-size: 13px; }
+  .summary-table tbody tr:hover { background: #1c2129; }
+  .summary-table tbody tr:last-child td { border-bottom: none; }
+  .campaign-dot {
+    display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+    margin-right: 7px; vertical-align: middle;
+  }
+
   /* ── Corpus detail panel ── */
   .delta-entry { border-bottom: 1px solid var(--border); }
   .delta-header {
@@ -218,6 +261,12 @@
   </div>
 </header>
 
+<div class="tab-nav">
+  <button class="tab-btn active" id="tab-btn-campaign" onclick="switchTab('campaign')">Campaign</button>
+  <button class="tab-btn"        id="tab-btn-compare"  onclick="switchTab('compare')">Comparison</button>
+</div>
+
+<div id="tab-campaign">
 <main>
   <!-- Stat cards -->
   <div class="cards">
@@ -298,6 +347,78 @@
     <div class="log-wrap" id="log-wrap"></div>
   </div>
 </main>
+</div><!-- end tab-campaign -->
+
+<div id="tab-compare" style="display:none">
+<main>
+
+  <!-- Compare stat cards -->
+  <div class="cards" id="compare-cards">
+    <div class="card" style="grid-column:span 4">
+      <div class="card-label">Ablation Study — Three Campaigns</div>
+      <div style="color:var(--muted);font-size:13px;margin-top:6px">
+        All campaigns use <span style="color:var(--green);font-family:'JetBrains Mono',monospace">afl-clang-lto</span> instrumented crun.
+        Auto-refreshes every 5s while campaigns are running.
+      </div>
+    </div>
+  </div>
+
+  <!-- Coverage vs Time (full-width) -->
+  <div class="section">
+    <div class="section-header">
+      <span>Coverage — Edges Discovered Over Time (all campaigns)</span>
+      <div style="display:flex;gap:18px;align-items:center">
+        <span><span style="color:#58a6ff">&#9632;</span> C1 Config-only</span>
+        <span><span style="color:#ffa500">&#9632;</span> C2 Rootfs-only</span>
+        <span><span style="color:#00ff88">&#9632;</span> C3 Combined</span>
+      </div>
+    </div>
+    <div class="compare-chart-wrap" style="height:320px"><canvas id="chart-coverage"></canvas></div>
+  </div>
+
+  <!-- Exec/sec and Corpus side by side -->
+  <div class="compare-grid">
+    <div class="section">
+      <div class="section-header"><span>Exec / sec Over Time</span></div>
+      <div class="compare-chart-wrap"><canvas id="chart-execsec"></canvas></div>
+    </div>
+    <div class="section">
+      <div class="section-header"><span>Corpus Size Over Time</span></div>
+      <div class="compare-chart-wrap"><canvas id="chart-corpus"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Summary table -->
+  <div class="section">
+    <div class="section-header">
+      <span>Campaign Summary</span>
+      <span id="compare-refresh-info" class="refresh-info">auto-refresh <span>5s</span></span>
+    </div>
+    <div style="overflow-x:auto">
+      <table class="summary-table" id="compare-summary">
+        <thead>
+          <tr>
+            <th>Campaign</th>
+            <th>Status</th>
+            <th>Run Time</th>
+            <th>Edges Found</th>
+            <th>Coverage %</th>
+            <th>Corpus</th>
+            <th>Crashes</th>
+            <th>Avg Exec/s</th>
+          </tr>
+        </thead>
+        <tbody id="compare-summary-body">
+          <tr><td colspan="8" style="text-align:center;color:var(--muted);padding:24px">
+            Waiting for campaign data — run campaigns to /tmp/campaign{1,2,3}/
+          </td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</main>
+</div><!-- end tab-compare -->
 
 <script>
 // ── Tiny canvas chart ──────────────────────────────────────────────────────
@@ -605,6 +726,151 @@ function update() {
 update();
 setInterval(update, 2000);
 window.addEventListener('resize', () => drawChart(chartHistory));
+
+// ── Tab switching ─────────────────────────────────────────────────────────
+
+function switchTab(name) {
+  document.getElementById('tab-campaign').style.display = name === 'campaign' ? '' : 'none';
+  document.getElementById('tab-compare').style.display  = name === 'compare'  ? '' : 'none';
+  document.getElementById('tab-btn-campaign').classList.toggle('active', name === 'campaign');
+  document.getElementById('tab-btn-compare').classList.toggle('active', name === 'compare');
+  if (name === 'compare') updateCompare();
+}
+
+// ── Multi-line canvas chart ───────────────────────────────────────────────
+
+const CAMPAIGN_COLORS = ['#58a6ff', '#ffa500', '#00ff88'];
+
+function drawMultiChart(canvasId, datasets, yLabel, yFmt) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const W = canvas.clientWidth  || canvas.parentElement.clientWidth;
+  const H = canvas.clientHeight || canvas.parentElement.clientHeight;
+  canvas.width  = W;
+  canvas.height = H;
+  const ctx2 = canvas.getContext('2d');
+
+  const pad  = { top: 16, right: 16, bottom: 40, left: 56 };
+  const cW   = W - pad.left - pad.right;
+  const cH   = H - pad.top  - pad.bottom;
+
+  ctx2.clearRect(0, 0, W, H);
+
+  const allVals = datasets.flatMap(d => d.map(pt => pt.v));
+  const allTimes = datasets.flatMap(d => d.map(pt => pt.t));
+  if (!allVals.length) return;
+
+  const maxV = Math.max(...allVals, 1);
+  const minT = Math.min(...allTimes);
+  const maxT = Math.max(...allTimes, 1);
+
+  // Grid lines
+  ctx2.strokeStyle = '#21262d';
+  ctx2.lineWidth   = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.top + (cH * i / 4);
+    ctx2.beginPath(); ctx2.moveTo(pad.left, y); ctx2.lineTo(pad.left + cW, y); ctx2.stroke();
+    ctx2.fillStyle = '#5c6470';
+    ctx2.font = '10px JetBrains Mono, monospace';
+    ctx2.textAlign = 'right';
+    ctx2.fillText(yFmt(maxV * (4 - i) / 4), pad.left - 6, y + 4);
+  }
+
+  // X axis labels — adaptive: seconds / minutes / hours depending on range
+  ctx2.fillStyle = '#5c6470';
+  ctx2.font = '10px JetBrains Mono, monospace';
+  ctx2.textAlign = 'center';
+  const totalSecs = maxT - minT;
+  let tickStep, tickLabel;
+  if      (totalSecs <= 300)   { tickStep = 30;   tickLabel = s => s + 's'; }
+  else if (totalSecs <= 3600)  { tickStep = 300;  tickLabel = s => Math.round(s/60) + 'm'; }
+  else if (totalSecs <= 86400) { tickStep = 3600; tickLabel = s => Math.round(s/3600) + 'h'; }
+  else                         { tickStep = 7200; tickLabel = s => Math.round(s/3600) + 'h'; }
+  const maxTicks = Math.min(10, Math.ceil(totalSecs / tickStep) + 1);
+  for (let i = 0; i <= maxTicks; i++) {
+    const t = i * tickStep;
+    if (t > totalSecs + tickStep) break;
+    const x = pad.left + (t / Math.max(totalSecs, 1)) * cW;
+    if (x > pad.left + cW + 5) break;
+    ctx2.fillText(tickLabel(t), x, H - 4);
+  }
+
+  // Draw each campaign's line
+  datasets.forEach((data, idx) => {
+    if (!data.length) return;
+    ctx2.beginPath();
+    ctx2.strokeStyle = CAMPAIGN_COLORS[idx];
+    ctx2.lineWidth   = 2;
+    data.forEach((pt, i) => {
+      const x = pad.left + ((pt.t - minT) / Math.max(maxT - minT, 1)) * cW;
+      const y = pad.top  + cH - (pt.v / maxV) * cH;
+      i === 0 ? ctx2.moveTo(x, y) : ctx2.lineTo(x, y);
+    });
+    ctx2.stroke();
+  });
+}
+
+// ── Comparison data update ────────────────────────────────────────────────
+
+function fmtSeconds(s) {
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+function updateCompare() {
+  fetch('/api/compare')
+    .then(r => r.json())
+    .then(d => {
+      const campaigns = d.campaigns || [];
+
+      // Build datasets for each chart
+      const covDatasets    = [];
+      const execDatasets   = [];
+      const corpusDatasets = [];
+
+      campaigns.forEach(c => {
+        const s = c.series || [];
+        covDatasets.push(s.map(pt => ({ t: pt.t, v: pt.edges })));
+        execDatasets.push(s.map(pt => ({ t: pt.t, v: pt.exec_sec })));
+        corpusDatasets.push(s.map(pt => ({ t: pt.t, v: pt.corpus })));
+      });
+
+      drawMultiChart('chart-coverage', covDatasets, 'edges',  v => Math.round(v));
+      drawMultiChart('chart-execsec',  execDatasets, 'ex/s',  v => v >= 1000 ? (v/1000).toFixed(1)+'k' : v.toFixed(0));
+      drawMultiChart('chart-corpus',   corpusDatasets, 'entries', v => Math.round(v));
+
+      // Summary table
+      const tbody = document.getElementById('compare-summary-body');
+      if (!campaigns.some(c => c.running || c.edges_found > 0)) return;
+
+      tbody.innerHTML = campaigns.map((c, idx) => {
+        const pct = c.total_edges > 0 ? ((c.edges_found / c.total_edges) * 100).toFixed(2) : '—';
+        const dot = `<span class="campaign-dot" style="background:${CAMPAIGN_COLORS[idx]}"></span>`;
+        const statusColor = c.running ? 'var(--green)' : 'var(--muted)';
+        const statusText  = c.running ? 'RUNNING' : (c.edges_found > 0 ? 'DONE' : 'PENDING');
+        return `<tr>
+          <td>${dot}<strong>${c.name}</strong></td>
+          <td style="color:${statusColor};font-weight:600;font-family:'JetBrains Mono',monospace;font-size:12px">${statusText}</td>
+          <td class="mono">${c.run_time > 0 ? fmtSeconds(c.run_time) : '—'}</td>
+          <td class="mono" style="color:${CAMPAIGN_COLORS[idx]}">${c.edges_found > 0 ? c.edges_found : '—'}</td>
+          <td class="mono">${c.edges_found > 0 ? pct + '%' : '—'}</td>
+          <td class="mono">${c.corpus_count > 0 ? c.corpus_count : '—'}</td>
+          <td class="mono" style="color:var(--red)">${c.crashes > 0 ? c.crashes : '0'}</td>
+          <td class="mono">${c.exec_sec > 0 ? fmtExecSec(c.exec_sec) : '—'}</td>
+        </tr>`;
+      }).join('');
+    })
+    .catch(() => {});
+}
+
+setInterval(() => {
+  if (document.getElementById('tab-compare').style.display !== 'none') updateCompare();
+}, 5000);
+
+window.addEventListener('resize', () => {
+  if (document.getElementById('tab-compare').style.display !== 'none') updateCompare();
+});
 </script>
 </body>
 </html>

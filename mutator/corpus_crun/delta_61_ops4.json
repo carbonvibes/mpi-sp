@@ -1,0 +1,70 @@
+{
+  "ops": [
+    {
+      "kind": "UpdateFile",
+      "path": "/config.json",
+      "content": [
+        13,
+        1,
+        86,
+        4,
+        210,
+        233,
+        61,
+        169,
+        29,
+        203,
+        64,
+        221,
+        238,
+        233,
+        24,
+        103,
+        143,
+        206,
+        202,
+        161,
+        185,
+        40,
+        204,
+        124,
+        233
+      ],
+      "size": 25,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Truncate",
+      "path": "/rootfs/etc/hostname",
+      "content": [],
+      "size": 523,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Rmdir",
+      "path": "/rootfs/run",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Mkdir",
+      "path": "/test",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    }
+  ]
+}

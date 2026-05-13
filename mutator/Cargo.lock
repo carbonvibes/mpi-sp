@@ -339,6 +339,7 @@ dependencies = [
  "libafl_bolts",
  "libafl_targets",
  "libc",
+ "nix",
  "serde",
  "serde_json",
 ]

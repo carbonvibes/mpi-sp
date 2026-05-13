@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Hard cap on ops per delta.
-pub const MAX_OPS: usize = 20;
+pub const MAX_OPS: usize = 48;
 
 /// Cap on the live corpus size; evicts a random non-seed entry when full.
 pub const MAX_LIVE_CORPUS: usize = 128;

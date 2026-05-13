@@ -1,0 +1,94 @@
+{
+  "ops": [
+    {
+      "kind": "UpdateFile",
+      "path": "/rootfs/bin/true",
+      "content": [
+        127,
+        69,
+        76,
+        70
+      ],
+      "size": 4,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "DeleteFile",
+      "path": "/rootfs/etc/passwd",
+      "content": [],
+      "size": 0,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "CreateFile",
+      "path": "/d/run/data",
+      "content": [
+        21,
+        120,
+        255,
+        176,
+        96,
+        212
+      ],
+      "size": 6,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "CreateFile",
+      "path": "/test/b",
+      "content": [
+        230,
+        190,
+        35,
+        110,
+        194,
+        172,
+        122,
+        169,
+        234,
+        66,
+        35,
+        56,
+        131,
+        195,
+        232,
+        37,
+        28,
+        243,
+        3,
+        71,
+        207,
+        116,
+        15,
+        44,
+        197,
+        15,
+        73
+      ],
+      "size": 27,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    },
+    {
+      "kind": "Truncate",
+      "path": "/config.json",
+      "content": [],
+      "size": 350,
+      "mtime_sec": 0,
+      "mtime_nsec": 0,
+      "atime_sec": 0,
+      "atime_nsec": 0
+    }
+  ]
+}

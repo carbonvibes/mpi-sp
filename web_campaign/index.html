@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Parallel Fuzzing Dashboard</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+  :root {
+    --bg:      #0d1117;
+    --surface: #161b22;
+    --border:  #30363d;
+    --muted:   #8b949e;
+    --text:    #e6edf3;
+    --green:   #3fb950;
+    --blue:    #58a6ff;
+    --red:     #f85149;
+    --yellow:  #d29922;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; font-size: 14px; }
+
+  /* ── Header ── */
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .logo { font-size: 18px; font-weight: 700; letter-spacing: -.5px; }
+  .logo span { color: var(--green); }
+  .refresh-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px; color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px;
+  }
+  .status-dot {
+    display: inline-block; width: 8px; height: 8px;
+    border-radius: 50%; background: var(--green);
+    margin-right: 8px;
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  /* ── Layout ── */
+  main { max-width: 1400px; margin: 0 auto; padding: 20px 24px; }
+
+  /* ── Stat cards ── */
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .card-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    display: inline-block; margin-right: 6px; vertical-align: middle;
+  }
+  .card-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 6px; }
+  .card-edges { font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 700; }
+  .card-execsec { font-size: 12px; color: var(--muted); margin-top: 3px; }
+  .card-corpus  { font-size: 12px; color: var(--muted); }
+
+  /* ── Chart sections ── */
+  .section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 20px;
+    overflow: hidden;
+  }
+  .section-header {
+    padding: 10px 18px;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 1px;
+    color: var(--muted);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .chart-wrap { padding: 12px 16px; height: 220px; }
+  canvas { width: 100% !important; }
+
+  /* ── Legend ── */
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 14px;
+    padding: 8px 18px 12px;
+    border-top: 1px solid var(--border);
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+  .legend-swatch { width: 12px; height: 12px; border-radius: 2px; flex-shrink: 0; }
+
+  /* ── Offline badge ── */
+  .offline { color: var(--muted); font-style: italic; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo"><span>Fuzz</span> Parallel Dashboard</div>
+  <div style="display:flex;align-items:center;gap:14px">
+    <div class="refresh-badge"><span class="status-dot"></span>auto-refresh 5s</div>
+    <div id="ts-badge" class="refresh-badge" style="color:var(--muted)">—</div>
+  </div>
+</header>
+
+<main>
+
+  <!-- Per-instance stat cards -->
+  <div class="cards" id="cards">
+    <div class="card"><div class="card-label">Waiting…</div></div>
+    <div class="card"></div><div class="card"></div>
+    <div class="card"></div><div class="card"></div><div class="card"></div>
+  </div>
+
+  <!-- Coverage chart -->
+  <div class="section">
+    <div class="section-header">
+      <span>Coverage — Edges Discovered Over Time</span>
+      <span id="hdr-edges" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--green)">—</span>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-edges"></canvas></div>
+    <div class="legend" id="legend-edges"></div>
+  </div>
+
+  <!-- Corpus chart -->
+  <div class="section">
+    <div class="section-header">
+      <span>Corpus Growth Over Time</span>
+      <span id="hdr-corpus" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--blue)">—</span>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-corpus"></canvas></div>
+    <div class="legend" id="legend-corpus"></div>
+  </div>
+
+  <!-- Exec/sec chart -->
+  <div class="section">
+    <div class="section-header">
+      <span>Execution Speed Over Time (exec/sec)</span>
+      <span id="hdr-execsec" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--yellow)">—</span>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-execsec"></canvas></div>
+    <div class="legend" id="legend-execsec"></div>
+  </div>
+
+</main>
+
+<script>
+// ── Multi-line canvas chart ────────────────────────────────────────────────
+
+function fmtTime(seconds) {
+  const s = Math.round(seconds);
+  if (s < 3600) return Math.floor(s / 60) + 'm';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h + 'h' + (m ? m + 'm' : '');
+}
+
+function fmtNum(n) {
+  if (n === undefined || n === null) return '—';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(Math.round(n));
+}
+
+function fmtExactNum(n) {
+  if (n === undefined || n === null) return '—';
+  return String(Math.round(n));
+}
+
+function drawMultiChart(canvasId, campaigns, getValue, formatValue = fmtNum) {
+  const canvas = document.getElementById(canvasId);
+  const wrap   = canvas.parentElement;
+  const W = wrap.clientWidth;
+  const H = wrap.clientHeight;
+  canvas.width  = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+
+  const pad = { top: 12, right: 16, bottom: 30, left: 52 };
+  const cW = W - pad.left - pad.right;
+  const cH = H - pad.top  - pad.bottom;
+
+  // Compute global bounds
+  let maxV = 1, maxT = 1;
+  for (const c of campaigns) {
+    for (const pt of c.series) {
+      const v = getValue(pt);
+      if (v > maxV) maxV = v;
+      if (pt.t > maxT) maxT = pt.t;
+    }
+  }
+
+  // Grid lines (horizontal)
+  ctx.strokeStyle = '#21262d';
+  ctx.lineWidth   = 1;
+  const yTicks = 4;
+  for (let i = 0; i <= yTicks; i++) {
+    const y = pad.top + cH - (i / yTicks) * cH;
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(pad.left + cW, y);
+    ctx.stroke();
+    const val = (i / yTicks) * maxV;
+    ctx.fillStyle = '#8b949e';
+    ctx.font = '10px JetBrains Mono, monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(formatValue(val), pad.left - 6, y + 3);
+  }
+
+  // X-axis labels
+  const xTicks = Math.min(6, Math.floor(cW / 60));
+  ctx.fillStyle = '#8b949e';
+  ctx.font = '10px JetBrains Mono, monospace';
+  ctx.textAlign = 'center';
+  for (let i = 0; i <= xTicks; i++) {
+    const x = pad.left + (i / xTicks) * cW;
+    const t = (i / xTicks) * maxT;
+    ctx.fillText(fmtTime(t), x, H - pad.bottom + 14);
+  }
+
+  // Plot each campaign's series
+  for (const c of campaigns) {
+    if (!c.series.length) continue;
+    ctx.beginPath();
+    ctx.strokeStyle = c.color;
+    ctx.lineWidth   = 2;
+    ctx.lineJoin    = 'round';
+    let first = true;
+    for (const pt of c.series) {
+      const x = pad.left + (pt.t / maxT) * cW;
+      const v = getValue(pt);
+      const y = pad.top + cH - (v / maxV) * cH;
+      if (first) { ctx.moveTo(x, y); first = false; }
+      else        { ctx.lineTo(x, y); }
+    }
+    ctx.stroke();
+
+    // Dot at last point
+    const last = c.series[c.series.length - 1];
+    const lx = pad.left + (last.t / maxT) * cW;
+    const lv = getValue(last);
+    const ly = pad.top + cH - (lv / maxV) * cH;
+    ctx.beginPath();
+    ctx.arc(lx, ly, 3.5, 0, 2 * Math.PI);
+    ctx.fillStyle = c.color;
+    ctx.fill();
+  }
+}
+
+function buildLegend(containerId, campaigns) {
+  const el = document.getElementById(containerId);
+  el.innerHTML = campaigns.map(c =>
+    `<div class="legend-item">
+      <div class="legend-swatch" style="background:${c.color}"></div>
+      <span>${c.label}${c.running ? '' : ' <span class="offline">(stopped)</span>'}</span>
+    </div>`
+  ).join('');
+}
+
+// ── Data refresh ──────────────────────────────────────────────────────────
+
+let lastData = null;
+
+function refresh() {
+  fetch('/api/data')
+    .then(r => r.json())
+    .then(data => {
+      lastData = data;
+      render(data);
+    })
+    .catch(() => {});
+}
+
+function render(data) {
+  const campaigns = data.campaigns;
+
+  // Timestamp badge
+  const d = new Date(data.ts * 1000);
+  document.getElementById('ts-badge').textContent =
+    d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+
+  // Stat cards
+  const cardsEl = document.getElementById('cards');
+  cardsEl.innerHTML = campaigns.map(c => {
+    const l = c.latest;
+    const edgesPct = l.edges ? ((l.edges / 11072) * 100).toFixed(1) : '0.0';
+    return `<div class="card">
+      <div class="card-label">
+        <span class="card-dot" style="background:${c.color}"></span>${c.label}
+      </div>
+      <div class="card-edges" style="color:${c.color}">${fmtExactNum(l.edges)}<span style="color:var(--muted);font-size:13px"> / 11072</span></div>
+      <div class="card-execsec">${edgesPct}% edges &nbsp;·&nbsp; ${fmtNum(l.exec_sec)} ex/s</div>
+      <div class="card-corpus">corpus: ${l.corpus} &nbsp;·&nbsp; crashes: ${l.crashes}</div>
+    </div>`;
+  }).join('');
+
+  // Header summaries
+  const totalEdges = Math.max(...campaigns.map(c => c.latest.edges || 0));
+  const totalCorpus = campaigns.reduce((s, c) => s + (c.latest.corpus || 0), 0);
+  const avgExecSec = campaigns.reduce((s, c) => s + (c.latest.exec_sec || 0), 0);
+  document.getElementById('hdr-edges').textContent   = fmtExactNum(totalEdges)  + ' max edges';
+  document.getElementById('hdr-corpus').textContent  = fmtNum(totalCorpus) + ' total corpus';
+  document.getElementById('hdr-execsec').textContent = fmtNum(avgExecSec)  + ' total ex/s';
+
+  // Charts
+  drawMultiChart('chart-edges',   campaigns, pt => pt.edges, fmtExactNum);
+  drawMultiChart('chart-corpus',  campaigns, pt => pt.corpus);
+  drawMultiChart('chart-execsec', campaigns, pt => pt.exec_sec);
+
+  // Legends (only need building once but cheap to redo)
+  buildLegend('legend-edges',   campaigns);
+  buildLegend('legend-corpus',  campaigns);
+  buildLegend('legend-execsec', campaigns);
+}
+
+// Kick off
+refresh();
+setInterval(refresh, 5000);
+
+// Redraw on window resize
+window.addEventListener('resize', () => { if (lastData) render(lastData); });
+</script>
+</body>
+</html>

@@ -1,4 +1,5 @@
 use libafl::{corpus::CorpusId, inputs::Input};
+use libafl_bolts::HasLen;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -169,6 +170,12 @@ impl FsDelta {
             .collect();
 
         Self { ops }
+    }
+}
+
+impl HasLen for FsDelta {
+    fn len(&self) -> usize {
+        self.ops.len()
     }
 }
 
