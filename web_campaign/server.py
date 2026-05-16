@@ -15,9 +15,9 @@ CAMPAIGNS = [
     {"id": "c1_0", "label": "C1-inst-0", "dir": Path("/tmp/c1_0"), "color": "#58a6ff"},
     {"id": "c1_1", "label": "C1-inst-1", "dir": Path("/tmp/c1_1"), "color": "#79c0ff"},
     {"id": "c1_2", "label": "C1-inst-2", "dir": Path("/tmp/c1_2"), "color": "#a5d6ff"},
-    {"id": "c2_0", "label": "C2-inst-0", "dir": Path("/tmp/c2_0"), "color": "#ffa657"},
-    {"id": "c2_1", "label": "C2-inst-1", "dir": Path("/tmp/c2_1"), "color": "#ffb74d"},
-    {"id": "c2_2", "label": "C2-inst-2", "dir": Path("/tmp/c2_2"), "color": "#ffd180"},
+    {"id": "c3_0", "label": "C3-inst-0", "dir": Path("/tmp/c3_0"), "color": "#ffa657"},
+    {"id": "c3_1", "label": "C3-inst-1", "dir": Path("/tmp/c3_1"), "color": "#ffb74d"},
+    {"id": "c3_2", "label": "C3-inst-2", "dir": Path("/tmp/c3_2"), "color": "#ffd180"},
 ]
 
 def parse_fuzzer_stats(path):
@@ -71,7 +71,13 @@ def parse_plot_data(path):
         if last_reset:
             series = series[last_reset:]
 
-    return series[-200:]  # last 200 points for chart performance
+    # Downsample evenly across the full time range (not just the tail)
+    n = 400
+    if len(series) <= n:
+        return series
+    step = (len(series) - 1) / (n - 1)
+    indices = sorted(set(round(i * step) for i in range(n)))
+    return [series[i] for i in indices]
 
 def get_campaign_data(c):
     stats  = parse_fuzzer_stats(c["dir"] / "fuzzer_stats")
@@ -87,11 +93,17 @@ def get_campaign_data(c):
         "crashes": int(stats.get("saved_crashes", 0) or 0),
         "run_time": run_time,
     }
+    stats_path = c["dir"] / "fuzzer_stats"
+    try:
+        alive = (time.time() - stats_path.stat().st_mtime) < 30
+    except FileNotFoundError:
+        alive = False
+
     return {
         "id":      c["id"],
         "label":   c["label"],
         "color":   c["color"],
-        "running": (c["dir"] / "fuzzer_stats").exists(),
+        "running": alive,
         "latest":  latest,
         "series":  series,
     }

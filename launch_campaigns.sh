@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 
 FUZZER=/nix/store/2hpav3yiv5fffrs9g3mf0lx21y7dxk41-crun-fuzzer-0.0.1
-CRUN=/nix/store/wgwpvlvpw94s1k7ir5rkw01v56454mpy-crun-harness-1.23.1/bin/crun
-ROOTFS_BIN=/home/arjun/mpi-sp/mutator/target/release/fuzz_rootfs_afl
+CRUN=/nix/store/xdripc6yb5zpn19rn72yc7vgmddrj2ws-crun-harness-1.23.1/bin/crun
+COMBINED_BIN=/home/arjun/mpi-sp/mutator/target/release/fuzz_combined_afl
+GRAMMAR=/nix/store/2hpav3yiv5fffrs9g3mf0lx21y7dxk41-crun-fuzzer-0.0.1/share/grammar.py
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-CAMPAIGN_DIRS=(/tmp/c1_0 /tmp/c1_1 /tmp/c1_2 /tmp/c2_0 /tmp/c2_1 /tmp/c2_2)
+CAMPAIGN_DIRS=(/tmp/c1_0 /tmp/c1_1 /tmp/c1_2 /tmp/c3_0 /tmp/c3_1 /tmp/c3_2)
 CORES=(0 1 2 3 4 5)
 PIDS=()
 
@@ -59,7 +60,7 @@ cleanup() {
     done
 
     # Kill the root-owned fuzzer processes, identified strictly by their CWD
-    # (one of /tmp/c1_0 … /tmp/c2_2) — never touches other users' processes
+    # (one of /tmp/c1_0 … /tmp/c3_2) — never touches other users' processes
     kill_our_fuzzers
 
     # Give them 3 seconds to flush their final fuzzer_stats / plot_data
@@ -82,7 +83,7 @@ cleanup() {
         sudo rm -rf "$dir"
         echo "    rm -rf $dir"
     done
-    rm -f /tmp/c1_{0,1,2}_fuzz.log /tmp/c2_{0,1,2}_fuzz.log
+    rm -f /tmp/c1_{0,1,2}_fuzz.log /tmp/c3_{0,1,2}_fuzz.log
 
     echo "==> Done."
     exit 0
@@ -102,14 +103,14 @@ for i in 0 1 2; do
     echo "C1-inst-$i started on core $i (pid ${PIDS[-1]})"
 done
 
-# ── Campaign 2 — cores 3, 4, 5 ───────────────────────────────────────────────
+# ── Campaign 3 — cores 3, 4, 5 ───────────────────────────────────────────────
 for i in 0 1 2; do
     core=$((i + 3))
-    (cd /tmp/c2_$i && taskset -c $core sudo unshare -m \
-        "$ROOTFS_BIN" "$CRUN" \
-        2>&1 | tee /tmp/c2_${i}_fuzz.log) &
+    (cd /tmp/c3_$i && taskset -c $core sudo unshare -m \
+        "$COMBINED_BIN" "$CRUN" "$GRAMMAR" \
+        2>&1 | tee /tmp/c3_${i}_fuzz.log) &
     PIDS+=($!)
-    echo "C2-inst-$i started on core $core (pid ${PIDS[-1]})"
+    echo "C3-inst-$i started on core $core (pid ${PIDS[-1]})"
 done
 
 echo ""

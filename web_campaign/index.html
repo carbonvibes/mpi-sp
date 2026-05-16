@@ -32,19 +32,27 @@
   }
   .logo { font-size: 18px; font-weight: 700; letter-spacing: -.5px; }
   .logo span { color: var(--green); }
-  .refresh-badge {
+  .hdr-right { display: flex; align-items: center; gap: 10px; }
+  .badge {
     font-family: 'JetBrains Mono', monospace;
     font-size: 12px; color: var(--muted);
     border: 1px solid var(--border);
     border-radius: 6px; padding: 4px 10px;
+    white-space: nowrap;
   }
+  .badge.elapsed {
+    color: var(--text); border-color: #58a6ff44;
+    background: #58a6ff0d;
+    font-size: 13px; font-weight: 600; letter-spacing: .5px;
+  }
+  .badge.running-count { font-size: 12px; }
   .status-dot {
-    display: inline-block; width: 8px; height: 8px;
-    border-radius: 50%; background: var(--green);
-    margin-right: 8px;
-    animation: pulse 2s infinite;
+    display: inline-block; width: 7px; height: 7px;
+    border-radius: 50%; margin-right: 5px;
+    vertical-align: middle;
   }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  .dot-pulse { animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
 
   /* ── Layout ── */
   main { max-width: 1400px; margin: 0 auto; padding: 20px 24px; }
@@ -61,15 +69,31 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 12px 14px;
+    transition: border-color .3s, opacity .3s;
   }
+  .card.dead {
+    opacity: 0.55;
+    border-color: var(--red);
+  }
+  .card-top {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 7px;
+  }
+  .card-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .8px; }
   .card-dot {
-    width: 10px; height: 10px; border-radius: 50%;
-    display: inline-block; margin-right: 6px; vertical-align: middle;
+    width: 9px; height: 9px; border-radius: 50%;
+    display: inline-block; margin-right: 5px; vertical-align: middle;
   }
-  .card-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 6px; }
+  .status-pill {
+    font-size: 9px; font-weight: 700; letter-spacing: .8px;
+    padding: 2px 6px; border-radius: 4px;
+    text-transform: uppercase;
+  }
+  .status-pill.running { background: #0d2a1a; color: var(--green); border: 1px solid #238636; }
+  .status-pill.dead    { background: #2a0d0d; color: var(--red);   border: 1px solid #6e2020; }
   .card-edges { font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 700; }
-  .card-execsec { font-size: 12px; color: var(--muted); margin-top: 3px; }
-  .card-corpus  { font-size: 12px; color: var(--muted); }
+  .card-sub   { font-size: 12px; color: var(--muted); margin-top: 3px; }
+  .card-elapsed { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #58a6ff99; margin-top: 5px; }
 
   /* ── Chart sections ── */
   .section {
@@ -98,18 +122,18 @@
   }
   .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; }
   .legend-swatch { width: 12px; height: 12px; border-radius: 2px; flex-shrink: 0; }
-
-  /* ── Offline badge ── */
-  .offline { color: var(--muted); font-style: italic; }
+  .legend-dead { color: var(--muted); text-decoration: line-through; }
 </style>
 </head>
 <body>
 
 <header>
   <div class="logo"><span>Fuzz</span> Parallel Dashboard</div>
-  <div style="display:flex;align-items:center;gap:14px">
-    <div class="refresh-badge"><span class="status-dot"></span>auto-refresh 5s</div>
-    <div id="ts-badge" class="refresh-badge" style="color:var(--muted)">—</div>
+  <div class="hdr-right">
+    <div class="badge running-count" id="hdr-status">—</div>
+    <div class="badge elapsed" id="hdr-elapsed">00:00:00</div>
+    <div class="badge"><span class="status-dot dot-pulse" style="background:var(--green)"></span>auto-refresh 5s</div>
+    <div class="badge" id="ts-badge" style="color:var(--muted)">—</div>
   </div>
 </header>
 
@@ -155,7 +179,7 @@
 </main>
 
 <script>
-// ── Multi-line canvas chart ────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────
 
 function fmtTime(seconds) {
   const s = Math.round(seconds);
@@ -163,6 +187,14 @@ function fmtTime(seconds) {
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   return h + 'h' + (m ? m + 'm' : '');
+}
+
+function fmtElapsed(seconds) {
+  if (!seconds || seconds < 0) return '00:00:00';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
 }
 
 function fmtNum(n) {
@@ -176,6 +208,8 @@ function fmtExactNum(n) {
   if (n === undefined || n === null) return '—';
   return String(Math.round(n));
 }
+
+// ── Multi-line canvas chart ───────────────────────────────────────────────
 
 function drawMultiChart(canvasId, campaigns, getValue, formatValue = fmtNum) {
   const canvas = document.getElementById(canvasId);
@@ -191,15 +225,21 @@ function drawMultiChart(canvasId, campaigns, getValue, formatValue = fmtNum) {
   const cW = W - pad.left - pad.right;
   const cH = H - pad.top  - pad.bottom;
 
-  // Compute global bounds
-  let maxV = 1, maxT = 1;
+  // Compute global bounds across ALL series
+  let minV = Infinity, maxV = -Infinity, maxT = 1;
   for (const c of campaigns) {
     for (const pt of c.series) {
       const v = getValue(pt);
+      if (v < minV) minV = v;
       if (v > maxV) maxV = v;
       if (pt.t > maxT) maxT = pt.t;
     }
   }
+  if (minV === Infinity) { minV = 0; maxV = 1; }
+  // 5% headroom above max; floor at data minimum (not forced to 0)
+  const range = (maxV - minV) || 1;
+  const yMin = minV - range * 0.02;
+  const yMax = maxV + range * 0.05;
 
   // Grid lines (horizontal)
   ctx.strokeStyle = '#21262d';
@@ -211,7 +251,7 @@ function drawMultiChart(canvasId, campaigns, getValue, formatValue = fmtNum) {
     ctx.moveTo(pad.left, y);
     ctx.lineTo(pad.left + cW, y);
     ctx.stroke();
-    const val = (i / yTicks) * maxV;
+    const val = yMin + (i / yTicks) * (yMax - yMin);
     ctx.fillStyle = '#8b949e';
     ctx.font = '10px JetBrains Mono, monospace';
     ctx.textAlign = 'right';
@@ -233,24 +273,26 @@ function drawMultiChart(canvasId, campaigns, getValue, formatValue = fmtNum) {
   for (const c of campaigns) {
     if (!c.series.length) continue;
     ctx.beginPath();
-    ctx.strokeStyle = c.color;
-    ctx.lineWidth   = 2;
+    ctx.strokeStyle = c.running ? c.color : c.color + '66';
+    ctx.lineWidth   = c.running ? 2 : 1.5;
+    ctx.setLineDash(c.running ? [] : [4, 3]);
     ctx.lineJoin    = 'round';
     let first = true;
     for (const pt of c.series) {
       const x = pad.left + (pt.t / maxT) * cW;
       const v = getValue(pt);
-      const y = pad.top + cH - (v / maxV) * cH;
+      const y = pad.top + cH - ((v - yMin) / (yMax - yMin)) * cH;
       if (first) { ctx.moveTo(x, y); first = false; }
       else        { ctx.lineTo(x, y); }
     }
     ctx.stroke();
+    ctx.setLineDash([]);
 
     // Dot at last point
     const last = c.series[c.series.length - 1];
     const lx = pad.left + (last.t / maxT) * cW;
     const lv = getValue(last);
-    const ly = pad.top + cH - (lv / maxV) * cH;
+    const ly = pad.top + cH - ((lv - yMin) / (yMax - yMin)) * cH;
     ctx.beginPath();
     ctx.arc(lx, ly, 3.5, 0, 2 * Math.PI);
     ctx.fillStyle = c.color;
@@ -260,13 +302,26 @@ function drawMultiChart(canvasId, campaigns, getValue, formatValue = fmtNum) {
 
 function buildLegend(containerId, campaigns) {
   const el = document.getElementById(containerId);
-  el.innerHTML = campaigns.map(c =>
-    `<div class="legend-item">
-      <div class="legend-swatch" style="background:${c.color}"></div>
-      <span>${c.label}${c.running ? '' : ' <span class="offline">(stopped)</span>'}</span>
-    </div>`
-  ).join('');
+  el.innerHTML = campaigns.map(c => {
+    const deadCls = c.running ? '' : ' legend-dead';
+    return `<div class="legend-item">
+      <div class="legend-swatch" style="background:${c.color}${c.running ? '' : '88'}"></div>
+      <span class="${deadCls}">${c.label}${c.running ? '' : ' (dead)'}</span>
+    </div>`;
+  }).join('');
 }
+
+// ── Elapsed ticker ────────────────────────────────────────────────────────
+
+let _baseRunTime = 0;   // run_time value from last API fetch
+let _fetchedAt   = 0;   // Date.now() when that fetch happened
+
+function tickElapsed() {
+  if (_fetchedAt === 0) return;
+  const now = Math.round(_baseRunTime + (Date.now() - _fetchedAt) / 1000);
+  document.getElementById('hdr-elapsed').textContent = fmtElapsed(now);
+}
+setInterval(tickElapsed, 1000);
 
 // ── Data refresh ──────────────────────────────────────────────────────────
 
@@ -277,6 +332,12 @@ function refresh() {
     .then(r => r.json())
     .then(data => {
       lastData = data;
+      // Update elapsed ticker base
+      const runningTimes = data.campaigns
+        .filter(c => c.running)
+        .map(c => c.latest.run_time || 0);
+      _baseRunTime = runningTimes.length ? Math.max(...runningTimes) : _baseRunTime;
+      _fetchedAt = Date.now();
       render(data);
     })
     .catch(() => {});
@@ -290,35 +351,49 @@ function render(data) {
   document.getElementById('ts-badge').textContent =
     d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
 
+  // Running/dead count in header
+  const alive = campaigns.filter(c => c.running).length;
+  const total = campaigns.length;
+  const statusEl = document.getElementById('hdr-status');
+  statusEl.textContent = `${alive}/${total} alive`;
+  statusEl.style.color = alive === total ? 'var(--green)' : alive === 0 ? 'var(--red)' : 'var(--yellow)';
+
   // Stat cards
   const cardsEl = document.getElementById('cards');
   cardsEl.innerHTML = campaigns.map(c => {
     const l = c.latest;
     const edgesPct = l.edges ? ((l.edges / 11072) * 100).toFixed(1) : '0.0';
-    return `<div class="card">
-      <div class="card-label">
-        <span class="card-dot" style="background:${c.color}"></span>${c.label}
+    const deadCls = c.running ? '' : ' dead';
+    const pillCls = c.running ? 'running' : 'dead';
+    const pillTxt = c.running ? '● RUNNING' : '● DEAD';
+    return `<div class="card${deadCls}">
+      <div class="card-top">
+        <div class="card-label">
+          <span class="card-dot" style="background:${c.color}"></span>${c.label}
+        </div>
+        <span class="status-pill ${pillCls}">${pillTxt}</span>
       </div>
       <div class="card-edges" style="color:${c.color}">${fmtExactNum(l.edges)}<span style="color:var(--muted);font-size:13px"> / 11072</span></div>
-      <div class="card-execsec">${edgesPct}% edges &nbsp;·&nbsp; ${fmtNum(l.exec_sec)} ex/s</div>
-      <div class="card-corpus">corpus: ${l.corpus} &nbsp;·&nbsp; crashes: ${l.crashes}</div>
+      <div class="card-sub">${edgesPct}% edges &nbsp;·&nbsp; ${fmtNum(l.exec_sec)} ex/s</div>
+      <div class="card-sub">corpus: ${l.corpus} &nbsp;·&nbsp; crashes: ${l.crashes}</div>
+      <div class="card-elapsed">${fmtElapsed(l.run_time)}</div>
     </div>`;
   }).join('');
 
   // Header summaries
-  const totalEdges = Math.max(...campaigns.map(c => c.latest.edges || 0));
+  const totalEdges  = Math.max(...campaigns.map(c => c.latest.edges || 0));
   const totalCorpus = campaigns.reduce((s, c) => s + (c.latest.corpus || 0), 0);
-  const avgExecSec = campaigns.reduce((s, c) => s + (c.latest.exec_sec || 0), 0);
+  const totalExecSec = campaigns.reduce((s, c) => s + (c.latest.exec_sec || 0), 0);
   document.getElementById('hdr-edges').textContent   = fmtExactNum(totalEdges)  + ' max edges';
   document.getElementById('hdr-corpus').textContent  = fmtNum(totalCorpus) + ' total corpus';
-  document.getElementById('hdr-execsec').textContent = fmtNum(avgExecSec)  + ' total ex/s';
+  document.getElementById('hdr-execsec').textContent = fmtNum(totalExecSec) + ' total ex/s';
 
   // Charts
   drawMultiChart('chart-edges',   campaigns, pt => pt.edges, fmtExactNum);
   drawMultiChart('chart-corpus',  campaigns, pt => pt.corpus);
   drawMultiChart('chart-execsec', campaigns, pt => pt.exec_sec);
 
-  // Legends (only need building once but cheap to redo)
+  // Legends
   buildLegend('legend-edges',   campaigns);
   buildLegend('legend-corpus',  campaigns);
   buildLegend('legend-execsec', campaigns);
@@ -327,8 +402,6 @@ function render(data) {
 // Kick off
 refresh();
 setInterval(refresh, 5000);
-
-// Redraw on window resize
 window.addEventListener('resize', () => { if (lastData) render(lastData); });
 </script>
 </body>

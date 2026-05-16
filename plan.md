@@ -105,10 +105,10 @@ for rootfs, running together in one fuzzer.
 > **All three campaigns use the exact same Nix-built crun binary from SemanticSanitizer.**
 
 ```
-/nix/store/wgwpvlvpw94s1k7ir5rkw01v56454mpy-crun-harness-1.23.1/bin/crun
+/nix/store/xdripc6yb5zpn19rn72yc7vgmddrj2ws-crun-harness-1.23.1/bin/crun
 ```
 
-This is crun 1.23.1 patched with `0001-crun-add-harness.patch` (3rd rebuild — all bugs fixed),
+This is crun 1.23.1 patched with `0001-crun-add-harness.patch` (4th rebuild — all bugs fixed),
 compiled with `afl-clang-lto` via Nix. Using the same binary across all campaigns guarantees:
 - Identical instrumentation
 - Identical total edge count: **11072 edges** for all three campaigns
@@ -335,7 +335,9 @@ python3 /home/arjun/mpi-sp/fuzz_dashboard/server.py /tmp/campaign2_fuzz.log camp
 - [x] **Harness bugs found and fixed** — see Harness Bug Analysis section below
 - [x] 2nd rebuild at `/nix/store/j25zzfyvqvvfp2z988h22rr0i4rknn0v-crun-harness-1.23.1/bin/crun` (11072 edges — fixed cgroup/state-dir leaks + persistent mode)
 - [x] **Mount accumulation bug found and fixed** (exec/sec dropped from 158→81 over 18 min due to stacked OCI bind-mounts) — `umount(path)` → `while (umount2(path, MNT_DETACH) == 0);` in `rmdir_rec`
-- [x] 3rd rebuild at `/nix/store/wgwpvlvpw94s1k7ir5rkw01v56454mpy-crun-harness-1.23.1/bin/crun` (11072 edges — **use this**)
+- [x] 3rd rebuild at `/nix/store/wgwpvlvpw94s1k7ir5rkw01v56454mpy-crun-harness-1.23.1/bin/crun` (11072 edges)
+- [x] **OOM-kill bug found and fixed** (grammar `[0-9]+` generates tiny memory limits → `CONSTRAINT_MEMCG` kills crun inside its own container cgroup; proven via dmesg after 3/6 instances crashed at ~25h) — memory limit clamped to 128 MiB minimum in harness
+- [x] 4th rebuild at `/nix/store/xdripc6yb5zpn19rn72yc7vgmddrj2ws-crun-harness-1.23.1/bin/crun` (11072 edges — **use this**)
 - [x] Campaign 1 fuzzer available at `/nix/store/2hpav3yiv5fffrs9g3mf0lx21y7dxk41-crun-fuzzer-0.0.1/bin/forkserver_simple`
 - [x] Dashboard: Comparison tab with 3-campaign charts → `fuzz_dashboard/`
 - [x] Write `mutator/src/bin/fuzz_rootfs_afl.rs` (Campaign 2 fuzzer) — compiles clean, logic verified
@@ -433,6 +435,40 @@ mount from a stack of thousands. Fix: `while (umount2(path, MNT_DETACH) == 0);` 
 until all stacked layers are detached. `MNT_DETACH` (lazy unmount) is required because some
 mounts have child mounts.
 
+#### Bug 10 — Grammar-generated tiny memory limits OOM-kill crun inside its own container cgroup
+
+**Discovered:** 2026-05-16  
+**Symptom:** 3 out of 6 parallel instances died mid-campaign (~25h in). `dmesg` confirmed the kills were `constraint=CONSTRAINT_MEMCG` — not system memory exhaustion, but the container's own cgroup memory limit killing crun itself.
+
+**Root cause:** The grammar defines memory limits as `ctx.regex("MEMORY_LIMIT", "[0-9]+")`, which generates any sequence of digits: `1`, `5`, `100`, `4096`, etc. (bytes, not MiB). crun joins the container cgroup **before** exec — it applies the cgroup limits to itself before starting the container process. When the grammar generates a limit smaller than crun's own binary footprint (`file-rss: 512kB`), crun is OOM-killed before it can even exec the container.
+
+**Proof from `dmesg`:**
+```
+oom-kill: constraint=CONSTRAINT_MEMCG, ... task=crun, pid=...,
+          oom_score_adj=0, total-vm:8992kB, anon-rss:0kB, file-rss:512kB
+```
+- `constraint=CONSTRAINT_MEMCG` → killed by the container's own cgroup memory limit (not system OOM)
+- `anon-rss:0kB, file-rss:512kB` → crun had barely started; its binary mappings alone exceeded the grammar-generated limit
+- This only manifested after many hours because the probability of the grammar generating a tiny value is low per execution (~26% chance of a single digit out of `[0-9]+`), but across 6 parallel instances running millions of executions over 25 hours, it becomes near-certain
+
+**Why previous Campaign 3-only runs (30h) survived:** Fewer total executions (3 instances vs 6), so the probability of hitting the degenerate case within the run window was lower. The crash is stochastic, not deterministic.
+
+**Fix:** After `libcrun_container_load_from_file`, clamp any memory limit below 128 MiB up to 128 MiB before calling `libcrun_container_run`:
+
+```c
+if (container->container_def->linux
+    && container->container_def->linux->resources
+    && container->container_def->linux->resources->memory
+    && container->container_def->linux->resources->memory->limit_present
+    && container->container_def->linux->resources->memory->limit >= 0
+    && container->container_def->linux->resources->memory->limit < 128L * 1024 * 1024)
+  container->container_def->linux->resources->memory->limit = 128L * 1024 * 1024;
+```
+
+128 MiB is large enough to never OOM crun itself while still preserving coverage of the cgroup memory-limit setup path (the cgroup is still created and the limit is still written — just clamped to a safe value).
+
+---
+
 ### Changes made to the patch
 
 | What | Before | After |
@@ -445,6 +481,7 @@ mounts have child mounts.
 | `cleanup_cgroup()` function | absent | **added** — belt-and-suspenders direct rmdir of `/sys/fs/cgroup/<container_id>` after each run |
 | `umount(path)` in `rmdir_rec` | single call — removes only top layer | `while (umount2(path, MNT_DETACH) == 0);` — drains all stacked layers |
 | `__AFL_LOOP(10000)` | 10,000 runs of same config per fork | `__AFL_LOOP(1)` — 1 run per fork, 10,000× more unique configs explored |
+| Memory limit clamping | absent — grammar `[0-9]+` could generate 1-byte limits, OOM-killing crun inside its own cgroup | **added** — clamp to 128 MiB minimum after `libcrun_container_load_from_file` |
 
 ### Edge count change: 11200 → 11072
 
@@ -458,9 +495,10 @@ binary (all of `crun.c` + libcrun). Removing `libcrun_container_create` and
 ### Rebuilt binaries
 
 ```
-1st (buggy):  /nix/store/dl0ncis1aanb8jxk6vj18iqdkgfi5ijj-crun-harness-1.23.1/bin/crun  (11200 edges)
-2nd (bugs 1-7 fixed): /nix/store/j25zzfyvqvvfp2z988h22rr0i4rknn0v-crun-harness-1.23.1/bin/crun  (11072 edges)
-3rd (bug 8 fixed):    /nix/store/wgwpvlvpw94s1k7ir5rkw01v56454mpy-crun-harness-1.23.1/bin/crun  (11072 edges) ← USE THIS
+1st (buggy):        /nix/store/dl0ncis1aanb8jxk6vj18iqdkgfi5ijj-crun-harness-1.23.1/bin/crun  (11200 edges)
+2nd (bugs 1-7):     /nix/store/j25zzfyvqvvfp2z988h22rr0i4rknn0v-crun-harness-1.23.1/bin/crun  (11072 edges)
+3rd (bug 8):        /nix/store/wgwpvlvpw94s1k7ir5rkw01v56454mpy-crun-harness-1.23.1/bin/crun  (11072 edges)
+4th (bug 10 fixed): /nix/store/xdripc6yb5zpn19rn72yc7vgmddrj2ws-crun-harness-1.23.1/bin/crun  (11072 edges) ← USE THIS
 ```
 
 Rebuild command (from `SemanticSanitizer/` — use `path:` prefix to avoid needing a git commit):

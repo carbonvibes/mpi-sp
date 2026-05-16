@@ -653,8 +653,9 @@ function renderCorpusDetail(entries) {
   }
 
   const html = withDelta.map((e, idx) => {
-    const ops   = (e.delta && e.delta.ops) || [];
-    const age   = timeAgo(e.mtime);
+    const ops    = (e.delta && e.delta.ops) || [];
+    const config = (e.delta && e.delta.config) || null;
+    const age    = timeAgo(e.mtime);
     const isOpen = openEntries.has(idx);
 
     // Op-kind summary pills in the header
@@ -664,17 +665,32 @@ function renderCorpusDetail(entries) {
       const s = OP_STYLE[k] || { bg:'#1a1a1a', color:'#ccc', border:'#333', label:'???' };
       return `<span class="op-badge" style="background:${s.bg};color:${s.color};border-color:${s.border};margin-right:3px">${n}×${s.label}</span>`;
     }).join('');
+    const configPill = config
+      ? `<span class="op-badge" style="background:#0d2a1a;color:#3fb950;border-color:#238636;margin-right:3px">config.json</span>`
+      : '';
 
     const opsHtml = ops.map(op => renderOp(op)).join('');
+
+    // Config section: pretty-printed JSON, collapsed by default
+    let configHtml = '';
+    if (config) {
+      let pretty = config;
+      try { pretty = JSON.stringify(JSON.parse(config), null, 2); } catch(_) {}
+      configHtml = `
+        <div style="border-bottom:1px solid var(--border);padding:8px 14px">
+          <div style="font-size:11px;font-weight:600;color:var(--green);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">config.json</div>
+          <pre style="margin:0;font-size:11px;color:#cdd9e5;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow-y:auto;background:#0d1117;padding:8px;border-radius:4px;border:1px solid var(--border)">${escHtml(pretty)}</pre>
+        </div>`;
+    }
 
     return `<div class="delta-entry">
       <div class="delta-header" onclick="toggleDelta(${idx})">
         <span style="color:var(--blue);font-family:'JetBrains Mono',monospace;font-size:12px;min-width:200px">${escHtml(e.name)}</span>
-        <span style="display:flex;gap:4px;align-items:center">${pills}</span>
+        <span style="display:flex;gap:4px;align-items:center">${configPill}${pills}</span>
         <span style="color:var(--muted);font-size:12px;margin-left:auto">${age}</span>
         <span style="color:var(--muted);font-size:11px;margin-left:12px">${isOpen ? '▼' : '▶'}</span>
       </div>
-      <div class="delta-ops ${isOpen ? 'open' : ''}" id="ops-${idx}">${opsHtml}</div>
+      <div class="delta-ops ${isOpen ? 'open' : ''}" id="ops-${idx}">${configHtml}${opsHtml}</div>
     </div>`;
   }).join('');
 

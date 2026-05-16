@@ -101,7 +101,10 @@ def scan_corpus(directory, max_entries=80, decode_json=False):
     entries = []
     try:
         files = [p for p in Path(directory).iterdir()
-                 if p.is_file() and not p.name.startswith('.')]
+                 if p.is_file() and not p.name.startswith('.')
+                 # Skip binary postcard files (no extension) that have a .json sidecar —
+                 # the sidecar carries the human-readable content; the binary is noise.
+                 and not (p.suffix == '' and p.with_suffix('.json').exists())]
         # most-recently-modified first so the dashboard shows the freshest entries
         files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         for p in files[:max_entries]:
