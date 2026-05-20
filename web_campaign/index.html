@@ -313,12 +313,13 @@ function buildLegend(containerId, campaigns) {
 
 // ── Elapsed ticker ────────────────────────────────────────────────────────
 
-let _baseRunTime = 0;   // run_time value from last API fetch
-let _fetchedAt   = 0;   // Date.now() when that fetch happened
+// Bootstrapped once from the first fuzzer_stats run_time we see.
+// After that we count wall-clock from _startedAt — never jumps backward.
+let _startedAt = 0;
 
 function tickElapsed() {
-  if (_fetchedAt === 0) return;
-  const now = Math.round(_baseRunTime + (Date.now() - _fetchedAt) / 1000);
+  if (_startedAt === 0) return;
+  const now = Math.round((Date.now() - _startedAt) / 1000);
   document.getElementById('hdr-elapsed').textContent = fmtElapsed(now);
 }
 setInterval(tickElapsed, 1000);
@@ -332,12 +333,18 @@ function refresh() {
     .then(r => r.json())
     .then(data => {
       lastData = data;
-      // Update elapsed ticker base
-      const runningTimes = data.campaigns
-        .filter(c => c.running)
-        .map(c => c.latest.run_time || 0);
-      _baseRunTime = runningTimes.length ? Math.max(...runningTimes) : _baseRunTime;
-      _fetchedAt = Date.now();
+      // Bootstrap the start time once from the largest run_time we've seen.
+      // fuzzer_stats files are written every ~5 s and can be stale, so we only
+      // anchor once and then let wall-clock run — this prevents backward jumps.
+      if (_startedAt === 0) {
+        const runningTimes = data.campaigns
+          .filter(c => c.running)
+          .map(c => c.latest.run_time || 0);
+        if (runningTimes.length) {
+          const knownRunTime = Math.max(...runningTimes);
+          _startedAt = Date.now() - knownRunTime * 1000;
+        }
+      }
       render(data);
     })
     .catch(() => {});

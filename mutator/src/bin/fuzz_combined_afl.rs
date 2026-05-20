@@ -21,7 +21,7 @@ use std::{
 
 use libafl::{
     BloomInputFilter, HasMetadata, StdFuzzerBuilder,
-    corpus::{Corpus, CorpusId, OnDiskCorpus},
+    corpus::{Corpus, CorpusId, OnDiskCorpus, Testcase},
     events::{ProgressReporter, SimpleEventManager},
     executors::{HasObservers, StdChildArgs, forkserver::ForkserverExecutor},
     feedback_and_fast, feedback_or,
@@ -509,13 +509,16 @@ fn main() {
     pyo3::prepare_freethreaded_python();
 
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} <crun-afl-binary> <grammar.py>", args[0]);
+    let resume = args.iter().any(|a| a == "--resume");
+    let positional: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).collect();
+    if positional.len() < 2 {
+        eprintln!("Usage: {} <crun-afl-binary> <grammar.py> [--resume]", args[0]);
         eprintln!("  Run as root from /tmp/campaign3/");
+        eprintln!("  --resume  reload existing corpus instead of starting fresh");
         std::process::exit(1);
     }
-    let crun_binary  = &args[1];
-    let grammar_path = PathBuf::from(&args[2]);
+    let crun_binary  = positional[0];
+    let grammar_path = PathBuf::from(positional[1]);
     let pid          = std::process::id();
 
     println!("=== fuzz_combined_afl: Campaign 3 — Nautilus config + FUSE rootfs ===");
@@ -737,6 +740,41 @@ fn main() {
     // Rootfs seeds × baseline config
     for r in r_seeds {
         seeds.push(CombinedInput { config: baseline_config.clone(), rootfs: r });
+    }
+
+    if resume {
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&corpus_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("combined_") && !n.contains('.'))
+                    .unwrap_or(false)
+            })
+            .collect();
+        paths.sort_by_key(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix("combined_"))
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(usize::MAX)
+        });
+        let mut resumed = 0usize;
+        for path in &paths {
+            let Ok(input) = CombinedInput::from_file(path) else { continue };
+            let mut tc = Testcase::new(input.clone());
+            *tc.file_path_mut() = Some(path.clone());
+            if state.corpus_mut().add(tc).is_ok() {
+                live_corpus.borrow_mut().push(input.rootfs.clone());
+                if let Some(meta) = state.metadata_map_mut().get_mut::<NautilusChunksMetadata>() {
+                    meta.cks.add_tree(input.config.tree.clone(), &context.ctx);
+                }
+                resumed += 1;
+            }
+        }
+        println!("Resumed: {resumed} corpus entries reloaded from prior run");
     }
 
     if state.must_load_initial_inputs() {

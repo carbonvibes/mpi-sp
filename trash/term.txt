@@ -1,0 +1,107 @@
+arjun@server1:~/mpi-sp$ cat /proc/1308434/wchan
+request_wait_answerarjunsudo cat /proc/1308434/stack/proc/1308434/stack
+[sudo] password for arjun: 
+[<0>] request_wait_answer+0x1be/0x2a0
+[<0>] fuse_simple_request+0x18d/0x2f0
+[<0>] fuse_dentry_revalidate+0x14f/0x3a0
+[<0>] lookup_fast+0x84/0x100
+[<0>] open_last_lookups+0x5f/0x400
+[<0>] path_openat+0x99/0x2d0
+[<0>] do_filp_open+0xaf/0x170
+[<0>] do_sys_openat2+0xb3/0xe0
+[<0>] __x64_sys_openat+0x55/0xa0
+[<0>] x64_sys_call+0x1eb1/0x25a0
+[<0>] do_syscall_64+0x7f/0x180
+[<0>] entry_SYSCALL_64_after_hwframe+0x78/0x80
+arjun@server1:~/mpi-sp$ sudo dmesg -T | grep -v audit | tail -80
+[Tue May 19 18:22:14 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:15 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:15 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:16 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:16 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:16 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:18 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:18 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:19 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:19 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:19 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:19 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:20 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:20 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:20 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:21 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:21 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:21 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:22 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:23 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:23 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:23 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:23 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:24 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:25 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:26 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:26 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:27 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:28 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:28 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:28 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:28 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:29 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:29 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:29 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:29 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:30 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:30 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:30 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:30 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:31 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:32 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:32 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:32 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:35 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:35 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:36 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:36 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:36 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:36 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:36 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:38 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:38 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:38 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:38 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:38 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:39 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:39 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:40 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:40 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:40 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:41 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:42 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:43 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:43 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:44 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:44 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:45 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:45 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:45 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:45 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:45 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:46 2026] sysfs: Unknown parameter 'mode'
+[Tue May 19 18:22:46 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:47 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:47 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:48 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:49 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:49 2026] proc: Unknown parameter 'mode'
+[Tue May 19 18:22:49 2026] proc: Unknown parameter 'mode'
+arjun@server1:~/mpi-sp$ for pid in $(ls /proc | grep -E '^[0-9]+$'); do
+    cwd=$(sudo readlink /proc/$pid/cwd 2>/dev/null)
+    [[ "$cwd" == "/tmp/c3_0" ]] && echo "pid=$pid state=$(cat /proc/$pid/status | grep State) wchan=$(cat /proc/$pid/wchan)"
+done
+[/proc/4054047: No such file or directory (os error 2)]
+[/proc/4054056: No such file or directory (os error 2)]
+[/proc/4054057: No such file or directory (os error 2)]
+[/proc/4054058: No such file or directory (os error 2)]
+pid=3969896 state=State:        T (stopped) wchan=do_signal_stop
+pid=3969901 state=State:        T (stopped) wchan=0
+pid=3969902 state=State:        T (stopped) wchan=do_signal_stop

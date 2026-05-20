@@ -561,27 +561,424 @@ Phase B exit criteria:
 
 ---
 
-#### Phase C — FUSE Logging + Guidance Wiring (after LibAFL is validated)
+### Week 6: Symlink Op + Crun-Targeted Mutators + Op Vocabulary Expansion
+
+Context: the real crun campaign is complete. The VFS and FUSE layers already
+have full symlink support (pre-Week 4 sidequest: `vfs_symlink`, `fvfs_symlink`,
+`fvfs_readlink` implemented and tested). What is missing is the Rust-side
+plumbing — and, more importantly, a set of mutators and seeds that specifically
+target the bug classes symlinks expose in crun.
+
+**Why symlinks matter for crun specifically:**
+
+Before `pivot_root`, crun walks the rootfs as seen from the *host* filesystem to
+create mount destinations (`mkdir -p /rootfs/proc`, `/rootfs/dev`, etc.), set up
+devices, resolve `/etc/passwd`/`/etc/group`, and validate the executable path.
+If any symlink in those paths escapes the rootfs boundary at this stage, crun
+follows it into the host filesystem. This overlaps with the same family of
+runtime path-resolution and `/proc/self/exe` escape hazards, including runc-style
+attacks (CVE-2019-5736), but the specific crun target here is pre-pivot and
+mount-destination path handling. The dangerous window is pre-pivot — the fuzzer
+has direct control over every symlink crun will encounter in this window through
+the FUSE rootfs.
+
+No new op types are needed beyond `CreateSymlink`. Mount destination replacement
+(e.g. `/proc` → symlink) is expressed as `rmdir("/proc") + create_symlink("/proc",
+target)` using existing ops. The `SymlinkChainMutator` emits N `CreateSymlink` ops
+in sequence. The richness comes from the mutators and seeds, not from new op
+vocabulary.
 
 Objectives:
 
-- add per-iteration write logging to FUSE callbacks
-- wire log output into `MutationGuidance` so the closed feedback loop is live on top of the working LibAFL harness
+- add `CreateSymlink` as a first-class `FsOp` through the full Rust stack
+- add a `replace_with_symlink` Rust-side helper that reliably replaces any path (including non-empty dirs) with a symlink
+- add 6 crun-targeted mutator stages covering the key symlink bug classes, ordered by bug-finding value
+- add a rich crun-specific seed corpus targeting pre-pivot escape scenarios
 
-This phase was the original "Phase B" but is now sequenced after LibAFL
-integration.  Doing it on a validated harness means any bug introduced here
-is clearly in the guidance layer, not in the fuzzer loop itself.
+#### Part A — CreateSymlink Op (Must Finish)
 
-Concrete steps (same as original Phase B):
+The change is mechanical and self-contained:
+
+1. Add `CreateSymlink { path, target }` variant to `FsOpKind` enum in `mutator/src/delta.rs`
+2. Add `FsOp::create_symlink(path, target)` constructor
+3. Add Rust FFI binding in `mutator/src/ffi.rs`; wire into `apply_delta()` match arm
+   calling `vfs_symlink(vfs, linkpath, target)` — the C function already exists in the VFS
+4. Confirm `fvfs_symlink` is registered in `fuse_operations` (pre-Week 4 sidequest wired it,
+   verify it's still connected after any refactors)
+
+Testing:
+- `FsOp::create_symlink` round-trips through serialization
+- `apply_delta` with `CreateSymlink` op: FUSE mount shows symlink with correct target via `readlink`
+- symlink loop (`/loop → /loop`) does not hang VFS or FUSE layer
+- absolute symlink target (`/proc/self/exe`) serializes and applies correctly
+
+#### Part A.2 — `replace_with_symlink` Helper (Must Finish)
+
+The naive pattern `rmdir(path) + create_symlink(path, target)` only works when `path`
+is an empty directory. For `/etc`, `/bin`, `/usr`, `/lib`, and any other non-empty
+baseline dir, `rmdir` returns `ENOTEMPTY` and `create_symlink` then fails with `EEXIST`.
+Many high-value seeds silently produce no symlink at all without this helper.
+
+Add a Rust-side helper (not a serialized `FsOpKind`) that expands into correct primitive ops:
+
+```rust
+fn replace_with_symlink(path: &str, target: &str) -> Vec<FsOp> {
+    // Existing file or symlink → delete_file, then create_symlink
+    // Empty directory         → rmdir, then create_symlink
+    // Non-empty directory     → delete children in postorder, rmdir, then create_symlink
+}
+```
+
+The helper should be built around a **baseline path-kind index** — a pre-computed table of
+the baseline VFS tree that seed generation and mutators can query without inspecting the live
+VFS at mutation time. LibAFL mutators cannot safely walk the live VFS during fuzzing, so the
+index is the only practical source of path metadata.
+
+```rust
+enum PathKind { File, Dir, Symlink }
+
+struct PathInfo {
+    path: String,
+    kind: PathKind,
+    children: Vec<String>,  // direct children; empty for File/Symlink
+}
+```
+
+Seed generation inspects the baseline VFS directly to build this index. Mutators use the
+cached `PathInfo` table plus the current `FsDelta` (to account for ops already in the
+delta that may have changed path state) to decide the correct expansion.
+
+This helper is used by every mutator that replaces an existing path with a symlink.
+Without it, mount-destination and parent-component seeds will fail silently and the
+fuzzer's high-value inputs will never reach crun.
+
+#### Part B — Crun-Targeted Mutators (Must Finish)
+
+Six mutator stages ordered by crun-specific bug-finding value:
+
+**1. `MountDestinationSymlinkMutator`** — highest priority
+
+Targets the paths crun *always* accesses pre-pivot to create mount destinations:
+`/proc`, `/dev`, `/sys`, `/tmp`, `/etc`. For each selected path:
+- Uses `replace_with_symlink(path, target)` — not raw `rmdir + create_symlink`
+  (raw rmdir fails on non-empty dirs like `/etc`, silently leaving no symlink)
+- Target selection (weighted):
+  - Relative escape to same-named host path (35%): `../../proc`, `../../dev`, `../../sys`
+  - Absolute target (25%): `/proc`, `/dev`, `/proc/self/fd`, `/proc/self/exe`
+  - Cross-type (20%): symlink to wrong-type path: `/proc → /etc/passwd`, `/dev → /bin/true`
+  - Dangling (15%): `/proc → /nonexistent`, `/dev → /missing`
+  - Special file (5%): `/proc → /dev/null`, `/dev → /proc/self/fd`
+
+This mutator fires on every corpus entry. Mount destination setup is exercised
+every crun iteration — highest density of pre-pivot escape opportunities.
+
+**2. `MountOptionSymlinkMutator`** — crun-specific, second priority
+
+crun has explicit logic for bind mount symlink-aware options. This mutator
+coordinates config and rootfs state, but the source/destination split matters:
+
+OCI bind mount `source` is a **host path** (resolved from the host namespace before
+pivot). `destination` is a **container path** (resolved from the FUSE rootfs).
+This means source and destination symlinks are created in different namespaces:
+
+- **Source-related options** (`copy-symlink`, `src-nofollow`): create a temporary
+  symlink on the host filesystem (e.g. `/tmp/fuzz_src_symlink → /etc/passwd`) and
+  set `mount.source` to that host path. A symlink created only inside the FUSE
+  rootfs will NOT exercise these branches — crun reads `mount.source` from the
+  host before entering the container rootfs.
+- **Destination-related options** (`dest-nofollow`): create a symlink inside the
+  FUSE rootfs at `mount.destination`. This is correctly served through FUSE.
+
+Option combinations to generate:
+  - `["bind", "copy-symlink"]` — crun copies the symlink itself, not its target
+  - `["bind", "src-nofollow"]` — crun does not follow symlink at source
+  - `["bind", "dest-nofollow"]` — crun does not follow symlink at destination
+  - `["bind", "copy-symlink", "src-nofollow"]` — invalid combination
+  - `["bind", "copy-symlink", "dest-nofollow"]` — invalid combination
+
+This directly exercises crun's symlink-aware bind mount branches, which are
+unlikely to be reached by any other mutator. Invalid combinations test error
+handling in mount option parsing.
+
+**3. `ExecutableSymlinkMutator`** — executable path coordination
+
+Coordinates both config and rootfs to create the "exec path is a symlink" scenario
+that cannot be found by independent config and rootfs mutation:
+
+1. Pick a synthetic executable path (`/bin/target`, `/usr/local/bin/x`)
+2. Override `process.args[0]` in `CombinedInput.config` via `override_args` field
+   on `CombinedInput` (applied by `CombinedConverter` alongside `root.path` override)
+3. Create that path in the rootfs as a symlink to an interesting target
+
+Interesting symlink targets for the executable path:
+- `/proc/self/exe` — classic runc-family escape vector
+- `/proc/self/mem` — process memory
+- `/proc/self/fd/0` — stdin
+- `/dev/zero` — exec of `/dev/zero`
+- `../../usr/bin/python3` — escapes rootfs to host binary
+- `/dev/null` — dead exec target
+- `/nonexistent` — dangling, tests ENOENT handling on exec
+
+This is the only mutator that systematically explores "config says run X, rootfs
+has X as a symlink to Y." Without it, the two dimensions only coordinate by accident.
+
+**4. `ParentComponentSymlinkMutator`** — historically dangerous class
+
+Most fuzzers only create leaf symlinks. This mutator replaces a *non-leaf* path
+component — the class that historically caused container escapes.
+
+Targets non-leaf components of paths crun is likely to access:
+- parent of `process.args[0]` (e.g. `/bin` if binary is `/bin/true`)
+- parent of each mount destination (e.g. `/usr` for `/usr/lib`)
+- parent of `/etc/passwd` → `/etc`
+- parent of `/etc/group` → `/etc`
+- parent of `/dev/null` → `/dev`
+- parent of `/dev/console` → `/dev`
+
+Uses `replace_with_symlink` (non-empty dirs like `/etc`, `/bin`, `/usr` must use
+recursive deletion). Example replacements:
+- `/bin → ../../bin` — host's `/bin/true` resolves instead of rootfs `/bin/true`
+- `/etc → ../../etc` — host's `/etc/passwd` resolves when crun reads user info
+- `/usr → ../../usr` — host library paths resolve
+- `/lib → ../../lib` — dynamic linker escapes
+- `/dev → /proc/self/fd` — absolute target to proc fd dir
+
+**5. `SymlinkEscapeMutator`** — relative and absolute target dictionary
+
+Generates symlink targets crafted to escape the rootfs. Two modes:
+
+*Relative mode* — parameterized by escape depth (2–8 `../` hops):
+```rust
+static RELATIVE_TARGETS: &[&str] = &[
+    "etc/passwd",
+    "etc/shadow",
+    "proc/self/exe",
+    "proc/self/mem",
+    "proc/sysrq-trigger",
+    "dev/sda",
+    "dev/zero",
+    "run/containerd",
+    "var/run/docker.sock",
+    "proc/self/fd",
+];
+// construction: "../".repeat(depth) + target
+```
+
+*Absolute mode* — targets where pre-pivot vs post-pivot path resolution differs:
+```rust
+static ABSOLUTE_TARGETS: &[&str] = &[
+    "/proc",
+    "/proc/self",
+    "/proc/self/exe",
+    "/proc/self/fd",
+    "/proc/self/fd/0",
+    "/dev",
+    "/dev/null",
+    "/sys",
+    "/etc/passwd",
+    "/bin/sh",
+];
+```
+
+Absolute symlinks are important because crun's safe-open logic before the rootfs
+boundary is enforced may handle them differently from relative ones. If a
+pre-pivot absolute symlink is followed from host context, the escape is direct.
+
+Applied at a random path in the current delta that is a file or leaf directory,
+using `replace_with_symlink` when replacing an existing path.
+
+**6. `LoopAndDepthMutator`** — robustness, lower priority
+
+Creates symlink loops and deep chains. Useful for error-handling coverage but less
+crun-specific than the mutators above. Lower mutation weight.
+
+Chain lengths: `{1, 5, 10, 39, 40, 41}`. Chain-100 removed — it only confirms
+`ELOOP` handling and wastes mutation energy.
+
+Interesting cases:
+- Self-loop: `/loop → /loop`
+- Two-cycle: `/a → /b`, `/b → /a`
+- Length 40: kernel limit, should succeed
+- Length 41: should return `ELOOP` — tests every crun call site
+- Long target strings near `PATH_MAX`
+- Targets with repeated slashes: `////proc//self//exe`
+
+The chain is anchored at a path crun will access (`/bin/true`, `/proc`, `/dev`).
+Emits N `CreateSymlink` ops in sequence within the delta.
+
+**Also extend existing mutators:**
+
+- `AddFileOp`: 25% probability to emit `CreateSymlink` instead of `CreateFile`;
+  when `MutationGuidance` provides an `ENOENT` path, bias toward symlink (30%)
+- `DestructiveMutator`: new arm — `replace_with_symlink(path, proc_or_dev_target)`
+  to replace a real file with a symlink pointing to a proc/dev special file
+- Guidance: treat `ELOOP`, `ENOTDIR`, `EEXIST`, and `EINVAL` as meaningful signals
+  (not just noise) — they indicate crun reached a symlink-handling branch
+
+#### Part C — Crun-Specific Seeds
+
+Seeds are organized by the crun pre-pivot operation they target:
+
+Note: all seeds use `replace_with_symlink(path, target)` — a helper that
+expands into the correct primitive ops based on what the VFS snapshot shows
+at that path (empty dir → rmdir+symlink; non-empty dir → recursive delete+rmdir+symlink;
+file → delete_file+symlink). Using raw `rmdir + create_symlink` on non-empty dirs like
+`/etc` or `/bin` silently fails: `rmdir` returns ENOTEMPTY, `create_symlink` returns
+EEXIST, and no symlink is created.
+
+```rust
+// ── Mount destination escapes — relative targets (highest priority) ───────────
+// crun always calls make_parent_directories for each mount destination pre-pivot.
+// replace_with_symlink handles non-empty baseline dirs correctly.
+replace_with_symlink("/proc", "../../proc"),
+replace_with_symlink("/dev",  "../../dev"),
+replace_with_symlink("/sys",  "../../sys"),
+replace_with_symlink("/tmp",  "../../tmp"),
+
+// All mount destinations simultaneously — exercises combined error handling
+FsDelta::from(vec![
+    replace_with_symlink("/proc", "../../proc"),
+    replace_with_symlink("/dev",  "../../dev"),
+    replace_with_symlink("/sys",  "../../sys"),
+].concat()),
+
+// ── Mount destination escapes — absolute targets ──────────────────────────────
+// Absolute symlinks: pre-pivot vs post-pivot resolution may differ.
+// If crun's safe-open logic doesn't enforce rootfs boundary before pivot,
+// an absolute symlink is a direct escape — no ../.. counting needed.
+replace_with_symlink("/proc", "/proc"),
+replace_with_symlink("/dev",  "/proc/self/fd"),
+replace_with_symlink("/sys",  "/sys"),
+replace_with_symlink("/proc", "/proc/self/exe"),
+
+// ── Mount destination → wrong type ───────────────────────────────────────────
+replace_with_symlink("/proc", "/etc/passwd"),    // dir expected, symlink to file
+replace_with_symlink("/dev",  "/bin/true"),
+
+// ── Mount destination → dangling ─────────────────────────────────────────────
+replace_with_symlink("/proc", "/nonexistent"),
+replace_with_symlink("/dev",  "/missing"),
+
+// ── Parent component symlinks — non-leaf, historically dangerous ──────────────
+// replace_with_symlink recurses through /etc, /bin, /usr children before replacing
+replace_with_symlink("/etc", "../../etc"),       // /etc/passwd → host
+replace_with_symlink("/bin", "../../bin"),       // /bin/true → host
+replace_with_symlink("/lib", "../../lib"),       // dynamic linker → host
+replace_with_symlink("/usr", "../../usr"),       // /usr/bin/python3 → host
+replace_with_symlink("/dev", "/proc/self/fd"),   // absolute parent escape
+
+// ── Binary path → proc/dev special files ─────────────────────────────────────
+// crun validates the binary before pivot, then execs it after — TOCTOU window
+// /bin/true is a file so replace_with_symlink emits delete_file + create_symlink
+replace_with_symlink("/bin/true", "/proc/self/exe"),
+replace_with_symlink("/bin/true", "/proc/self/mem"),
+replace_with_symlink("/bin/true", "/proc/self/fd/0"),
+replace_with_symlink("/bin/true", "/dev/zero"),
+replace_with_symlink("/bin/true", "/dev/null"),
+replace_with_symlink("/bin/true", "../../usr/bin/python3"),
+
+// ── Config-reading files → host escape ───────────────────────────────────────
+// crun reads /etc/passwd and /etc/group pre-pivot for uid/gid resolution
+replace_with_symlink("/etc/passwd", "../../etc/passwd"),
+replace_with_symlink("/etc/passwd", "/etc/passwd"),        // absolute
+replace_with_symlink("/etc/passwd", "../../../etc/shadow"),
+replace_with_symlink("/etc/group",  "../../etc/group"),
+
+// ── Bind mount with symlink-aware options ────────────────────────────────────
+// Seeds for MountOptionSymlinkMutator — coordinate config + rootfs
+// (expressed here as conceptual pairs; mutator generates the actual CombinedInput)
+// source: symlink in rootfs, config: bind mount with copy-symlink option
+// source: symlink in rootfs, config: bind mount with src-nofollow option
+// destination: symlink in rootfs, config: bind mount with dest-nofollow option
+
+// ── ELOOP boundary cases ──────────────────────────────────────────────────────
+// Chain of 40: kernel limit — should succeed
+// Chain of 41: should ELOOP — does crun handle this at every call site?
+// (generated programmatically by LoopAndDepthMutator seeds)
+FsDelta::new(vec![FsOp::create_symlink("/loop", "/loop")]),  // self-loop
+FsDelta::new(vec![
+    FsOp::create_symlink("/a", "/b"),
+    FsOp::create_symlink("/b", "/c"),
+    FsOp::create_symlink("/c", "/a"),
+]),
+
+// ── Relative escape via deep path ────────────────────────────────────────────
+replace_with_symlink("/etc/passwd", "../../../etc/shadow"),
+FsDelta::new(vec![FsOp::create_symlink("/bin/sh", "../../../proc/sysrq-trigger")]),
+
+// ── Dangling symlink at a path crun opens ────────────────────────────────────
+FsDelta::new(vec![FsOp::create_symlink("/bin/sh", "/nonexistent")]),
+replace_with_symlink("/proc", "/nonexistent"),
+
+// ── Targets with path noise (repeated slashes, trailing dots) ────────────────
+FsDelta::new(vec![FsOp::create_symlink("/bin/x", "////proc//self//exe")]),
+FsDelta::new(vec![FsOp::create_symlink("/bin/x", "../../../proc/./self/./exe")]),
+```
+
+#### Part D — Guidance Integration Note (prep for Week 7)
+
+When Week 7's FUSE logging is live, the guidance must handle symlinks explicitly:
+- When FUSE log shows `ENOENT` for a path matching a known crun access pattern
+  (mount destinations, binary paths, config files), the next iteration should
+  create a **symlink** at that path rather than a regular file
+- When FUSE log shows a `READ` from path X, the next iteration should sometimes
+  replace X with a symlink — currently the guidance only biases toward regular
+  file creation; the symlink bias must be added explicitly in Week 7
+
+Testing and validation:
+
+- `FsOp::create_symlink` round-trips through serialization
+- `apply_delta` with `CreateSymlink`: FUSE mount shows symlink with correct target via `readlink`
+- absolute symlink target (`/proc/self/exe`) serializes and applies correctly
+- symlink loop (`/loop → /loop`) does not hang VFS or FUSE layer
+- `replace_with_symlink` on non-empty dir produces correct ops (children deleted first)
+- `replace_with_symlink` on a file produces `delete_file + create_symlink`
+- `MountDestinationSymlinkMutator` uses `replace_with_symlink`, not raw `rmdir`
+- `MountOptionSymlinkMutator` generates valid and invalid option combinations
+- `ExecutableSymlinkMutator` produces `CombinedInput` where config path and rootfs symlink are aligned
+- `LoopAndDepthMutator` produces chains of correct length; chain-41 applies without crash
+- guidance treats `ELOOP`, `ENOTDIR`, `EEXIST`, `EINVAL` from crun as meaningful signals
+
+Exit criteria:
+
+- `CreateSymlink` implemented through full stack: `FsOp` → FFI → `cp_apply_delta` → VFS → FUSE
+- baseline `PathInfo` index built from VFS snapshot; available to both seed generation and mutators
+- `replace_with_symlink` helper implemented using `PathInfo`; used by all mutators that replace existing paths
+- all 6 crun-targeted mutators implemented and unit-tested
+- `MountOptionSymlinkMutator` correctly uses host-side temp symlinks for source options
+  (`copy-symlink`, `src-nofollow`) and FUSE rootfs symlinks for destination options (`dest-nofollow`)
+- crun-specific seeds present in `rootfs_seeds()` as expanded `Vec<FsOp>` (not unexpanded helper calls);
+  covering mount destinations, parent components, executable paths, bind mount options,
+  absolute targets, dangling, and loop cases
+- `SetXattr`/`RemoveXattr`, `Chmod`, `Chown` deferred to Week 8 (not Week 6 scope)
+
+### Week 7: FUSE Logging + FuseLogObserver + FsAccessFeedback
+
+Context: the campaign has validated the harness end-to-end. Week 7 closes the
+guidance loop — adding per-iteration FUSE access logging and wiring it into
+LibAFL as an `Observer` + `Feedback`. This is the core research contribution:
+making the fuzzer aware of what the target actually touched on the filesystem,
+and biasing future mutations toward those paths.
+
+Objectives:
+
+- add per-iteration write logging to FUSE callbacks (gated by `g_target_running`)
+- wire log output into `MutationGuidance` so the closed feedback loop is live on top of the validated LibAFL harness
+- implement `FuseLogObserver` and `FsAccessFeedback`
+- measure guided vs unguided coverage growth — this is the key evaluation result
+
+#### Part A — FUSE Per-Iteration Log
+
+Concrete steps:
 
 1. add the per-iteration write log to the FUSE layer:
    - define `fuse_iter_log_t`: a fixed-capacity array of
      `{char path[VFS_PATH_MAX], event_t kind}` entries where `event_t` is
-     `LOG_CREATE | LOG_WRITE | LOG_MKDIR | LOG_RENAME_FROM | LOG_RENAME_TO | LOG_UNLINK | LOG_RMDIR | LOG_ENOENT`
+     `LOG_CREATE | LOG_WRITE | LOG_MKDIR | LOG_RENAME_FROM | LOG_RENAME_TO | LOG_UNLINK | LOG_RMDIR | LOG_ENOENT | LOG_SYMLINK`
    - add a global `bool g_target_running` flag (false by default)
    - add logging calls in `fvfs_create`, `fvfs_write`, `fvfs_mkdir`,
      `fvfs_rename` (emits both RENAME_FROM and RENAME_TO), `fvfs_unlink`,
-     `fvfs_rmdir` — only when `g_target_running` is true
+     `fvfs_rmdir`, `fvfs_symlink` — only when `g_target_running` is true
    - add ENOENT logging in `fvfs_getattr` when `g_target_running` is true
      and the return value is `-ENOENT`
    - deduplicate WRITE entries: multiple write calls to the same path collapse
@@ -596,48 +993,17 @@ Concrete steps (same as original Phase B):
    - promote write-set paths as new corpus seeds
    - reset to baseline
 
-Phase C testing and validation:
+#### Part B — LibAFL Observer + Feedback
 
-- write-log unit tests: verify each event kind is logged correctly when
-  `g_target_running` is true
-- suppression test: apply a delta with `g_target_running = false` and confirm
-  no entries appear (fuzzer writes via direct VFS API must never be logged)
-- deduplication test: two writes to the same path produce exactly one LOG_WRITE entry
-- end-to-end test: fake target creates a file, writes to it, deletes another,
-  and requests a missing path; verify the log captures all four event types
-- feedback loop integration test: 10 guided iterations with reset, no stale state
-
-Phase C exit criteria:
-
-- per-iteration write log implemented in FUSE callbacks and tested
-- fuzzer writes (via direct VFS API) confirmed absent from the log
-- `MutationGuidance` populated from log and consumed by mutator stages
-- closed feedback loop runs without stale state on top of the LibAFL harness
-
-### Week 6: FUSE Log Guidance + FsAccessFeedback + Stabilization
-
-Context: by the start of Week 6, the LibAFL harness (Phase B above) is running
-and validated against the demo target.  Week 6 closes the guidance loop — the
-`FuseLogObserver` and `FsAccessFeedback` traits are added on top of the working
-`StdFuzzer`, making the fuzzer aware of what the target actually touched.
-
-Objectives:
-
-- add `FuseLogObserver` and `FsAccessFeedback` on top of the validated LibAFL harness
-- confirm the closed guidance loop improves coverage growth vs the unguided baseline
-- stabilize the full pipeline before moving to real-world integration
-
-Concrete steps:
-
-1. **Implement `FuseLogObserver`** in `mutator/src/libafl_glue/fuse_log_observer.rs`:
+3. **Implement `FuseLogObserver`** in `mutator/src/libafl_glue/fuse_log_observer.rs`:
    - `pre_exec`: `fuse_log_set_active(true)` + `fuse_log_clear()`
    - `post_exec`: drain log, stash as `MutationGuidance` for next mutator pass
 
-2. **Implement `FsAccessFeedback`** in `mutator/src/libafl_glue/fs_access_feedback.rs`:
+4. **Implement `FsAccessFeedback`** in `mutator/src/libafl_glue/fs_access_feedback.rs`:
    - `is_interesting = true` when log contains a never-before-seen ENOENT path
      or write-set path; tracked in a `HashSet<String>` on the feedback state
 
-3. **Compose into the existing fuzzer**:
+5. **Compose into the existing fuzzer**:
    ```rust
    let mut feedback = feedback_or!(
        MaxMapFeedback::tracking(&edge_observer, true, false),
@@ -645,153 +1011,38 @@ Concrete steps:
    );
    ```
 
-4. **Measure guidance impact**: run the same campaign with and without
+6. **Measure guidance impact**: run the same campaign with and without
    `FsAccessFeedback` active; compare coverage growth rate and time-to-crash.
-   This is the core evidence that the guidance signal adds value.
+   This is the core evidence that the guidance signal adds value — goes directly
+   in the paper.
 
 Testing and validation:
 
-- write-log unit tests: each event kind logged correctly when `g_target_running = true`
-- suppression test: fuzzer writes via direct VFS API never appear in log
-- deduplication test: two writes to same path produce exactly one LOG_WRITE entry
-- end-to-end guided vs unguided comparison numbers recorded
+- write-log unit tests: verify each event kind is logged correctly when `g_target_running` is true
+- suppression test: apply a delta with `g_target_running = false` and confirm no entries appear (fuzzer writes via direct VFS API must never be logged)
+- deduplication test: two writes to the same path produce exactly one LOG_WRITE entry
+- end-to-end test: fake target creates a file, writes to it, deletes another, and requests a missing path; verify the log captures all four event types
+- feedback loop integration test: 10 guided iterations with reset, no stale state
+- end-to-end guided vs unguided comparison numbers recorded in `docs/benchmark_baseline.md`
 
 Exit criteria:
 
+- per-iteration write log implemented in FUSE callbacks and tested
+- fuzzer writes (via direct VFS API) confirmed absent from the log
 - `FuseLogObserver` and `FsAccessFeedback` implemented and unit-tested
-- closed guidance loop runs stably on the LibAFL harness
-- guided vs unguided comparison numbers recorded in `docs/benchmark_baseline.md`
+- `MutationGuidance` populated from log and consumed by mutator stages
+- closed feedback loop runs without stale state on top of the LibAFL harness
+- guided vs unguided comparison numbers recorded
 
-### Week 7: Close The First Major Milestone
+### Week 8: Scale Snapshotting + Real-World Integration
 
-Objectives:
+Context: Week 8 bridges to the real target. The op vocabulary is expanding (Week 6)
+and the guidance loop is live (Week 7). Two remaining blockers before any meaningful
+campaign against a real OCI runtime: (1) the deep-copy snapshot restore is
+O(total filesystem size) and will be a bottleneck on a full rootfs; (2) a real
+baseline filesystem must be importable into the VFS for real-world integration.
 
-- make the first end-to-end milestone fully reproducible
-- remove instability before moving to the MVP work
-
-Concrete steps:
-
-1. connect LibAFL testcase generation to the control plane or in-process update path
-2. run multiple clean end-to-end campaigns
-3. confirm the fuzzer reaches the crash without manual help
-4. save the crashing testcase and verify it reproduces
-5. add regression coverage for the milestone path
-
-Testing and validation:
-
-- at least three clean reruns from an empty or reset state
-- crash reproduction from saved testcase
-- explicit confirmation that reset preserves determinism
-
-Exit criteria:
-
-- filesystem-backed fuzzing works end to end and is reproducible
-
-This week is the latest acceptable point for achieving the first major milestone. If it slips beyond Week 7, the project scope must be reduced immediately.
-
-### Week 8: Op Vocabulary Expansion + Scale Snapshotting + Real-World Integration Begin
-
-Objectives:
-
-- expand `FsOpKind` to cover the full attack surface of OCI container
-  runtimes (symlinks, xattrs, permissions, ownership) — the current 7
-  ops are insufficient for real-world targets
-- replace the deep-copy snapshot restore with a journal/diff approach
-  before scaling to real rootfs sizes
-- import a real baseline filesystem (e.g. a minimal container rootfs)
-  into the VFS and begin integration with the container-runtime setup
-
-Context: the Week 6 demo proves the framework works end-to-end against a
-trivial `foobar` target.  Week 8 is the bridge to the real target.  Two
-blockers exist before any meaningful campaign against an OCI runtime:
-(1) the op vocabulary is missing the operations that matter most for
-container security — symlinks, xattrs, permissions, ownership; (2) the
-deep-copy snapshot restore is O(total filesystem size) and will be a
-bottleneck on a full rootfs.  Both must be resolved in Week 8.
-
-#### Part A — Op Vocabulary Expansion
-
-The current 7 `FsOpKind` variants cover the basic filesystem surface.
-Container runtimes validate rootfs structures that depend critically on
-four additional op classes:
-
-| New op | Why it matters | Container runtime bug class |
-|---|---|---|
-| `CreateSymlink(path, target)` | Symlink traversal attacks are the primary container escape vector. Runtimes must validate symlinks before exposing them to containerised processes. Without this op the entire symlink attack surface is unreachable. | Container escape via path traversal (CVE class) |
-| `SetXattr(path, name, value)` / `RemoveXattr(path, name)` | File capabilities (`security.capability`), SELinux labels, AppArmor labels are stored as xattrs. Runtimes parse and apply these during container setup. The spec explicitly lists xattrs as a target op. | Privilege escalation via capability xattr manipulation |
-| `Chmod(path, mode)` | Permission bits — setuid, setgid, sticky — are security-critical in a rootfs. Runtimes check and strip dangerous modes. Without this op the permission-handling code paths are never exercised. | setuid binary escapes, sticky-dir mishandling |
-| `Chown(path, uid, gid)` | uid/gid ownership — containers run processes as specific uids mapped through the user namespace. Bugs here can produce privilege escalation inside the container or across the namespace boundary. | uid-mapping bypass, chown-to-root mishandling |
-
-**Concrete implementation steps for each new op:**
-
-For every new op kind the change is mechanical and self-contained:
-
-1. Add variant to `FsOpKind` enum in `mutator/src/delta.rs`
-2. Add fields to `FsOp` struct (e.g. `symlink_target: String` for
-   `CreateSymlink`; `xattr_name/value: Vec<u8>` for xattr ops;
-   `mode: u32` for Chmod; `uid/gid: u32` for Chown)
-3. Add constructor to `FsOp` (e.g. `FsOp::create_symlink(path, target)`)
-4. Add VFS operation to `vfs/vfs.c` if not already present
-   (`vfs_symlink`, `vfs_setxattr`, `vfs_removexattr`, `vfs_chmod`,
-   `vfs_chown`)
-5. Add C FFI in `control_plane/delta.h` / `delta.c`:
-   `delta_add_symlink`, `delta_add_set_xattr`, `delta_add_remove_xattr`,
-   `delta_add_chmod`, `delta_add_chown`
-6. Add Rust FFI binding in `mutator/src/ffi.rs` and wire into
-   `apply_delta()` match arm
-7. Expose the FUSE callback in `vfs/fvfs.c` so the mounted filesystem
-   actually honours the new op
-8. Extend the mutators that generate ops:
-   - `AddFileOp`: can now emit `CreateSymlink` (30% when guidance
-     provides a path the target tried to dereference)
-   - `DestructiveMutator`: can now emit `Chmod` (strip or set dangerous
-     mode bits) and `RemoveXattr`
-   - New `XattrMutator` stage (9th stage): targets existing files with
-     `SetXattr` — draws capability / label names from a dictionary
-     (`security.capability`, `security.selinux`, `user.overlay.*`)
-9. Add seeds to `generate_seed_corpus` and `initial_corpus_pool` that
-   exercise the new ops
-
-**Op vocabulary priority order** (implement in this order; stop if time
-runs short):
-
-1. `CreateSymlink` — highest priority, largest unreachable attack surface
-2. `SetXattr` / `RemoveXattr` — explicitly in the spec, capability bugs
-3. `Chmod` — setuid/setgid mishandling
-4. `Chown` — uid/gid mapping bugs (lowest priority, revisit in Week 9)
-
-**Dictionary additions for new ops:**
-
-```rust
-// Xattr names of interest to container runtimes
-static XATTR_DICTIONARY: &[&str] = &[
-    "security.capability",
-    "security.selinux",
-    "security.apparmor",
-    "user.overlay.opaque",
-    "user.overlay.redirect",
-    "trusted.overlay.opaque",
-];
-
-// Interesting mode bits for Chmod
-static MODE_DICTIONARY: &[u32] = &[
-    0o4755,   // setuid + rwxr-xr-x
-    0o2755,   // setgid + rwxr-xr-x
-    0o1777,   // sticky + rwxrwxrwx (world-writable sticky dir)
-    0o0000,   // no permissions
-    0o0777,   // world-writable
-    0o0755,   // normal executable
-];
-```
-
-Testing for new ops:
-- unit test per new op constructor: verify fields set correctly
-- E2E FFI test per new op: apply through full FFI bridge, confirm VFS
-  state updated correctly
-- `FuseLogObserver` extended to log `SYMLINK`, `SETXATTR` events so the
-  feedback loop can see when the target chases these paths
-
-#### Part B — Scale Snapshotting
+#### Part A — Scale Snapshotting
 
 Context: the current `vfs_reset_to_snapshot` deep-copies the entire tree
 — O(total filesystem size). For a full container rootfs this will be a
@@ -835,36 +1086,34 @@ Concrete steps:
    - walk a real directory, create corresponding VFS nodes, set metadata
      (mode, mtime, xattrs, symlink targets)
    - this is how a container rootfs gets loaded as the concrete baseline;
-     must handle all new op kinds from Part A
+     must handle all op kinds including the new ones from Week 6
 3. measure restore speed against the imported rootfs baseline
-4. identify the integration point in Moritz's harness
-5. perform smoke tests with an unmutated baseline rootfs — the target
-   must execute cleanly
-6. apply one small delta (including at least one symlink and one xattr
-   op) and verify the target sees the change
+
+#### Part B — Real-World Integration Begin
+
+4. identify the integration point in the harness
+5. perform smoke tests with an unmutated baseline rootfs — the target must execute cleanly
+6. apply one small delta (including at least one symlink op) and verify the target sees the change
+7. measure concurrency behaviour of the real OCI target:
+   - how many processes hit the FUSE mount simultaneously during a single target run?
+   - if single-threaded FUSE serialisation is measurably slowing the target, evaluate enabling FUSE multithreading (`-o clone_fd`) with a pthread rwlock around VFS access
+   - if it is not a bottleneck, leave single-threaded as-is
 
 Testing and validation:
 
-- snapshot-create and restore equivalence checks (result must match
-  deep-copy result) for all 11+ op kinds including new ones
+- snapshot-create and restore equivalence checks (result must match deep-copy result) for all op kinds including new ones from Week 6
 - repeated restore cycles with correctness assertions
 - restore time measurement before and after optimisation
 - real-target smoke tests against the mounted baseline
-- new-op E2E FFI tests (one per new op kind, all passing before
-  integration begins)
+- new-op E2E FFI tests (one per new op kind, all passing before integration begins)
+- `FuseLogObserver` extended to capture symlink and xattr access events
 
 Exit criteria:
 
-- all new `FsOpKind` variants (at minimum `CreateSymlink` and xattr ops)
-  implemented through the full stack: enum → VFS → FFI → FUSE → mutator
-  → test
-- journal vs CoW comparison written in `docs/vfs_design_v2.md`; approach
-  chosen and implemented
+- journal vs CoW comparison written in `docs/vfs_design_v2.md`; approach chosen and implemented
 - restore time measured before and after against a large synthetic tree
-- a real rootfs baseline (including symlinks and xattrs) can be imported
-  into the VFS
+- a real rootfs baseline (including symlinks and xattrs) can be imported into the VFS
 - the real target executes cleanly against the mounted baseline
-- `FuseLogObserver` extended to capture symlink and xattr access events
 
 ### Week 9: Real-World Campaign Bring-Up And Initial Evaluation
 
@@ -1084,38 +1333,42 @@ If time remains after that, do:
 
 ## 11. Immediate Next Actions
 
-Weeks 1–3, the pre-Week 4 side quest, Week 4, and Week 5 Phase A are done.
-The priority order has changed — LibAFL integration is pulled forward before
-FUSE log guidance wiring.  The sequence is:
+Weeks 1–3, the pre-Week 4 side quest, Week 4, Week 5 Phase A, Week 5 Phase B
+(LibAFL integration), and the real crun fuzzing campaign are all complete.
 
-1. **✅ DONE — Week 5 Phase A**: 9 mutator stages, live corpus, content
-   dictionary, real-content perturbation, guidance threading (consumer side),
-   46 tests, 98% semantic yield
+1. **✅ DONE — Week 5 Phase A**: 9 mutator stages, live corpus, content dictionary,
+   real-content perturbation, guidance threading (consumer side), 46 tests, 98% semantic yield
 
-2. **IMMEDIATE — Week 5 Phase B (LibAFL integration + real campaign)**:
-   - build the demo target (`demo/target_foobar.c`) with SanCov
-   - implement `VfsExecutor` in `mutator/src/libafl_glue/vfs_executor.rs`
-   - wire `StdFuzzer` in `mutator/src/bin/fuzz_libafl.rs`
-   - retire `seen_checksums` and `MAX_LIVE_CORPUS` eviction from the new binary
-   - run a real campaign, observe throughput / corpus growth / stability
-   - record side-by-side numbers (hand-rolled vs LibAFL) for the paper
+2. **✅ DONE — Week 5 Phase B**: LibAFL integration (`fuzz_combined_afl`), real
+   crun campaign running across 6 instances (Campaign 1 + Campaign 3 with FUSE rootfs mutation),
+   throughput and coverage observed over multi-day runs
 
-3. **NEXT — Week 5 Phase C (FUSE logging + guidance wiring)**:
-   - implement per-iteration write log in FUSE callbacks (`fvfs_create`,
-     `fvfs_write`, `fvfs_mkdir`, `fvfs_rename`, `fvfs_unlink`, `fvfs_rmdir`,
-     ENOENT in `fvfs_getattr`) with `g_target_running` flag gating all logging
-   - wire log output into `MutationGuidance` on the LibAFL harness (not the
-     hand-rolled loop)
+3. **IMMEDIATE — Week 6 (Symlink Op + Crun-Targeted Mutators)**:
+   - add `CreateSymlink { path, target }` to `FsOpKind` in `mutator/src/delta.rs`
+   - add `FsOp::create_symlink(path, target)` constructor; add `target: String` field to `FsOp`
+   - add Rust FFI binding in `mutator/src/ffi.rs`; wire into `apply_delta()` match arm
+   - implement `replace_with_symlink(path, target)` Rust-side helper (handles non-empty dirs)
+   - implement 6 crun-targeted mutators: `MountDestinationSymlinkMutator`,
+     `MountOptionSymlinkMutator`, `ExecutableSymlinkMutator`, `ParentComponentSymlinkMutator`,
+     `SymlinkEscapeMutator` (relative + absolute), `LoopAndDepthMutator`
+   - extend `AddFileOp` and `DestructiveMutator` to emit symlink ops
+   - add crun-specific seeds to `rootfs_seeds()` covering all scenario groups
+   - `SetXattr`/`RemoveXattr`, `Chmod`, `Chown` deferred to Week 8
 
-4. **Week 6 — close the guidance loop**:
-   - implement `FuseLogObserver` and `FsAccessFeedback`
+4. **NEXT — Week 7 (FUSE Logging + FuseLogObserver + FsAccessFeedback)**:
+   - implement `fuse_iter_log_t` and `g_target_running` in FUSE layer
+   - instrument `fvfs_create`, `fvfs_write`, `fvfs_mkdir`, `fvfs_rename`,
+     `fvfs_unlink`, `fvfs_rmdir`, `fvfs_symlink`, ENOENT in `fvfs_getattr`
+   - expose `fuse_log_clear()`, `fuse_log_set_active(bool)`, `fuse_log_get()`
+   - implement `FuseLogObserver` and `FsAccessFeedback` in LibAFL harness
    - compose into `StdFuzzer` via `feedback_or!`
+   - wire `MutationGuidance` from log into mutator stages
    - measure guided vs unguided coverage growth
 
 5. **Week 8 — before implementing restore optimisation**: write journal vs CoW
    design comparison in `docs/vfs_design_v2.md`, decide, then implement
 
-Remaining VFS/FUSE work — non-blocking for Phase B/C but needed before OCI integration (Week 8):
+Remaining VFS/FUSE work — non-blocking for Week 6/7 but needed before OCI integration (Week 8):
 
 - `chmod` / `mode` field on `vfs_node_t` — needed for permission-sensitive targets
 - `release` no-op callback — flush semantics correctness

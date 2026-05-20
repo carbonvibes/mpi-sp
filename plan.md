@@ -105,10 +105,10 @@ for rootfs, running together in one fuzzer.
 > **All three campaigns use the exact same Nix-built crun binary from SemanticSanitizer.**
 
 ```
-/nix/store/xdripc6yb5zpn19rn72yc7vgmddrj2ws-crun-harness-1.23.1/bin/crun
+/nix/store/bamjhvk6vc4w6f0gpiyyvdyxx825i7l0-crun-harness-1.23.1/bin/crun
 ```
 
-This is crun 1.23.1 patched with `0001-crun-add-harness.patch` (4th rebuild — all bugs fixed),
+This is crun 1.23.1 patched with `0001-crun-add-harness.patch` (6th rebuild — all bugs fixed),
 compiled with `afl-clang-lto` via Nix. Using the same binary across all campaigns guarantees:
 - Identical instrumentation
 - Identical total edge count: **11072 edges** for all three campaigns
@@ -337,7 +337,11 @@ python3 /home/arjun/mpi-sp/fuzz_dashboard/server.py /tmp/campaign2_fuzz.log camp
 - [x] **Mount accumulation bug found and fixed** (exec/sec dropped from 158→81 over 18 min due to stacked OCI bind-mounts) — `umount(path)` → `while (umount2(path, MNT_DETACH) == 0);` in `rmdir_rec`
 - [x] 3rd rebuild at `/nix/store/wgwpvlvpw94s1k7ir5rkw01v56454mpy-crun-harness-1.23.1/bin/crun` (11072 edges)
 - [x] **OOM-kill bug found and fixed** (grammar `[0-9]+` generates tiny memory limits → `CONSTRAINT_MEMCG` kills crun inside its own container cgroup; proven via dmesg after 3/6 instances crashed at ~25h) — memory limit clamped to 128 MiB minimum in harness
-- [x] 4th rebuild at `/nix/store/xdripc6yb5zpn19rn72yc7vgmddrj2ws-crun-harness-1.23.1/bin/crun` (11072 edges — **use this**)
+- [x] 4th rebuild at `/nix/store/xdripc6yb5zpn19rn72yc7vgmddrj2ws-crun-harness-1.23.1/bin/crun` (11072 edges)
+- [x] **Crash detection gap found and fixed** (libcrun returns 128+N for signal-killed containers; harness checked `ret < 0` only, so SIGSEGV=139 was silently treated as success → 0 crashes saved despite dmesg segfaults; fix: `if (ret > 128) raise(ret - 128)` re-raises the signal so AFL records it as a crash)
+- [x] 5th rebuild at `/nix/store/wwqb1dxkz92d7i94r1wy964wmpgr93vx-crun-harness-1.23.1/bin/crun` (11072 edges)
+- [x] **Pre-sync crash detection gap fixed** (container child killed by signal before sync handshake produced ret < 0, swallowed as normal error; fix: check `err->status == 0 && strstr(err->msg, "read from the init process")` — the specific libcrun error for "child died without sending a message" — then raise SIGSEGV so AFL records it)
+- [x] 6th rebuild at `/nix/store/bamjhvk6vc4w6f0gpiyyvdyxx825i7l0-crun-harness-1.23.1/bin/crun` (11072 edges — **use this**)
 - [x] Campaign 1 fuzzer available at `/nix/store/2hpav3yiv5fffrs9g3mf0lx21y7dxk41-crun-fuzzer-0.0.1/bin/forkserver_simple`
 - [x] Dashboard: Comparison tab with 3-campaign charts → `fuzz_dashboard/`
 - [x] Write `mutator/src/bin/fuzz_rootfs_afl.rs` (Campaign 2 fuzzer) — compiles clean, logic verified
@@ -469,6 +473,39 @@ if (container->container_def->linux
 
 ---
 
+#### Bug 11 — Crash detection gap: container signal-kills were silently treated as success
+
+**Discovered:** 2026-05-17  
+**Symptom:** `saved_crashes: 0` across all 6 instances after 10+ hours of fuzzing, despite `dmesg` showing repeated segfaults in `crun` on CPUs 3,4,5 at a fixed libc offset (`0x16B5DC` = `internal_getent` in `nss/nss_files/files-XXX.c:131`).
+
+**Root cause:** `libcrun_container_run` calls `waitpid` on the container process and converts its exit status using `get_process_exit_status` (in `libcrun/utils.h`):
+
+```c
+static inline int get_process_exit_status (int status) {
+  if (WIFEXITED (status))  return WEXITSTATUS (status);
+  if (WIFSIGNALED (status)) return 128 + WTERMSIG (status);
+  return -1;
+}
+```
+
+When the container is killed by SIGSEGV (signal 11), this returns `128 + 11 = 139`. The harness only checked `if (UNLIKELY(ret < 0))` — 139 > 0, so it fell through to the success path. The AFL child exited cleanly with exit code 0. LibAFL's forkserver reported `ExitKind::Ok` → `CrashFeedback` never triggered → nothing saved to `crashes/`.
+
+**The actual crash:** The grammar generates `USER_CONFIG` with `"user": {"uid": N, "gid": N}`. crun's container init calls `getpwuid_r` → glibc NSS `internal_getent` → NULL deref because the container rootfs has no `/etc/passwd` after the mount namespace switch. This is a real libcrun bug.
+
+**Why C3 also had 0 crashes:** Same issue — identical harness code, identical `ret < 0` check.
+
+**Fix:** After the success cleanup path, re-raise any signal that killed the container:
+
+```c
+/* Re-raise container-kill signal so AFL records this run as a crash. */
+if (ret > 128)
+  raise (ret - 128);
+```
+
+`raise(11)` (SIGSEGV) kills the AFL child. The forkserver's parent sees `WIFSIGNALED(SIGSEGV)`. Since SIGSEGV ≠ kill_signal (SIGKILL), LibAFL reports `ExitKind::Crash` → `CrashFeedback` triggers → saved to `crashes/`. If the container was killed by SIGKILL (ret=137), `raise(SIGKILL)` kills the child; LibAFL interprets it as a timeout (kill_signal = SIGKILL) — correct, since SIGKILL usually means OOM or timeout, not a crash.
+
+---
+
 ### Changes made to the patch
 
 | What | Before | After |
@@ -482,6 +519,7 @@ if (container->container_def->linux
 | `umount(path)` in `rmdir_rec` | single call — removes only top layer | `while (umount2(path, MNT_DETACH) == 0);` — drains all stacked layers |
 | `__AFL_LOOP(10000)` | 10,000 runs of same config per fork | `__AFL_LOOP(1)` — 1 run per fork, 10,000× more unique configs explored |
 | Memory limit clamping | absent — grammar `[0-9]+` could generate 1-byte limits, OOM-killing crun inside its own cgroup | **added** — clamp to 128 MiB minimum after `libcrun_container_load_from_file` |
+| Crash detection | `if (ret < 0)` only — `libcrun_container_run` returns `128+N` for signal N; SIGSEGV=139 passed silently as "success" → 0 crashes saved | **`if (ret > 128) raise(ret - 128)`** — re-raises container-kill signal so AFL forkserver sees WIFSIGNALED → ExitKind::Crash → saved |
 
 ### Edge count change: 11200 → 11072
 
@@ -498,7 +536,9 @@ binary (all of `crun.c` + libcrun). Removing `libcrun_container_create` and
 1st (buggy):        /nix/store/dl0ncis1aanb8jxk6vj18iqdkgfi5ijj-crun-harness-1.23.1/bin/crun  (11200 edges)
 2nd (bugs 1-7):     /nix/store/j25zzfyvqvvfp2z988h22rr0i4rknn0v-crun-harness-1.23.1/bin/crun  (11072 edges)
 3rd (bug 8):        /nix/store/wgwpvlvpw94s1k7ir5rkw01v56454mpy-crun-harness-1.23.1/bin/crun  (11072 edges)
-4th (bug 10 fixed): /nix/store/xdripc6yb5zpn19rn72yc7vgmddrj2ws-crun-harness-1.23.1/bin/crun  (11072 edges) ← USE THIS
+4th (bug 10 fixed): /nix/store/xdripc6yb5zpn19rn72yc7vgmddrj2ws-crun-harness-1.23.1/bin/crun  (11072 edges)
+5th (bug 11 fixed): /nix/store/wwqb1dxkz92d7i94r1wy964wmpgr93vx-crun-harness-1.23.1/bin/crun  (11072 edges)
+6th (bug 12 fixed): /nix/store/bamjhvk6vc4w6f0gpiyyvdyxx825i7l0-crun-harness-1.23.1/bin/crun  (11072 edges) ← USE THIS
 ```
 
 Rebuild command (from `SemanticSanitizer/` — use `path:` prefix to avoid needing a git commit):
