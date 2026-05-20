@@ -595,7 +595,7 @@ Objectives:
 - add 6 crun-targeted mutator stages covering the key symlink bug classes, ordered by bug-finding value
 - add a rich crun-specific seed corpus targeting pre-pivot escape scenarios
 
-#### Part A — CreateSymlink Op (Must Finish)
+#### Part A — CreateSymlink Op ✓ COMPLETE
 
 The change is mechanical and self-contained:
 
@@ -612,7 +612,7 @@ Testing:
 - symlink loop (`/loop → /loop`) does not hang VFS or FUSE layer
 - absolute symlink target (`/proc/self/exe`) serializes and applies correctly
 
-#### Part A.2 — `replace_with_symlink` Helper (Must Finish)
+#### Part A.2 — `replace_with_symlink` Helper ✓ COMPLETE
 
 The naive pattern `rmdir(path) + create_symlink(path, target)` only works when `path`
 is an empty directory. For `/etc`, `/bin`, `/usr`, `/lib`, and any other non-empty
@@ -652,7 +652,7 @@ This helper is used by every mutator that replaces an existing path with a symli
 Without it, mount-destination and parent-component seeds will fail silently and the
 fuzzer's high-value inputs will never reach crun.
 
-#### Part B — Crun-Targeted Mutators (Must Finish)
+#### Part B — Crun-Targeted Mutators ✓ COMPLETE
 
 Six mutator stages ordered by crun-specific bug-finding value:
 
@@ -815,7 +815,7 @@ Emits N `CreateSymlink` ops in sequence within the delta.
 - Guidance: treat `ELOOP`, `ENOTDIR`, `EEXIST`, and `EINVAL` as meaningful signals
   (not just noise) — they indicate crun reached a symlink-handling branch
 
-#### Part C — Crun-Specific Seeds
+#### Part C — Crun-Specific Seeds ✓ COMPLETE
 
 Seeds are organized by the crun pre-pivot operation they target:
 

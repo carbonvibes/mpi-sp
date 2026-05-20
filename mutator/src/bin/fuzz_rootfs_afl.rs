@@ -14,6 +14,7 @@ use std::{
     path::PathBuf,
     rc::Rc,
     str::FromStr,
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -54,6 +55,11 @@ use fs_mutator::{
         AddFileOp, ByteFlipFileContent, DestructiveMutator, LiveCorpus, MutatePath, RemoveOp,
         ReplaceFileContent, ReplayWriteFile, SpliceDelta, UpdateExistingFile,
     },
+    symlink_mutators::{
+        ExecutableSymlinkMutator, LoopAndDepthMutator, MountDestinationSymlinkMutator,
+        MountOptionSymlinkMutator, ParentComponentSymlinkMutator, SymlinkEscapeMutator,
+    },
+    symlink_utils::{replace_with_symlink, BaselineIndex},
 };
 
 #[cfg(has_fuse3)]
@@ -354,6 +360,111 @@ fn rootfs_seeds(bin_true: &[u8]) -> Vec<FsDelta> {
     seeds
 }
 
+// ── Symlink seed corpus ───────────────────────────────────────────────────────
+//
+// Targets the crun pre-pivot code paths that follow symlinks: mount destination
+// setup, uid/gid resolution from /etc/passwd and /etc/group, and binary exec.
+//
+// All seeds use replace_with_symlink so non-empty baseline dirs (/etc, /bin)
+// are correctly expanded — raw rmdir + create_symlink silently fails on them.
+
+fn rootfs_symlink_seeds(index: &BaselineIndex) -> Vec<FsDelta> {
+    let mut seeds = Vec::new();
+
+    // ── Mount destination escapes — relative targets ──────────────────────────
+    for (path, target) in &[
+        ("/proc", "../../proc"),
+        ("/dev",  "../../dev"),
+        ("/sys",  "../../sys"),
+        ("/tmp",  "../../tmp"),
+    ] {
+        seeds.push(FsDelta::new(replace_with_symlink(path, target, index)));
+    }
+
+    // All mount destinations simultaneously
+    let mut combined = Vec::new();
+    for (path, target) in &[("/proc", "../../proc"), ("/dev", "../../dev"), ("/sys", "../../sys")] {
+        combined.extend(replace_with_symlink(path, target, index));
+    }
+    if !combined.is_empty() {
+        seeds.push(FsDelta::new(combined));
+    }
+
+    // ── Mount destination escapes — absolute targets ──────────────────────────
+    for (path, target) in &[
+        ("/proc", "/proc"),
+        ("/dev",  "/proc/self/fd"),
+        ("/sys",  "/sys"),
+        ("/proc", "/proc/self/exe"),
+    ] {
+        seeds.push(FsDelta::new(replace_with_symlink(path, target, index)));
+    }
+
+    // ── Mount destination → wrong type ───────────────────────────────────────
+    seeds.push(FsDelta::new(replace_with_symlink("/proc", "/etc/passwd", index)));
+    seeds.push(FsDelta::new(replace_with_symlink("/dev",  "/bin/true",   index)));
+
+    // ── Mount destination → dangling ─────────────────────────────────────────
+    seeds.push(FsDelta::new(replace_with_symlink("/proc", "/nonexistent", index)));
+    seeds.push(FsDelta::new(replace_with_symlink("/dev",  "/missing",     index)));
+
+    // ── Parent component symlinks — non-leaf, historically dangerous ──────────
+    for (path, target) in &[
+        ("/etc", "../../etc"),
+        ("/bin", "../../bin"),
+        ("/lib", "../../lib"),
+        ("/usr", "../../usr"),
+        ("/dev", "/proc/self/fd"),
+    ] {
+        seeds.push(FsDelta::new(replace_with_symlink(path, target, index)));
+    }
+
+    // ── Binary path → proc/dev special files ─────────────────────────────────
+    for target in &[
+        "/proc/self/exe",
+        "/proc/self/mem",
+        "/proc/self/fd/0",
+        "/dev/zero",
+        "/dev/null",
+        "../../usr/bin/python3",
+    ] {
+        seeds.push(FsDelta::new(replace_with_symlink("/bin/true", target, index)));
+    }
+
+    // ── Config-reading files → host escape ───────────────────────────────────
+    seeds.push(FsDelta::new(replace_with_symlink("/etc/passwd", "../../etc/passwd",    index)));
+    seeds.push(FsDelta::new(replace_with_symlink("/etc/passwd", "/etc/passwd",         index)));
+    seeds.push(FsDelta::new(replace_with_symlink("/etc/passwd", "../../../etc/shadow", index)));
+    seeds.push(FsDelta::new(replace_with_symlink("/etc/group",  "../../etc/group",     index)));
+
+    // ── Symlink loops ─────────────────────────────────────────────────────────
+    seeds.push(FsDelta::new(vec![FsOp::create_symlink("/loop", "/loop")]));
+    seeds.push(FsDelta::new(vec![
+        FsOp::create_symlink("/a", "/b"),
+        FsOp::create_symlink("/b", "/c"),
+        FsOp::create_symlink("/c", "/a"),
+    ]));
+
+    // ── Relative escape via deep path ─────────────────────────────────────────
+    seeds.push(FsDelta::new(replace_with_symlink("/etc/passwd", "../../../etc/shadow", index)));
+    seeds.push(FsDelta::new(vec![
+        FsOp::create_symlink("/bin/sh", "../../../proc/sysrq-trigger"),
+    ]));
+
+    // ── Dangling symlink at a path crun opens ─────────────────────────────────
+    seeds.push(FsDelta::new(vec![FsOp::create_symlink("/bin/sh", "/nonexistent")]));
+    seeds.push(FsDelta::new(replace_with_symlink("/proc", "/nonexistent", index)));
+
+    // ── Targets with path noise ───────────────────────────────────────────────
+    seeds.push(FsDelta::new(vec![FsOp::create_symlink("/bin/x", "////proc//self//exe")]));
+    seeds.push(FsDelta::new(vec![FsOp::create_symlink("/bin/x", "../../../proc/./self/./exe")]));
+
+    // Drop empty deltas (replace_with_symlink on a path not in the index returns
+    // a single-op vec, but guard here in case the baseline changes)
+    seeds.retain(|d| !d.is_empty());
+    seeds
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -403,6 +514,7 @@ fn main() {
     let baseline_file_paths = enumerate_vfs_file_paths(vfs);
     let baseline_dir_paths  = enumerate_vfs_dir_paths(vfs);
     let baseline_all_paths  = enumerate_vfs_all_paths(vfs);
+    let baseline_index      = Arc::new(BaselineIndex::build(vfs));
 
     let baseline_contents: Vec<(String, Vec<u8>)> = {
         let mut c = vec![
@@ -522,10 +634,20 @@ fn main() {
     }
 
     // ── Seed corpus ───────────────────────────────────────────────────────────
-    let seeds = rootfs_seeds(&bin_true);
+    let mut seeds = rootfs_seeds(&bin_true);
+    seeds.extend(rootfs_symlink_seeds(&baseline_index));
     let live_corpus: LiveCorpus = Rc::new(RefCell::new(seeds.clone()));
 
     // ── Mutators ──────────────────────────────────────────────────────────────
+    //
+    // General-purpose stages (9):
+    //   ByteFlipFileContent, ReplaceFileContent, AddFileOp, RemoveOp, MutatePath,
+    //   SpliceDelta, DestructiveMutator, UpdateExistingFile, ReplayWriteFile
+    //
+    // Symlink-specific stages (7, MountDestination weighted ×2):
+    //   MountDestinationSymlinkMutator (×2), MountOptionSymlinkMutator,
+    //   ExecutableSymlinkMutator, ParentComponentSymlinkMutator,
+    //   SymlinkEscapeMutator, LoopAndDepthMutator
     let mutators = tuple_list!(
         ByteFlipFileContent::new(),
         ReplaceFileContent::new(),
@@ -545,6 +667,13 @@ fn main() {
         UpdateExistingFile::new(baseline_file_paths.clone())
             .with_baseline_contents(baseline_contents),
         ReplayWriteFile::new(baseline_file_paths.clone()),
+        MountDestinationSymlinkMutator::new(Arc::clone(&baseline_index)),
+        MountDestinationSymlinkMutator::new(Arc::clone(&baseline_index)),
+        MountOptionSymlinkMutator::new(Arc::clone(&baseline_index)),
+        ExecutableSymlinkMutator::new(Arc::clone(&baseline_index)),
+        ParentComponentSymlinkMutator::new(Arc::clone(&baseline_index)),
+        SymlinkEscapeMutator::new(Arc::clone(&baseline_index)),
+        LoopAndDepthMutator::new(),
     );
     let scheduled = HavocScheduledMutator::new(mutators);
     let havoc_stage = StdMutationalStage::new(scheduled);

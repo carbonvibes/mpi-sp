@@ -13,10 +13,11 @@ typedef enum {
     FS_OP_RMDIR       = 5,
     FS_OP_SET_TIMES   = 6,
     FS_OP_TRUNCATE    = 7,
+    FS_OP_SYMLINK     = 8,
 } fs_op_kind_t;
 
 #define FS_OP_KIND_MIN 1
-#define FS_OP_KIND_MAX 7
+#define FS_OP_KIND_MAX 8
 
 typedef struct {
     fs_op_kind_t     kind;
@@ -53,6 +54,7 @@ int delta_add_set_times(fs_delta_t *d, const char *path,
                         const struct timespec *mtime,
                         const struct timespec *atime);
 int delta_add_truncate(fs_delta_t *d, const char *path, size_t new_size);
+int delta_add_symlink(fs_delta_t *d, const char *path, const char *target);
 
 uint8_t *delta_serialize(const fs_delta_t *d, size_t *out_len);
 fs_delta_t *delta_deserialize(const uint8_t *buf, size_t len, int *err_out);

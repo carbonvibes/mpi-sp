@@ -90,6 +90,15 @@ static int apply_single_op(vfs_t *vfs, const fs_op_t *op)
         return r;
     }
 
+    case FS_OP_SYMLINK: {
+        if (!op->content || op->content_len == 0) return -EINVAL;
+        char *target = strndup((char *)op->content, op->content_len);
+        if (!target) return -ENOMEM;
+        int r = vfs_symlink(vfs, op->path, target);
+        free(target);
+        return r;
+    }
+
     default:
         return -EINVAL;
     }
@@ -359,7 +368,8 @@ static int enum_readdir_cb(void *raw, const char *name, const vfs_stat_t *vs)
 
     int match = (rc->list->filter == 0)
              || (rc->list->filter == 1 && vs->kind == VFS_FILE)
-             || (rc->list->filter == 2 && vs->kind == VFS_DIR);
+             || (rc->list->filter == 2 && vs->kind == VFS_DIR)
+             || (rc->list->filter == 3 && vs->kind == VFS_SYMLINK);
     if (match) enum_list_push(rc->list, child);
 
     if (vs->kind == VFS_DIR)

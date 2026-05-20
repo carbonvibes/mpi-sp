@@ -4,17 +4,28 @@
 
 Week 5 built the Rust-side fuzzing layer that sits between LibAFL and the
 in-memory VFS.  The deliverable is a working, measurable mutation → apply →
-reset loop that exercises all nine mutation strategies across all seven
-`FsOpKind` variants, with per-op failure reporting, semantic yield tracking,
-baseline-path targeting, and insertion-order-independent checksums.
+reset loop that exercises all fifteen mutation strategies (nine general-purpose plus six
+symlink-specific) across all eight `FsOpKind` variants, with per-op failure
+reporting, semantic yield tracking, baseline-path targeting, and
+insertion-order-independent checksums.
 
 The week is split into two phases:
 
-- **Phase A (complete)** — Rust `FsDelta`/`FsOp` corpus types, nine mutator
-  stages (including `UpdateExistingFile` + `ReplayWriteFile` for write-path coverage),
+- **Phase A (complete)** — Rust `FsDelta`/`FsOp` corpus types, nine
+  general-purpose mutator stages (including `UpdateExistingFile` +
+  `ReplayWriteFile` for write-path coverage) plus six symlink-specific stages
+  (`MountDestinationSymlinkMutator`, `MountOptionSymlinkMutator`,
+  `ExecutableSymlinkMutator`, `ParentComponentSymlinkMutator`,
+  `SymlinkEscapeMutator`, `LoopAndDepthMutator`), `CreateSymlink` as the
+  eighth `FsOpKind` variant with full stack support (`FsOp` → FFI →
+  `cp_apply_delta` → `vfs_symlink` → FUSE `readlink`), `BaselineIndex`
+  (pre-computed VFS path-kind table built once at startup; shared with
+  mutators via `Arc`), `replace_with_symlink` helper (correct primitive
+  expansion for any path type including non-empty dirs — naive
+  `rmdir + create_symlink` silently fails on non-empty directories),
   full FFI bridge with per-op result inspection, `MAX_OPS` cap,
   `validate_delta` debug assertions, baseline path enumeration via
-  `cp_enumerate_paths` (files / dirs / all), sorted `cp_vfs_checksum`
+  `cp_enumerate_paths` (files / dirs / all / symlinks), sorted `cp_vfs_checksum`
   (insertion-order independent), 7-seed diverse corpus, multi-mutation per
   iteration (1–3 mutations on the same delta before VFS apply), op-type-aware
   path selection in `DestructiveMutator`, `MutatePath` whole-path swap,
@@ -31,7 +42,7 @@ The week is split into two phases:
   `recreate_paths` → `DestructiveMutator` + `MutatePath` whole-swap),
   **skip-early stage filtering** via `can_apply` precondition checks (no
   wasted mutation-budget slots on guaranteed skips), dumb loop harness with
-  98% semantic yield, 46 unit + E2E integration tests, C serialization
+  98% semantic yield, 65 unit + E2E integration tests, C serialization
   cleanup, benchmarks.
 - **Phase B** — FUSE callback logging, `MutationGuidance` population
   from the write log, full closed loop.  The guidance hooks are already in
@@ -201,7 +212,10 @@ The VFS is reset to the same saved baseline after every iteration:
 
 ### 3. Mutator Pool
 
-The dumb loop randomly chooses one of the nine stages:
+The mutation pool contains fifteen stages — nine general-purpose and six
+symlink-specific:
+
+**General-purpose stages:**
 
 | Stage | High-level behavior |
 |---|---|
@@ -214,6 +228,17 @@ The dumb loop randomly chooses one of the nine stages:
 | `DestructiveMutator` | Append delete/rmdir/truncate/set-times ops; targets real baseline paths |
 | `UpdateExistingFile` | Append `UpdateFile` on a file from `write_paths ∩ baseline` (70%) or baseline |
 | `ReplayWriteFile` | Append `CreateFile` for `write_paths ∖ baseline` — recreates target-generated files wiped by reset |
+
+**Symlink-specific stages (use `Arc<BaselineIndex>` and `replace_with_symlink`):**
+
+| Stage | High-level behavior |
+|---|---|
+| `MountDestinationSymlinkMutator` | Replace a mount destination (`/proc`, `/dev`, `/sys`, `/tmp`, `/etc`) with a symlink using `replace_with_symlink` |
+| `MountOptionSymlinkMutator` | Create a symlink at a bind mount destination; exercises symlink-aware mount option branches (`dest-nofollow`, `copy-symlink`, `src-nofollow`) |
+| `ExecutableSymlinkMutator` | Create the target binary path as a symlink to a proc/dev special file |
+| `ParentComponentSymlinkMutator` | Replace a non-leaf path component (`/etc`, `/bin`, `/lib`, `/usr`) with a symlink — the historically dangerous escape class |
+| `SymlinkEscapeMutator` | Create symlinks with relative (`../../`) or absolute escape targets; parameterized by escape depth |
+| `LoopAndDepthMutator` | Create symlink loops and chains of controlled lengths; exercises `ELOOP` and the kernel 40-hop limit |
 
 Each stage returns:
 
@@ -462,6 +487,128 @@ ReplayWriteFile    → always picks "/tmp/output"  (∖ baseline)
 Skips when `write_paths ∖ baseline_file_paths` is empty (Phase A default —
 guidance is unpopulated) or at `MAX_OPS`.
 
+#### `MountDestinationSymlinkMutator`
+
+Replaces a mount destination with a symlink using `replace_with_symlink`.
+`/proc` is an empty directory in the baseline so the helper emits `Rmdir`
+rather than a recursive tree deletion:
+
+```text
+Before: [ UpdateFile("/input", "seed", size=4) ]
+After:  [
+  UpdateFile("/input", "seed", size=4),
+  Rmdir("/proc"),
+  CreateSymlink("/proc", "../../proc"),
+]
+```
+
+Target selection is weighted: relative escape (35%), absolute (25%),
+cross-type (20%), dangling (15%), special file (5%).
+
+#### `MountOptionSymlinkMutator`
+
+Creates a symlink at a bind mount destination path inside the rootfs.
+Exercises destination-side (`dest-nofollow`) symlink-aware option branches:
+
+```text
+Before: [ UpdateFile("/input", "seed", size=4) ]
+After:  [
+  UpdateFile("/input", "seed", size=4),
+  Rmdir("/mnt"),
+  CreateSymlink("/mnt", "../../var/lib"),
+]
+```
+
+Source-side options (`copy-symlink`, `src-nofollow`) require a symlink on
+the *host* filesystem (crun resolves `mount.source` from the host before
+pivot); a symlink inside the FUSE rootfs cannot exercise those branches.
+
+#### `ExecutableSymlinkMutator`
+
+Picks a synthetic executable path and creates it as a symlink to a
+proc/dev special file:
+
+```text
+Before: [ UpdateFile("/input", "seed", size=4) ]
+After:  [
+  UpdateFile("/input", "seed", size=4),
+  DeleteFile("/bin/target"),
+  CreateSymlink("/bin/target", "/proc/self/exe"),
+]
+```
+
+The `DeleteFile` above applies when `/bin/target` was a file in the
+baseline.  For a directory baseline path, `replace_with_symlink` emits
+recursive children deletion + `Rmdir` first.
+
+#### `ParentComponentSymlinkMutator`
+
+Replaces a non-leaf path component — the historically dangerous escape class.
+`/etc` has children so `replace_with_symlink` recurses through them first:
+
+```text
+Before: [ UpdateFile("/input", "seed", size=4) ]
+After:  [
+  UpdateFile("/input", "seed", size=4),
+  DeleteFile("/etc/passwd"),
+  DeleteFile("/etc/group"),
+  Rmdir("/etc"),
+  CreateSymlink("/etc", "../../etc"),
+]
+```
+
+When crun reads `/etc/passwd` for uid/gid resolution pre-pivot, the `/etc`
+symlink redirects that lookup to the host filesystem.
+
+#### `SymlinkEscapeMutator`
+
+Generates a symlink at a random baseline path with an escape-oriented
+target.  Two modes chosen 50/50:
+
+```text
+Before: [ UpdateFile("/input", "seed", size=4) ]
+After (relative, depth=3):  [
+  UpdateFile("/input", "seed", size=4),
+  DeleteFile("/input"),
+  CreateSymlink("/input", "../../../etc/shadow"),
+]
+After (absolute):  [
+  UpdateFile("/input", "seed", size=4),
+  DeleteFile("/input"),
+  CreateSymlink("/input", "/proc/self/exe"),
+]
+```
+
+Relative depth ranges from 2 to 8 `../` hops.  Absolute mode uses a
+dictionary of paths where pre-pivot and post-pivot resolution may differ.
+
+#### `LoopAndDepthMutator`
+
+Creates symlink loops and depth chains.  Chain lengths `{1, 5, 10, 39, 40, 41}`:
+length 40 is the Linux kernel follow limit; length 41 triggers `ELOOP`:
+
+```text
+Before: [ UpdateFile("/input", "seed", size=4) ]
+After (self-loop):  [
+  UpdateFile("/input", "seed", size=4),
+  CreateSymlink("/loop", "/loop"),
+]
+After (two-cycle):  [
+  UpdateFile("/input", "seed", size=4),
+  CreateSymlink("/a", "/b"),
+  CreateSymlink("/b", "/a"),
+]
+After (chain-41):  [
+  UpdateFile("/input", "seed", size=4),
+  CreateSymlink("/s0", "/s1"),
+  ...   ← 41 CreateSymlink ops total
+  CreateSymlink("/s40", "/proc"),
+]
+```
+
+Does not use `replace_with_symlink` — chains create fresh paths and need no
+prior clearing.
+
 ### 5. Apply, Yield, Reset
 
 After mutation, the loop calls:
@@ -587,10 +734,12 @@ to `cp_apply_delta`, reads the `cp_result_t` fields directly (transparent
 | Path | Purpose |
 |---|---|
 | `mutator/src/lib.rs` | Crate root; `pub mod` declarations |
-| `mutator/src/delta.rs` | `FsOpKind`, `FsOp` (7 constructors), `FsDelta`, `generate_seed`, `generate_seed_corpus`, `initial_corpus_pool`, 6 unit tests |
+| `mutator/src/delta.rs` | `FsOpKind`, `FsOp` (8 constructors), `FsDelta`, `generate_seed`, `generate_seed_corpus`, `initial_corpus_pool`, 6 unit tests |
 | `mutator/src/guidance.rs` | `MutationGuidance` — FUSE log stub (populated in Phase B) |
 | `mutator/src/mutators.rs` | `MAX_OPS`, `MAX_LIVE_CORPUS`, `LiveCorpus`, `CONTENT_DICTIONARY`, `PATH_COMPONENTS`, `pick_or_random`, `pick_timestamp`, `perturb_bytes`, 9 mutator stages (each with `can_apply`), 35 unit tests |
-| `mutator/src/ffi.rs` | C type bindings, `DeltaResult`, `apply_delta()`, `enumerate_vfs_file_paths`, `enumerate_vfs_dir_paths`, `enumerate_vfs_all_paths`, 5 E2E integration tests |
+| `mutator/src/symlink_utils.rs` | `PathKind`, `PathInfo`, `BaselineIndex` (pre-computed VFS tree index), `replace_with_symlink`, `delete_tree_ops`, 6 unit tests |
+| `mutator/src/symlink_mutators.rs` | 6 symlink-specific mutator stages, all `Mutator<FsDelta, S>` where `S: HasRand`, 6 unit tests |
+| `mutator/src/ffi.rs` | C type bindings, `DeltaResult`, `apply_delta()`, `enumerate_vfs_file_paths`, `enumerate_vfs_dir_paths`, `enumerate_vfs_all_paths`, `enumerate_vfs_symlink_paths`, 9 E2E integration tests |
 | `mutator/src/bin/fuzz.rs` | Dumb loop harness with live-corpus promotion and semantic yield tracking |
 | `mutator/src/bin/vfs_bench.rs` | Direct VFS benchmark (no FUSE, no mutators) |
 | `mutator/build.rs` | Builds `libcontrol_plane.a`, links it into the Rust crate |
@@ -606,17 +755,19 @@ to `cp_apply_delta`, reads the `cp_result_t` fields directly (transparent
 
 ```rust
 pub enum FsOpKind {
-    CreateFile,   // create file with content
-    UpdateFile,   // replace entire file content
-    DeleteFile,   // unlink file
-    Mkdir,        // create directory
-    Rmdir,        // remove empty directory
-    SetTimes,     // set mtime and/or atime
-    Truncate,     // resize file
+    CreateFile,    // create file with content
+    UpdateFile,    // replace entire file content
+    DeleteFile,    // unlink file
+    Mkdir,         // create directory
+    Rmdir,         // remove empty directory
+    SetTimes,      // set mtime and/or atime
+    Truncate,      // resize file
+    CreateSymlink, // create a symbolic link with a target path
 }
 ```
 
 Maps 1:1 to `fs_op_kind_t` in `control_plane/delta.h`.
+`CreateSymlink` corresponds to `FS_OP_SYMLINK = 8`.
 
 ### `FsOp`
 
@@ -626,6 +777,7 @@ pub struct FsOp {
     pub path:       String,    // absolute, starts with '/'
     pub content:    Vec<u8>,   // CreateFile / UpdateFile only; empty otherwise
     pub size:       usize,     // content.len() for file ops; new_size for Truncate; 0 otherwise
+    pub target:     String,    // CreateSymlink only: the symlink target; empty otherwise
     pub mtime_sec:  i64,       // SetTimes only; 0 otherwise
     pub mtime_nsec: i64,
     pub atime_sec:  i64,
@@ -633,7 +785,7 @@ pub struct FsOp {
 }
 ```
 
-All seven constructors:
+All eight constructors:
 
 | Constructor | Kind | Notable |
 |---|---|---|
@@ -644,6 +796,7 @@ All seven constructors:
 | `rmdir(path)` | `Rmdir` | content/size zero |
 | `truncate(path, new_size)` | `Truncate` | `size = new_size`, no content |
 | `set_times(path, mtime_sec, mtime_nsec, atime_sec, atime_nsec)` | `SetTimes` | all four timestamp fields set |
+| `create_symlink(path, target)` | `CreateSymlink` | `target` set; content/size zero |
 
 ### `FsDelta`
 
@@ -1063,6 +1216,231 @@ regardless of whether it pre-existed in the baseline.
 
 ---
 
+## `symlink_utils.rs` — Baseline Path Index and Symlink Expansion
+
+Two building blocks used by all symlink mutators and seed generation.
+
+### `PathKind` and `PathInfo`
+
+```rust
+pub enum PathKind { File, Dir, Symlink }
+
+pub struct PathInfo {
+    pub path:     String,
+    pub kind:     PathKind,
+    pub children: Vec<String>,  // direct children (non-recursive); empty for File/Symlink
+}
+```
+
+### `BaselineIndex`
+
+```rust
+pub struct BaselineIndex {
+    pub entries: Vec<PathInfo>,
+}
+impl BaselineIndex {
+    pub fn build(vfs: *mut VfsT) -> Self   // call once at startup
+    pub fn get(&self, path: &str) -> Option<&PathInfo>
+    pub fn is_dir(&self, path: &str) -> bool
+    pub fn is_file(&self, path: &str) -> bool
+    pub fn children_of(&self, path: &str) -> Vec<String>
+}
+```
+
+Built once at startup by calling `enumerate_vfs_all_paths`,
+`enumerate_vfs_dir_paths`, and `enumerate_vfs_symlink_paths` on the VFS
+snapshot.  Each entry records the path kind and direct children list.
+Mutators hold an `Arc<BaselineIndex>` and query it without touching the
+live VFS.
+
+**Why a pre-computed index instead of live VFS queries:** the live VFS
+pointer is not safely accessible from mutators during the fuzzing loop.
+The pre-computed index is immutable after construction and safe to share
+via `Arc`.
+
+### `replace_with_symlink`
+
+```rust
+pub fn replace_with_symlink(path: &str, target: &str, index: &BaselineIndex) -> Vec<FsOp>
+```
+
+Expands "replace path with a symlink" into the correct primitive ops:
+
+| Baseline state of `path` | Ops emitted |
+|---|---|
+| File or Symlink | `DeleteFile(path)`, `CreateSymlink(path, target)` |
+| Empty directory | `Rmdir(path)`, `CreateSymlink(path, target)` |
+| Non-empty directory | `DeleteFile`/`Rmdir` for all children postorder, `Rmdir(path)`, `CreateSymlink(path, target)` |
+| Not in baseline | `CreateSymlink(path, target)` |
+
+**Why this helper is necessary:** the naive `Rmdir(path) + CreateSymlink(path,
+target)` only works for empty directories.  For paths like `/etc` (which has
+`/etc/passwd`, `/etc/group` as children in the baseline), `Rmdir` returns
+`ENOTEMPTY` and `CreateSymlink` then returns `EEXIST`.  Without the helper,
+every seed and mutator that targets a non-empty directory silently produces
+no symlink — the delta applies, the VFS changes nothing, and the input is
+wasted.
+
+### Convenience functions
+
+```rust
+// When the caller already knows the path kind — avoids the index lookup.
+pub fn replace_file_with_symlink(path: &str, target: &str) -> Vec<FsOp>
+pub fn replace_empty_dir_with_symlink(path: &str, target: &str) -> Vec<FsOp>
+```
+
+---
+
+## `symlink_mutators.rs` — Symlink-Specific Mutator Stages
+
+Six mutator stages, all implementing `Mutator<FsDelta, S>` where `S: HasRand`.
+All take `Arc<BaselineIndex>` and use `replace_with_symlink` when replacing
+existing paths.  Each returns `MutationResult::Skipped` if `ops.len() >= MAX_OPS`.
+
+### Static dictionaries
+
+```rust
+static MOUNT_DESTINATIONS: &[&str] = &["/proc", "/dev", "/sys", "/tmp", "/etc"];
+
+static RELATIVE_TARGETS: &[&str] = &[
+    "etc/passwd", "etc/shadow", "proc/self/exe", "proc/self/mem",
+    "proc/sysrq-trigger", "dev/sda", "dev/zero", "run/containerd",
+    "var/run/docker.sock", "proc/self/fd",
+];
+
+static ABSOLUTE_TARGETS: &[&str] = &[
+    "/proc", "/proc/self", "/proc/self/exe", "/proc/self/fd",
+    "/proc/self/fd/0", "/dev", "/dev/null", "/sys", "/etc/passwd", "/bin/sh",
+];
+
+static EXEC_PATHS: &[&str] = &[
+    "/bin/target", "/usr/local/bin/x", "/usr/bin/target", "/sbin/init",
+];
+
+static EXEC_SYMLINK_TARGETS: &[&str] = &[
+    "/proc/self/exe", "/proc/self/mem", "/proc/self/fd/0",
+    "/dev/zero", "../../usr/bin/python3", "/dev/null", "/nonexistent",
+];
+
+static CHAIN_LENGTHS: &[usize] = &[1, 5, 10, 39, 40, 41];
+```
+
+---
+
+### 10. `MountDestinationSymlinkMutator`
+
+Picks a random path from `MOUNT_DESTINATIONS` and calls
+`replace_with_symlink(path, target, &index)` to replace it with a symlink.
+Target selection weights:
+
+| Weight | Type | Examples |
+|---|---|---|
+| 35% | Relative escape | `"../../proc"`, `"../../dev"`, `"../../sys"` |
+| 25% | Absolute | `"/proc"`, `"/dev"`, `"/proc/self/exe"` |
+| 20% | Cross-type | `"/etc/passwd"` (dir expected), `"/bin/true"` |
+| 15% | Dangling | `"/nonexistent"`, `"/missing"` |
+| 5% | Special file | `"/dev/null"`, `"/proc/self/fd"` |
+
+**Why**: mount destination setup is exercised every crun iteration.  Every
+mount destination is a pre-pivot escape opportunity when the kernel follows
+a symlink there before the rootfs boundary is enforced.  This mutator fires
+on every corpus entry — highest density of pre-pivot escape coverage of any
+stage.
+
+Skips if `ops.len() >= MAX_OPS`.
+
+---
+
+### 11. `MountOptionSymlinkMutator`
+
+Creates a symlink at a bind mount destination path inside the rootfs.
+Exercises the destination-side (`dest-nofollow`) symlink-aware bind mount
+branches by placing a symlink at `mount.destination`.
+
+Source-side options (`copy-symlink`, `src-nofollow`) require a symlink on
+the *host* filesystem — crun resolves `mount.source` from the host before
+entering the container rootfs, so a FUSE-side symlink cannot exercise those
+branches.  This mutator handles only the destination side.
+
+Skips if `ops.len() >= MAX_OPS`.
+
+---
+
+### 12. `ExecutableSymlinkMutator`
+
+1. Picks a path from `EXEC_PATHS` (e.g. `/bin/target`)
+2. Uses `replace_with_symlink` to create it as a symlink to a target
+   drawn from `EXEC_SYMLINK_TARGETS`
+
+**Why**: crun validates the binary path before pivot, then execs it after —
+a TOCTOU window.  `/proc/self/exe` is the classic runc-family escape
+vector.  Without this mutator, "config says run X, rootfs has X as a symlink
+to Y" only arises by accident from other stages.
+
+Skips if `ops.len() >= MAX_OPS`.
+
+---
+
+### 13. `ParentComponentSymlinkMutator`
+
+Replaces a *non-leaf* path component — the class that historically caused
+container escapes.  Targets the parents of paths crun is likely to access:
+
+- `/etc` (parent of `/etc/passwd`, `/etc/group` — uid/gid resolution)
+- `/dev` (parent of `/dev/null`, `/dev/console`)
+- `/bin`, `/usr`, `/lib`, `/sbin` (parent of exec paths and libraries)
+
+Since these are non-empty directories in the baseline, `replace_with_symlink`
+recurses through their children before emitting `Rmdir`.  Most fuzzers only
+create leaf symlinks; this stage systematically explores the path-component
+class.
+
+Skips if `ops.len() >= MAX_OPS`.
+
+---
+
+### 14. `SymlinkEscapeMutator`
+
+Generates a symlink at a random baseline path with an escape-oriented
+target.  Two modes (50/50):
+
+- **Relative mode** — escape depth 2–8 `../` hops; suffix drawn from
+  `RELATIVE_TARGETS`.  Construction: `"../".repeat(depth) + suffix`
+- **Absolute mode** — target drawn from `ABSOLUTE_TARGETS`.  Important
+  because absolute symlinks bypass `../` counting and escape directly
+  if the target's pre-pivot safe-open logic does not enforce the rootfs
+  boundary
+
+Uses `replace_with_symlink` when the chosen path exists in the baseline.
+
+Skips if `ops.len() >= MAX_OPS`.
+
+---
+
+### 15. `LoopAndDepthMutator`
+
+Creates symlink loops and deep chains.  Anchored at a path crun is likely
+to access (`MOUNT_DESTINATIONS` or a random baseline path).
+
+**Chain lengths**: `{1, 5, 10, 39, 40, 41}`.
+
+| Length | Expected outcome |
+|---|---|
+| 1–39 | Should follow successfully |
+| 40 | Linux kernel follow limit — should succeed |
+| 41 | Should return `ELOOP` at every crun call site that follows |
+
+**Loop modes**: self-loop (one `CreateSymlink` op), two-cycle (two ops), or
+deep chain (N ops where each points to the next and the final target is a
+real path like `/proc`).
+
+Does not use `replace_with_symlink` — chains create fresh paths and need no
+prior clearing.
+
+Skips if `ops.len() >= MAX_OPS`.
+
+---
+
 ## `ffi.rs` — FFI Bridge
 
 ### C type bindings
@@ -1110,6 +1488,7 @@ pub struct CpResultT {
 | `delta_add_rmdir(d, path)` | `Rmdir` |
 | `delta_add_set_times(d, path, *mtime, *atime)` | `SetTimes` |
 | `delta_add_truncate(d, path, new_size)` | `Truncate` |
+| `delta_add_symlink(d, path, target)` | `CreateSymlink` |
 
 All 7 `FsOpKind` variants are covered; no op kind is silently dropped.
 
@@ -1130,20 +1509,23 @@ All 7 `FsOpKind` variants are covered; no op kind is silently dropped.
 | 0 | all paths (files + directories + symlinks) |
 | 1 | regular files only |
 | 2 | directories only |
+| 3 | symlinks only |
 
 **Safe Rust wrappers:**
 
 ```rust
-pub fn enumerate_vfs_file_paths(vfs: *mut VfsT) -> Vec<String>  // filter=1
-pub fn enumerate_vfs_dir_paths(vfs: *mut VfsT)  -> Vec<String>  // filter=2
-pub fn enumerate_vfs_all_paths(vfs: *mut VfsT)  -> Vec<String>  // filter=0
+pub fn enumerate_vfs_file_paths(vfs: *mut VfsT)    -> Vec<String>  // filter=1
+pub fn enumerate_vfs_dir_paths(vfs: *mut VfsT)     -> Vec<String>  // filter=2
+pub fn enumerate_vfs_all_paths(vfs: *mut VfsT)     -> Vec<String>  // filter=0
+pub fn enumerate_vfs_symlink_paths(vfs: *mut VfsT) -> Vec<String>  // filter=3
 ```
 
-All three call `cp_enumerate_paths` with the appropriate filter via the shared
+All four call `cp_enumerate_paths` with the appropriate filter via the shared
 `collect_paths(vfs, filter)` helper, convert the resulting `char **` array to
 `Vec<String>`, and free the C allocation.  `enumerate_vfs_dir_paths` is needed
 by `DestructiveMutator` to populate `baseline_dir_paths` for Rmdir op-type-aware
-path selection.
+path selection.  `enumerate_vfs_symlink_paths` is used by `BaselineIndex::build`
+to classify symlink nodes in the pre-computed path-kind index.
 
 ### `DeltaResult`
 
@@ -1346,7 +1728,7 @@ once target execution (milliseconds) is included.
 
 ## Unit & Integration Tests
 
-Run with `cargo test`.  **46 tests, 0 failures.**
+Run with `cargo test`.  **65 tests, 0 failures.**
 
 ### `delta::tests` — 6 unit tests
 
@@ -1399,7 +1781,7 @@ Run with `cargo test`.  **46 tests, 0 failures.**
 | `replay_write_file_creates_non_baseline_path` | non-baseline `write_paths` entry produces `CreateFile` op at that exact path |
 | `replay_write_file_ignores_baseline_write_paths` | mixed `write_paths` (some in baseline, some not) — only non-baseline paths are ever selected across 100 tries |
 
-### `ffi::tests` — 5 E2E integration tests
+### `ffi::tests` — 9 E2E integration tests
 
 These build a real VFS, call `apply_delta()` through the full FFI bridge, and
 assert on VFS-level outcomes — not just struct mutation.
@@ -1411,9 +1793,38 @@ assert on VFS-level outcomes — not just struct mutation.
 | `e2e_update_existing_file_succeeds` | `UpdateFile` on a baseline file returns `succeeded == 1` |
 | `e2e_set_times_on_existing_file_succeeds` | `SetTimes` FFI path reaches the VFS and succeeds |
 | `e2e_failed_op_is_counted_not_panicked` | `DeleteFile` on non-existent path → `Ok` with `failed == 1`; no panic |
+| `e2e_create_symlink_succeeds_and_is_enumerated` | `CreateSymlink` op succeeds; symlink path appears in `enumerate_vfs_symlink_paths` result |
+| `e2e_symlink_roundtrip_serialization` | `FsDelta` with `CreateSymlink` serializes and deserializes to/from JSON with `path` and `target` intact |
+| `e2e_symlink_loop_does_not_hang` | Self-loop symlink (`/loop → /loop`) produces exactly 1 op result without hanging |
+| `e2e_create_symlink_with_absolute_target` | Absolute symlink target (`/proc/self/fd`) serializes and applies correctly |
 
 The `e2e_set_times` test confirms the SetTimes FFI bridge is wired end-to-end
 (the old code silently returned 0 and never called `delta_add_set_times`).
+
+### `symlink_utils::tests` — 6 unit tests
+
+All six build a real VFS and exercise `BaselineIndex::build` and
+`replace_with_symlink` through the full FFI bridge.
+
+| Test | Verifies |
+|---|---|
+| `baseline_index_classifies_kinds_correctly` | `is_dir` / `is_file` return the correct kind for dirs and files enumerated from the VFS |
+| `baseline_index_children_populated` | `children_of("/etc")` contains `/etc/passwd` and `/etc/group`; `children_of("/proc")` is empty |
+| `replace_with_symlink_file_emits_delete_then_create` | file path → `[DeleteFile, CreateSymlink]` with correct path and target fields |
+| `replace_with_symlink_empty_dir_emits_rmdir_then_create` | empty dir → `[Rmdir, CreateSymlink]` |
+| `replace_with_symlink_nonempty_dir_deletes_children_first` | non-empty dir → child deletions + `Rmdir` + `CreateSymlink` in postorder |
+| `replace_with_symlink_unknown_path_just_creates` | path not in baseline → `[CreateSymlink]` only |
+
+### `symlink_mutators::tests` — 6 unit tests
+
+| Test | Verifies |
+|---|---|
+| `mount_dest_mutator_appends_ops` | ops grow; last op is `CreateSymlink` at one of `MOUNT_DESTINATIONS` |
+| `exec_mutator_targets_synthetic_exec_path` | `CreateSymlink` produced at a path from `EXEC_PATHS` with target from `EXEC_SYMLINK_TARGETS` |
+| `loop_mutator_creates_symlinks` | all produced ops are `CreateSymlink` |
+| `escape_mutator_produces_symlink` | at least one `CreateSymlink` op added within 50 tries |
+| `parent_component_mutator_appends_ops` | ops grow; a `CreateSymlink` op is present |
+| `mutators_skip_at_max_ops` | all six mutators return `Skipped` when `ops.len() == MAX_OPS` |
 
 ---
 

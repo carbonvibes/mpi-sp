@@ -14,7 +14,8 @@
 Key distinction:
 
 ```text
-FsOp       = one filesystem operation
+FsOp       = one filesystem operation  (8 kinds: CreateFile, UpdateFile, DeleteFile,
+              Mkdir, Rmdir, SetTimes, Truncate, CreateSymlink)
 FsDelta    = array/list of FsOp values
 Corpus     = array/list of FsDelta values
 Path sets  = arrays of path strings, not corpus entries
@@ -68,19 +69,21 @@ One unit of mutation intent:
 
 ```c
 typedef struct {
-    fs_op_kind_t     kind;         /* which of the 7 ops (enum value 1–7) */
+    fs_op_kind_t     kind;         /* which of the 8 ops (enum value 1–8) */
     char            *path;         /* absolute path, heap-allocated, NUL-terminated */
     uint8_t         *content;      /* CREATE_FILE, UPDATE_FILE: heap-allocated bytes */
-                                   /* NULL for all other kinds */
+                                   /* SYMLINK: heap-allocated target string (NUL-terminated) */
+                                   /* NULL for RMDIR, MKDIR, DELETE_FILE, SET_TIMES */
     size_t           content_len;  /* CREATE_FILE / UPDATE_FILE: byte count of content */
                                    /* TRUNCATE: new file size (no content bytes written) */
+                                   /* SYMLINK: byte length of the target string */
                                    /* all others: 0 */
     struct timespec  mtime;        /* SET_TIMES: desired mtime; zero for others */
     struct timespec  atime;        /* SET_TIMES: desired atime; zero for others */
 } fs_op_t;
 ```
 
-The `content_len` field is dual-purpose by design: for CREATE/UPDATE it is the number of bytes in the content buffer; for TRUNCATE it is the target file size with no bytes in the buffer. This keeps the struct small — no extra `new_size` field needed.
+The `content_len` field is triple-purpose by design: for CREATE/UPDATE it is the number of bytes in the content buffer; for TRUNCATE it is the target file size with no bytes in the buffer; for SYMLINK it is the byte length of the target string (stored in `content`, NUL-terminated by `strndup` before the VFS call). This keeps the struct small — no extra `new_size` or `target` field needed.
 
 The 7 op kinds:
 
@@ -93,6 +96,7 @@ typedef enum {
     FS_OP_RMDIR       = 5,
     FS_OP_SET_TIMES   = 6,
     FS_OP_TRUNCATE    = 7,
+    FS_OP_SYMLINK     = 8,
 } fs_op_kind_t;
 ```
 
@@ -120,6 +124,7 @@ delta_add_mkdir(d, "/var/run/app");
 delta_add_rmdir(d, "/tmp/old");
 delta_add_set_times(d, "/var/log/app.log", &mtime, &atime);
 delta_add_truncate(d, "/var/log/app.log", 0);  /* truncate to empty */
+delta_add_symlink(d, "/proc", "../../proc");    /* create symlink */
 ```
 
 Each constructor deep-copies the path and content so the caller can free its own buffers immediately.

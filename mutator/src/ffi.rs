@@ -69,6 +69,11 @@ extern "C" {
         atime: *const timespec,
     ) -> c_int;
     pub fn delta_add_truncate(d: *mut FsDeltaC, path: *const i8, new_size: usize) -> c_int;
+    pub fn delta_add_symlink(
+        d: *mut FsDeltaC,
+        path: *const i8,
+        target: *const i8,
+    ) -> c_int;
 
     pub fn cp_apply_delta(vfs: *mut VfsT, d: *const FsDeltaC, dry_run: c_int) -> *mut CpResultT;
     pub fn cp_result_free(r: *mut CpResultT);
@@ -121,6 +126,13 @@ fn validate_delta(delta: &FsDelta) {
                 op.path
             );
         }
+        if matches!(op.kind, FsOpKind::CreateSymlink) {
+            debug_assert!(
+                !op.target.is_empty(),
+                "CreateSymlink op has empty target for path {}",
+                op.path
+            );
+        }
     }
 }
 
@@ -169,6 +181,16 @@ pub fn apply_delta(vfs: *mut VfsT, delta: &FsDelta) -> Result<DeltaResult, i32> 
                         tv_nsec: op.atime_nsec as libc::c_long,
                     };
                     delta_add_set_times(c_delta, path.as_ptr(), &mtime, &atime)
+                }
+                FsOpKind::CreateSymlink => {
+                    let symlink_target = match CString::new(op.target.as_str()) {
+                        Ok(t) => t,
+                        Err(_) => {
+                            delta_free(c_delta);
+                            return Err(-libc::EINVAL);
+                        }
+                    };
+                    delta_add_symlink(c_delta, path.as_ptr(), symlink_target.as_ptr())
                 }
             }
         };
@@ -225,6 +247,10 @@ pub fn enumerate_vfs_dir_paths(vfs: *mut VfsT) -> Vec<String> {
 
 pub fn enumerate_vfs_all_paths(vfs: *mut VfsT) -> Vec<String> {
     collect_paths(vfs, 0)
+}
+
+pub fn enumerate_vfs_symlink_paths(vfs: *mut VfsT) -> Vec<String> {
+    collect_paths(vfs, 3)
 }
 
 #[cfg(test)]
@@ -308,6 +334,59 @@ mod tests {
             1,
             "should have exactly 1 op result"
         );
+        unsafe { vfs_destroy(vfs) };
+    }
+
+    #[test]
+    fn e2e_create_symlink_succeeds_and_is_enumerated() {
+        let vfs = unsafe { make_baseline_vfs() };
+        let delta = FsDelta::new(vec![FsOp::create_symlink("/mylink", "../../proc/self/exe")]);
+        let dr = apply_delta(vfs, &delta).expect("apply_delta returned Err");
+        assert_eq!(dr.succeeded, 1, "create_symlink should succeed");
+        assert_eq!(dr.failed, 0);
+
+        let symlinks = enumerate_vfs_symlink_paths(vfs);
+        assert!(
+            symlinks.contains(&"/mylink".to_string()),
+            "symlink path should appear in enumerate_vfs_symlink_paths"
+        );
+        unsafe { vfs_destroy(vfs) };
+    }
+
+    #[test]
+    fn e2e_symlink_roundtrip_serialization() {
+        use crate::delta::FsDelta;
+        let original = FsDelta::new(vec![FsOp::create_symlink("/link", "/proc/self/exe")]);
+        let json = serde_json::to_string(&original).expect("serialization failed");
+        let restored: FsDelta = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(restored.ops.len(), 1);
+        let op = &restored.ops[0];
+        assert_eq!(op.kind, crate::delta::FsOpKind::CreateSymlink);
+        assert_eq!(op.path, "/link");
+        assert_eq!(op.target, "/proc/self/exe");
+    }
+
+    #[test]
+    fn e2e_symlink_loop_does_not_hang() {
+        let vfs = unsafe { make_baseline_vfs() };
+        // Self-loop: apply must not hang; VFS should reject or record it
+        let delta = FsDelta::new(vec![FsOp::create_symlink("/loop", "/loop")]);
+        let dr = apply_delta(vfs, &delta).expect("apply_delta returned Err");
+        assert_eq!(
+            dr.succeeded + dr.failed,
+            1,
+            "loop symlink should produce exactly 1 op result"
+        );
+        unsafe { vfs_destroy(vfs) };
+    }
+
+    #[test]
+    fn e2e_create_symlink_with_absolute_target() {
+        let vfs = unsafe { make_baseline_vfs() };
+        let delta = FsDelta::new(vec![FsOp::create_symlink("/abs_link", "/proc/self/fd")]);
+        let dr = apply_delta(vfs, &delta).expect("apply_delta returned Err");
+        assert_eq!(dr.succeeded, 1, "absolute-target symlink should succeed");
+        assert_eq!(dr.failed, 0);
         unsafe { vfs_destroy(vfs) };
     }
 }

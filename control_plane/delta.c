@@ -158,6 +158,18 @@ int delta_add_truncate(fs_delta_t *d, const char *path, size_t new_size)
     return delta_add_op(d, &op);
 }
 
+int delta_add_symlink(fs_delta_t *d, const char *path, const char *target)
+{
+    size_t target_len = target ? strlen(target) : 0;
+    fs_op_t op = {
+        .kind        = FS_OP_SYMLINK,
+        .path        = (char *)path,
+        .content     = (uint8_t *)target,
+        .content_len = target_len,
+    };
+    return delta_add_op(d, &op);
+}
+
 uint8_t *delta_serialize(const fs_delta_t *d, size_t *out_len)
 {
     *out_len = 0;
@@ -170,7 +182,8 @@ uint8_t *delta_serialize(const fs_delta_t *d, size_t *out_len)
         if (path_len > 0xFFFFu) return NULL;
 
         size_t data_len = (op->kind == FS_OP_CREATE_FILE ||
-                           op->kind == FS_OP_UPDATE_FILE)
+                           op->kind == FS_OP_UPDATE_FILE ||
+                           op->kind == FS_OP_SYMLINK)
                           ? op->content_len : 0;
 
         total += DELTA_OP_FIXED + path_len + data_len;
@@ -191,7 +204,8 @@ uint8_t *delta_serialize(const fs_delta_t *d, size_t *out_len)
         uint32_t size_field = (uint32_t)op->content_len;
 
         size_t data_len = (op->kind == FS_OP_CREATE_FILE ||
-                           op->kind == FS_OP_UPDATE_FILE)
+                           op->kind == FS_OP_UPDATE_FILE ||
+                           op->kind == FS_OP_SYMLINK)
                           ? op->content_len : 0;
 
         buf[pos++] = (uint8_t)op->kind;
@@ -292,7 +306,8 @@ fs_delta_t *delta_deserialize(const uint8_t *buf, size_t len, int *err_out)
         fs_op_kind_t kind = (fs_op_kind_t)kind_raw;
         if (kind == FS_OP_TRUNCATE)
             content_len = (size_t)size_field;
-        else if (kind == FS_OP_CREATE_FILE || kind == FS_OP_UPDATE_FILE)
+        else if (kind == FS_OP_CREATE_FILE || kind == FS_OP_UPDATE_FILE ||
+                 kind == FS_OP_SYMLINK)
             content_len = (size_t)data_len;
         else
             content_len = 0;
@@ -345,6 +360,7 @@ const char *op_kind_name(fs_op_kind_t kind)
         case FS_OP_RMDIR:       return "RMDIR";
         case FS_OP_SET_TIMES:   return "SET_TIMES";
         case FS_OP_TRUNCATE:    return "TRUNCATE";
+        case FS_OP_SYMLINK:     return "SYMLINK";
         default:                return "UNKNOWN";
     }
 }
@@ -364,6 +380,10 @@ void delta_dump(const fs_delta_t *d)
                 break;
             case FS_OP_TRUNCATE:
                 printf("  -> %zu bytes", op->content_len);
+                break;
+            case FS_OP_SYMLINK:
+                if (op->content && op->content_len > 0)
+                    printf("  -> %.*s", (int)op->content_len, (char *)op->content);
                 break;
             case FS_OP_SET_TIMES:
                 printf("  mtime=%ld.%09ld  atime=%ld.%09ld",

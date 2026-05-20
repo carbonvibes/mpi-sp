@@ -24,11 +24,6 @@ path = "src/bin/fuzz_foobar.rs"
 name = "fuzz_foobar_cmplog"
 path = "src/bin/fuzz_foobar_cmplog.rs"
 
-# LibAFL harness — dedicated runc/crun OCI runtime campaign.
-[[bin]]
-name = "fuzz_runc"
-path = "src/bin/fuzz_runc.rs"
-
 # LibAFL harness — foobar + libarchive + runc campaigns.
 # Usage:
 #   cargo run --bin fuzz_libafl -- foobar        (default demo)

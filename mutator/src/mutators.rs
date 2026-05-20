@@ -419,7 +419,7 @@ where
 
             // Creation ops: synthetic/random paths are the point.
             // Guidance block left intact for future FUSE-log integration.
-            FsOpKind::CreateFile | FsOpKind::Mkdir => {
+            FsOpKind::CreateFile | FsOpKind::Mkdir | FsOpKind::CreateSymlink => {
                 let have_swap_target = self.guidance.has_enoent()
                     || self.guidance.has_write()
                     || self.guidance.has_recreate()

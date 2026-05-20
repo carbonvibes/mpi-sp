@@ -11,6 +11,7 @@ pub enum FsOpKind {
     Rmdir,
     SetTimes,
     Truncate,
+    CreateSymlink,
 }
 
 #[derive(Clone, Debug, Hash, Serialize, Deserialize)]
@@ -22,6 +23,9 @@ pub struct FsOp {
     pub content: Vec<u8>,
     /// Semantic size: content length for file ops, new size for Truncate, 0 otherwise.
     pub size: usize,
+    /// Symlink target for CreateSymlink ops. Separate from content to keep JSON readable.
+    #[serde(default)]
+    pub target: String,
     pub mtime_sec: i64,
     pub mtime_nsec: i64,
     pub atime_sec: i64,
@@ -36,6 +40,7 @@ impl FsOp {
             path: path.into(),
             content,
             size,
+            target: String::new(),
             mtime_sec: 0,
             mtime_nsec: 0,
             atime_sec: 0,
@@ -50,6 +55,7 @@ impl FsOp {
             path: path.into(),
             content,
             size,
+            target: String::new(),
             mtime_sec: 0,
             mtime_nsec: 0,
             atime_sec: 0,
@@ -63,6 +69,7 @@ impl FsOp {
             path: path.into(),
             content: vec![],
             size: 0,
+            target: String::new(),
             mtime_sec: 0,
             mtime_nsec: 0,
             atime_sec: 0,
@@ -76,6 +83,7 @@ impl FsOp {
             path: path.into(),
             content: vec![],
             size: 0,
+            target: String::new(),
             mtime_sec: 0,
             mtime_nsec: 0,
             atime_sec: 0,
@@ -89,6 +97,7 @@ impl FsOp {
             path: path.into(),
             content: vec![],
             size: 0,
+            target: String::new(),
             mtime_sec: 0,
             mtime_nsec: 0,
             atime_sec: 0,
@@ -102,6 +111,7 @@ impl FsOp {
             path: path.into(),
             content: vec![],
             size: new_size,
+            target: String::new(),
             mtime_sec: 0,
             mtime_nsec: 0,
             atime_sec: 0,
@@ -121,10 +131,25 @@ impl FsOp {
             path: path.into(),
             content: vec![],
             size: 0,
+            target: String::new(),
             mtime_sec,
             mtime_nsec,
             atime_sec,
             atime_nsec,
+        }
+    }
+
+    pub fn create_symlink(path: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            kind: FsOpKind::CreateSymlink,
+            path: path.into(),
+            content: vec![],
+            size: 0,
+            target: target.into(),
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
         }
     }
 }
