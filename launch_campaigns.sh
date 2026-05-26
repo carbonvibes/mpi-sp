@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 FUZZER=/nix/store/2hpav3yiv5fffrs9g3mf0lx21y7dxk41-crun-fuzzer-0.0.1
-CRUN=/nix/store/bamjhvk6vc4w6f0gpiyyvdyxx825i7l0-crun-harness-1.23.1/bin/crun
+CRUN=/nix/store/arwkshyi5pj6f4j6a6nrvrf89irhgdp4-crun-harness-1.23.1/bin/crun
 COMBINED_BIN=/home/arjun/mpi-sp/mutator/target/release/fuzz_combined_afl
 GRAMMAR=/nix/store/2hpav3yiv5fffrs9g3mf0lx21y7dxk41-crun-fuzzer-0.0.1/share/grammar.py
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

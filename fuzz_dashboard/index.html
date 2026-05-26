@@ -578,13 +578,14 @@ function fmtExecSec(n) {
 // ── Corpus detail renderer ─────────────────────────────────────────────────
 
 const OP_STYLE = {
-  UpdateFile: { bg:'#0c2d1f', color:'#00ff88', border:'#1a5c3a', label:'UPD' },
-  CreateFile: { bg:'#1a2d40', color:'#58a6ff', border:'#1e4976', label:'NEW' },
-  DeleteFile: { bg:'#2d1a1a', color:'#ff4d4d', border:'#5c1e1e', label:'DEL' },
-  Mkdir:      { bg:'#2d2a1a', color:'#ffa500', border:'#5c521e', label:'DIR' },
-  Rmdir:      { bg:'#2a1a2d', color:'#c084fc', border:'#5c1e5c', label:'RMD' },
-  Truncate:   { bg:'#1a2a2d', color:'#67e8f9', border:'#1e5c6b', label:'TRC' },
-  SetTimes:   { bg:'#2d2d1a', color:'#d4d47a', border:'#5c5c1e', label:'TMS' },
+  UpdateFile:    { bg:'#0c2d1f', color:'#00ff88', border:'#1a5c3a', label:'UPD' },
+  CreateFile:    { bg:'#1a2d40', color:'#58a6ff', border:'#1e4976', label:'NEW' },
+  DeleteFile:    { bg:'#2d1a1a', color:'#ff4d4d', border:'#5c1e1e', label:'DEL' },
+  Mkdir:         { bg:'#2d2a1a', color:'#ffa500', border:'#5c521e', label:'DIR' },
+  Rmdir:         { bg:'#2a1a2d', color:'#c084fc', border:'#5c1e5c', label:'RMD' },
+  Truncate:      { bg:'#1a2a2d', color:'#67e8f9', border:'#1e5c6b', label:'TRC' },
+  SetTimes:      { bg:'#2d2d1a', color:'#d4d47a', border:'#5c5c1e', label:'TMS' },
+  CreateSymlink: { bg:'#1a2d2a', color:'#2dd4bf', border:'#1e5c52', label:'SYM' },
 };
 
 function escHtml(s) {
@@ -622,6 +623,8 @@ function renderOp(op) {
     extra = `<span class="op-meta">new_size = ${op.size}</span>`;
   } else if (op.kind === 'SetTimes') {
     extra = `<span class="op-meta">mtime=${op.mtime_sec}  atime=${op.atime_sec}</span>`;
+  } else if (op.kind === 'CreateSymlink') {
+    extra = `<span class="op-meta">→ ${escHtml(op.target || '')}</span>`;
   }
 
   return `<div class="op-row">${badge}${path}${extra}</div>`;

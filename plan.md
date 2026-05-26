@@ -105,10 +105,10 @@ for rootfs, running together in one fuzzer.
 > **All three campaigns use the exact same Nix-built crun binary from SemanticSanitizer.**
 
 ```
-/nix/store/bamjhvk6vc4w6f0gpiyyvdyxx825i7l0-crun-harness-1.23.1/bin/crun
+/nix/store/arwkshyi5pj6f4j6a6nrvrf89irhgdp4-crun-harness-1.23.1/bin/crun
 ```
 
-This is crun 1.23.1 patched with `0001-crun-add-harness.patch` (6th rebuild — all bugs fixed),
+This is crun 1.23.1 patched with `0001-crun-add-harness.patch` (7th rebuild — all bugs fixed),
 compiled with `afl-clang-lto` via Nix. Using the same binary across all campaigns guarantees:
 - Identical instrumentation
 - Identical total edge count: **11072 edges** for all three campaigns
@@ -161,7 +161,7 @@ cp /home/arjun/mpi-sp/SemanticSanitizer/case-studies/oci/corpus \
 ```bash
 cd /tmp/campaign1   # fuzzer_stats and plot_data are written relative to CWD
 
-CRUN=/nix/store/wgwpvlvpw94s1k7ir5rkw01v56454mpy-crun-harness-1.23.1/bin/crun
+CRUN=/nix/store/arwkshyi5pj6f4j6a6nrvrf89irhgdp4-crun-harness-1.23.1/bin/crun
 FUZZER=/nix/store/2hpav3yiv5fffrs9g3mf0lx21y7dxk41-crun-fuzzer-0.0.1
 
 sudo unshare -m $FUZZER/bin/forkserver_simple \
@@ -294,7 +294,7 @@ mkdir -p /tmp/campaign2/corpus /tmp/campaign2/crashes
 ```bash
 cd /tmp/campaign2
 
-CRUN=/nix/store/wgwpvlvpw94s1k7ir5rkw01v56454mpy-crun-harness-1.23.1/bin/crun
+CRUN=/nix/store/arwkshyi5pj6f4j6a6nrvrf89irhgdp4-crun-harness-1.23.1/bin/crun
 
 sudo unshare -m /home/arjun/mpi-sp/mutator/target/release/fuzz_rootfs_afl \
   $CRUN \
@@ -341,12 +341,14 @@ python3 /home/arjun/mpi-sp/fuzz_dashboard/server.py /tmp/campaign2_fuzz.log camp
 - [x] **Crash detection gap found and fixed** (libcrun returns 128+N for signal-killed containers; harness checked `ret < 0` only, so SIGSEGV=139 was silently treated as success → 0 crashes saved despite dmesg segfaults; fix: `if (ret > 128) raise(ret - 128)` re-raises the signal so AFL records it as a crash)
 - [x] 5th rebuild at `/nix/store/wwqb1dxkz92d7i94r1wy964wmpgr93vx-crun-harness-1.23.1/bin/crun` (11072 edges)
 - [x] **Pre-sync crash detection gap fixed** (container child killed by signal before sync handshake produced ret < 0, swallowed as normal error; fix: check `err->status == 0 && strstr(err->msg, "read from the init process")` — the specific libcrun error for "child died without sending a message" — then raise SIGSEGV so AFL records it)
-- [x] 6th rebuild at `/nix/store/bamjhvk6vc4w6f0gpiyyvdyxx825i7l0-crun-harness-1.23.1/bin/crun` (11072 edges — **use this**)
+- [x] 6th rebuild at `/nix/store/bamjhvk6vc4w6f0gpiyyvdyxx825i7l0-crun-harness-1.23.1/bin/crun` (11072 edges)
+- [x] **Narrow crash detection broadened** (`child_crashed` strstr only matched one of four libcrun sync-channel error paths; crashes on "read from sync socket", "read from sync pipe", "read from the exec fifo" were silently swallowed; fix: explicit list covering all four paths) + **Rust-side forkserver crash handler** (fuzz_combined_afl panicked on "Unable to communicate with fork server"; now catches it, saves the base corpus entry to crashes/ as a crash proxy, then exits with code 1 instead of panicking so a supervisor can restart)
+- [x] 7th rebuild at `/nix/store/arwkshyi5pj6f4j6a6nrvrf89irhgdp4-crun-harness-1.23.1/bin/crun` (11072 edges — **use this**)
 - [x] Campaign 1 fuzzer available at `/nix/store/2hpav3yiv5fffrs9g3mf0lx21y7dxk41-crun-fuzzer-0.0.1/bin/forkserver_simple`
 - [x] Dashboard: Comparison tab with 3-campaign charts → `fuzz_dashboard/`
 - [x] Write `mutator/src/bin/fuzz_rootfs_afl.rs` (Campaign 2 fuzzer) — compiles clean, logic verified
 - [x] **Run Campaign 1** (~17h) — plot_data saved at `/tmp/semsan_plot_data` (3095 rows, 732k execs, 1426/11200 edges, 12.7% coverage) — ran with OLD buggy binary
-- [ ] **Re-run Campaign 1** (24h) with fixed binary — `CRUN=/nix/store/wgwpvlvpw94s1k7ir5rkw01v56454mpy-crun-harness-1.23.1/bin/crun`
+- [ ] **Re-run Campaign 1** (24h) with fixed binary — `CRUN=/nix/store/arwkshyi5pj6f4j6a6nrvrf89irhgdp4-crun-harness-1.23.1/bin/crun`
 - [ ] **Run Campaign 2** (24h) with fixed binary
 - [ ] Write `mutator/src/bin/fuzz_combined_afl.rs` (Campaign 3 fuzzer)
 - [ ] Run Campaign 3 (24h)
@@ -506,6 +508,38 @@ if (ret > 128)
 
 ---
 
+---
+
+#### Bug 13 — Narrow `child_crashed` filter missed three of four libcrun sync-channel error paths
+
+**Discovered:** 2026-05-22
+**Symptom:** `dmesg` showed repeated crun segfaults at a fixed `libc.so.6` offset while `objectives: 0` persisted across all instances. The `child_crashed` check (Bug 12 fix) was firing for the "read from the init process" path but silently swallowing crashes that went through the other three libcrun sync-channel paths.
+
+**Root cause:** libcrun has four distinct places where it reads from the container init's sync socket/pipe/fifo and returns an error on EOF (meaning the child died by signal):
+
+- `"read from sync socket"` — `linux.c` (3 occurrences)
+- `"read from sync pipe"` — `container.c`
+- `"read from the exec fifo"` — `container.c`
+- `"read from the init process"` — `container.c` (the only one the harness checked)
+
+A crash at any of the first three produced `err->status == 0` but a non-matching message, so `child_crashed = 0` and the harness called `continue`. AFL saw a clean exit — nothing saved.
+
+**Unrelated "read from" errors** (`"read from `/proc/sys/…`"`, `"read from `cpuset.cpus`"`) have `errno != 0` (`err->status != 0`), so `status == 0` already filters them. A plain `strstr(err->msg, "read from")` would also be safe in practice, but the explicit list is preferred to avoid surprising future false-positives if libcrun adds new read paths.
+
+**Fix:** Replace the single `strstr` with an explicit OR over all four sync-channel strings:
+
+```c
+int child_crashed = (err && err->status == 0 && err->msg
+                     && (strstr (err->msg, "read from sync socket")
+                         || strstr (err->msg, "read from sync pipe")
+                         || strstr (err->msg, "read from the exec fifo")
+                         || strstr (err->msg, "read from the init process")));
+```
+
+**Rust-side companion fix:** `fuzz_combined_afl` previously panicked when `fuzz_one` returned "Unable to communicate with fork server" (the forkserver/crun parent process died, not just a test child). The panic discarded all context. Now the error is caught, the base corpus entry being mutated at the time is serialized to `crashes/forkserver_crash_<id>` as the closest available proxy for the triggering input, and the process exits with code 1 so a supervisor can restart it.
+
+---
+
 ### Changes made to the patch
 
 | What | Before | After |
@@ -520,6 +554,7 @@ if (ret > 128)
 | `__AFL_LOOP(10000)` | 10,000 runs of same config per fork | `__AFL_LOOP(1)` — 1 run per fork, 10,000× more unique configs explored |
 | Memory limit clamping | absent — grammar `[0-9]+` could generate 1-byte limits, OOM-killing crun inside its own cgroup | **added** — clamp to 128 MiB minimum after `libcrun_container_load_from_file` |
 | Crash detection | `if (ret < 0)` only — `libcrun_container_run` returns `128+N` for signal N; SIGSEGV=139 passed silently as "success" → 0 crashes saved | **`if (ret > 128) raise(ret - 128)`** — re-raises container-kill signal so AFL forkserver sees WIFSIGNALED → ExitKind::Crash → saved |
+| Pre-sync crash detection | `strstr(err->msg, "read from the init process")` only — 3 other libcrun sync-channel paths ("read from sync socket", "read from sync pipe", "read from the exec fifo") were silently swallowed | **Explicit 4-string list** covering all libcrun paths where `status==0` means signal kill |
 
 ### Edge count change: 11200 → 11072
 
@@ -538,7 +573,8 @@ binary (all of `crun.c` + libcrun). Removing `libcrun_container_create` and
 3rd (bug 8):        /nix/store/wgwpvlvpw94s1k7ir5rkw01v56454mpy-crun-harness-1.23.1/bin/crun  (11072 edges)
 4th (bug 10 fixed): /nix/store/xdripc6yb5zpn19rn72yc7vgmddrj2ws-crun-harness-1.23.1/bin/crun  (11072 edges)
 5th (bug 11 fixed): /nix/store/wwqb1dxkz92d7i94r1wy964wmpgr93vx-crun-harness-1.23.1/bin/crun  (11072 edges)
-6th (bug 12 fixed): /nix/store/bamjhvk6vc4w6f0gpiyyvdyxx825i7l0-crun-harness-1.23.1/bin/crun  (11072 edges) ← USE THIS
+6th (bug 12 fixed): /nix/store/bamjhvk6vc4w6f0gpiyyvdyxx825i7l0-crun-harness-1.23.1/bin/crun  (11072 edges)
+7th (bug 13 fixed): /nix/store/arwkshyi5pj6f4j6a6nrvrf89irhgdp4-crun-harness-1.23.1/bin/crun  (11072 edges) ← USE THIS
 ```
 
 Rebuild command (from `SemanticSanitizer/` — use `path:` prefix to avoid needing a git commit):
@@ -556,3 +592,7 @@ After 2nd rebuild (bugs 1-7), one Campaign 1 instance at 130.9 exec/sec for 98s:
 After 3rd rebuild (bug 8), exec/sec should hold stable at ~130-158 rather than dropping
 linearly over time. Mount count in `/proc/<pid>/mountinfo` should stay near baseline (~30)
 instead of climbing to thousands.
+
+saved_crashes is initialized to 0 on line 828 and is never incremented anywhere in the file. There's no saved_crashes += 1 anywhere. It's a LibAFL 0.15.4 bug — the counter field exists in the struct but the update code is missing. The stat is permanently hardcoded to 0.
+
+The last_crash and execs_since_crash fields are only updated inside #[cfg(feature = "track_hit_feedbacks")] blocks — meaning they require a non-default feature flag that almost certainly isn't enabled. So last_crash stays at start_time (the initialized value) and execs_since_crash stays at execs_done.

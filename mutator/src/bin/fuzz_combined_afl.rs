@@ -24,7 +24,7 @@ use libafl::{
     corpus::{Corpus, CorpusId, OnDiskCorpus, Testcase},
     events::{ProgressReporter, SimpleEventManager},
     executors::{HasObservers, StdChildArgs, forkserver::ForkserverExecutor},
-    feedback_and_fast, feedback_or,
+    feedback_or,
     feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback,
                 NautilusChunksMetadata},
     fuzzer::{Evaluator, Fuzzer},
@@ -38,7 +38,7 @@ use libafl::{
     observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver},
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
     stages::{AflStatsStage, StdMutationalStage},
-    state::{HasCorpus, StdState},
+    state::{HasCorpus, HasSolutions, StdState},
     Error,
 };
 use libafl::nautilus::grammartec::tree::TreeLike;
@@ -190,11 +190,12 @@ where
 //  5. Return placeholder [0u8] — crun reads from argv[1], not stdin
 
 struct CombinedConverter {
-    context:      &'static NautilusContext,
-    vfs:          *mut VfsT,
-    config_path:  PathBuf,
-    fuse_rootfs:  String,
-    fallback_cfg: Vec<u8>,
+    context:         &'static NautilusContext,
+    vfs:             *mut VfsT,
+    config_path:     PathBuf,
+    fuse_rootfs:     String,
+    fallback_cfg:    Vec<u8>,
+    last_input_path: PathBuf,
 }
 
 unsafe impl Send for CombinedConverter {}
@@ -214,8 +215,16 @@ impl ToTargetBytes<CombinedInput> for CombinedConverter {
         let cfg = override_rootfs_path(&*raw, &self.fuse_rootfs)
             .unwrap_or_else(|| self.fallback_cfg.clone());
 
-        // 4. Write to disk
+        // 4. Write config to disk
         let _ = std::fs::write(&self.config_path, &cfg);
+
+        // 4b. Persist the full mutated input so it survives a forkserver death.
+        //     Written every iteration — when crun crashes or goes D-state, this
+        //     file holds the exact input that was about to be executed, not the
+        //     pre-mutation base corpus entry.
+        if let Ok(json) = serde_json::to_string_pretty(&input.rootfs) {
+            let _ = std::fs::write(&self.last_input_path, json);
+        }
 
         // 5. Placeholder — crun reads config from argv[1]
         OwnedSlice::from(vec![0u8])
@@ -635,10 +644,11 @@ fn main() {
 
     let cwd = std::env::current_dir()
         .expect("cannot determine CWD — run from /tmp/campaign3/");
-    let corpus_dir    = cwd.join("corpus");
-    let solutions_dir = cwd.join("crashes");
-    let mountpoint    = format!("/tmp/campaign3-fuse-{pid}");
-    let config_path   = cwd.join("config.json");
+    let corpus_dir      = cwd.join("corpus");
+    let solutions_dir   = cwd.join("crashes");
+    let mountpoint      = format!("/tmp/campaign3-fuse-{pid}");
+    let config_path     = cwd.join("config.json");
+    let last_input_path = cwd.join("last_input.json");
 
     for d in &[&corpus_dir, &solutions_dir] {
         std::fs::create_dir_all(d).unwrap_or_else(|e| {
@@ -711,10 +721,7 @@ fn main() {
         MaxMapFeedback::new(&edges_observer),
         TimeFeedback::new(&time_observer),
     );
-    let mut objective = feedback_and_fast!(
-        CrashFeedback::new(),
-        MaxMapFeedback::with_name("mapfeedback_metadata_objective", &edges_observer),
-    );
+    let mut objective = CrashFeedback::new();
 
     let mut state = StdState::new(
         StdRand::with_seed(current_nanos()),
@@ -747,9 +754,10 @@ fn main() {
     let converter = CombinedConverter {
         context,
         vfs,
-        config_path:  config_path.clone(),
-        fuse_rootfs:  mountpoint.clone(),
-        fallback_cfg: fallback_cfg.clone(),
+        config_path:     config_path.clone(),
+        fuse_rootfs:     mountpoint.clone(),
+        fallback_cfg:    fallback_cfg.clone(),
+        last_input_path: last_input_path.clone(),
     };
 
     // ── Fuzzer ────────────────────────────────────────────────────────────────
@@ -930,6 +938,7 @@ fn main() {
     println!("  stats   → fuzzer_stats, plot_data\n");
 
     // ── Fuzzing loop ──────────────────────────────────────────────────────────
+    let mut solutions_before = state.solutions().count();
     loop {
         let before = state.corpus().count();
 
@@ -939,6 +948,16 @@ fn main() {
 
         mgr.maybe_report_progress(&mut state, Duration::from_secs(2))
             .expect("progress report failed");
+
+        // Write JSON sidecars for any new crash entries so they are human-readable.
+        let solutions_after = state.solutions().count();
+        for idx in solutions_before..solutions_after {
+            let cid = CorpusId::from(idx);
+            if let Ok(input) = state.solutions().cloned_input_for_id(cid) {
+                write_corpus_sidecar(&solutions_dir, idx, &input, context);
+            }
+        }
+        solutions_before = solutions_after;
 
         // Sync newly discovered corpus entries into LiveCorpus (for SpliceDelta)
         // and NautilusChunksMetadata (for NautilusSpliceMutator).
