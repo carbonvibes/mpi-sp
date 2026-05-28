@@ -305,16 +305,27 @@ fn make_fallback_config(rootfs_path: &str) -> Vec<u8> {
 // ── VFS baseline ──────────────────────────────────────────────────────────────
 
 unsafe fn init_vfs(vfs: *mut VfsT, bin_true: &[u8]) {
-    for dir in &[c"/bin", c"/proc", c"/dev", c"/sys", c"/tmp", c"/etc", c"/var", c"/run"] {
+    for dir in &[
+        c"/bin", c"/proc", c"/dev", c"/sys", c"/tmp", c"/etc", c"/var", c"/run",
+        // dirs for grammar CWD_VAL entries and process paths
+        c"/usr", c"/usr/bin", c"/app", c"/home", c"/home/user",
+    ] {
         vfs_mkdir(vfs, dir.as_ptr());
-    }
-    if !bin_true.is_empty() {
-        vfs_create_file(vfs, c"/bin/true".as_ptr(), bin_true.as_ptr(), bin_true.len());
     }
     macro_rules! mkfile {
         ($path:expr, $content:expr) => {
             vfs_create_file(vfs, $path.as_ptr(), $content.as_ptr(), $content.len())
         };
+    }
+    // All grammar ARGS_LIST binaries — each gets the same static exit(0) blob
+    // so find_executable succeeds for every grammar-generated process path.
+    // Grammar entries: /bin/sh, /bin/bash, ./app (cwd=/app → /app/app), /usr/bin/nginx
+    if !bin_true.is_empty() {
+        mkfile!(c"/bin/true",       bin_true);
+        mkfile!(c"/bin/sh",         bin_true);
+        mkfile!(c"/bin/bash",       bin_true);
+        mkfile!(c"/app/app",        bin_true); // for "args": ["./app"], "cwd": "/app"
+        mkfile!(c"/usr/bin/nginx",  bin_true);
     }
     mkfile!(c"/etc/passwd",
         b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/:/usr/sbin/nologin\n");
@@ -658,14 +669,14 @@ fn main() {
     }
     std::fs::create_dir_all(&mountpoint).expect("failed to create FUSE mountpoint");
 
-    let bin_true: Vec<u8> = std::fs::read("/bin/true")
-        .or_else(|_| std::fs::read("/usr/bin/true"))
-        .unwrap_or_default();
+    // Statically linked exit(0) binary — always available, no host dependency.
+    // Compiled with: gcc -static -nostartfiles -nostdlib -Os (raw exit syscall).
+    static BIN_TRUE: &[u8] = include_bytes!("../../static/true");
 
     // ── VFS + FUSE ────────────────────────────────────────────────────────────
     let vfs = unsafe { vfs_create() };
     assert!(!vfs.is_null(), "vfs_create() returned null");
-    unsafe { init_vfs(vfs, &bin_true) };
+    unsafe { init_vfs(vfs, BIN_TRUE) };
     unsafe { vfs_save_snapshot(vfs) };
 
     let baseline_file_paths = enumerate_vfs_file_paths(vfs);
@@ -675,9 +686,7 @@ fn main() {
     let baseline_contents: Vec<(String, Vec<u8>)> = {
         let mut c = vec![("/etc/passwd".to_string(),
                           b"root:x:0:0:root:/root:/bin/sh\n".to_vec())];
-        if !bin_true.is_empty() {
-            c.push(("/bin/true".to_string(), bin_true.clone()));
-        }
+        c.push(("/bin/true".to_string(), BIN_TRUE.to_vec()));
         c
     };
 
@@ -787,7 +796,7 @@ fn main() {
     }
 
     // ── LiveCorpus for SpliceDelta (updated after every fuzz_one) ─────────────
-    let mut r_seeds = rootfs_seeds(&bin_true);
+    let mut r_seeds = rootfs_seeds(BIN_TRUE);
     r_seeds.extend(crun_symlink_seeds(&baseline_index));
     let live_corpus: LiveCorpus = Rc::new(RefCell::new(r_seeds.clone()));
 

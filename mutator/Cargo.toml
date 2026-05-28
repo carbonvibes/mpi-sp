@@ -52,6 +52,13 @@ path = "src/bin/fuzz_rootfs_afl.rs"
 name = "fuzz_combined_afl"
 path = "src/bin/fuzz_combined_afl.rs"
 
+# Crash replay — runs a saved CombinedInput through the same FUSE VFS pipeline
+# the fuzzer uses, so replay is byte-for-byte identical to the original fuzz run.
+# Usage: sudo ./replay_crash <crash_file> [grammar.py] [harness]
+[[bin]]
+name = "replay_crash"
+path = "src/bin/replay_crash.rs"
+
 [dependencies]
 # nautilus_py is only in the git build of libafl, not the crates.io release.
 # Pin to the same commit as Campaign 1 (== 0.15.4 tag) to keep API stable.

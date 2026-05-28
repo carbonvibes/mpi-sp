@@ -24,7 +24,7 @@ static void vfs_stat_to_stat(const vfs_stat_t *vs, struct stat *st)
         st->st_nlink = 1;
         st->st_size  = (off_t)vs->size;
     } else {
-        st->st_mode  = S_IFREG | 0644;
+        st->st_mode  = S_IFREG | 0755;
         st->st_nlink = 1;
         st->st_size  = (off_t)vs->size;
     }
