@@ -27,8 +27,7 @@ pub struct BaselineIndex {
 }
 
 impl BaselineIndex {
-    /// Build the index from a live VFS pointer (call once, at startup).
-    /// Safety: `vfs` must be a valid, initialized VFS pointer.
+    /// Call once from startup; `vfs` must be a valid, initialized VFS pointer.
     pub fn build(vfs: *mut VfsT) -> Self {
         let all = enumerate_vfs_all_paths(vfs);
         let dirs = enumerate_vfs_dir_paths(vfs);
@@ -57,8 +56,7 @@ impl BaselineIndex {
             })
             .collect();
 
-        // Populate direct children for directories.
-        // A path is a direct child of parent if parent == dirname(path).
+        // A path is a direct child if parent == dirname(path).
         for i in 0..entries.len() {
             let path = entries[i].path.clone();
             let parent = parent_path(&path);
@@ -119,7 +117,7 @@ fn parent_path(path: &str) -> Option<String> {
 pub fn replace_with_symlink(path: &str, target: &str, index: &BaselineIndex) -> Vec<FsOp> {
     match index.get(path) {
         None => {
-            // Path not in baseline — just create symlink (may EEXIST but that's ok)
+            // Not in baseline — just create the symlink (may EEXIST but that's ok).
             vec![FsOp::create_symlink(path, target)]
         }
         Some(info) => match info.kind {
@@ -154,12 +152,10 @@ fn delete_tree_ops(dir: &str, index: &BaselineIndex, ops: &mut Vec<FsOp>) {
     ops.push(FsOp::rmdir(dir));
 }
 
-/// Convenience: build ops for a known-file path (avoids index lookup).
 pub fn replace_file_with_symlink(path: &str, target: &str) -> Vec<FsOp> {
     vec![FsOp::delete_file(path), FsOp::create_symlink(path, target)]
 }
 
-/// Convenience: build ops for a known-empty-dir path (avoids index lookup).
 pub fn replace_empty_dir_with_symlink(path: &str, target: &str) -> Vec<FsOp> {
     vec![FsOp::rmdir(path), FsOp::create_symlink(path, target)]
 }

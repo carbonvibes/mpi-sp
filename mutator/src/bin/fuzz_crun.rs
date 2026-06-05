@@ -1,23 +1,3 @@
-//! fuzz_crun — in-process crun fuzzer with real SanCov coverage.
-//!
-//! Unlike fuzz_runc (which spawns /usr/bin/crun as a subprocess), this binary
-//! links libcrun.a directly and calls fuzz_crun_run_container() in-process.
-//!
-//! Coverage:
-//!   libcrun.a is compiled with -fsanitize-coverage=trace-pc-guard,trace-cmp.
-//!   Every code path inside crun (JSON parsing via libocispec/yajl, OCI spec
-//!   validation, namespace setup, rootfs checks) updates EDGES_MAP in our
-//!   process — MaxMapFeedback sees real coverage and guides mutations.
-//!
-//! Throughput vs fuzz_runc:
-//!   No fork/exec overhead for crun itself; the container child still forks
-//!   (executing /bin/true), but that fork is cheap and non-blocking.
-//!   Expect 200–2000 exec/sec depending on host.
-//!   nothing 
-//! Usage:
-//!   cargo run --release --bin fuzz_crun 2>&1 | tee /tmp/crun_fuzz.log
-//!   cargo run --release --bin fuzz_crun -- --dry-run 20
-
 
 use std::{
     cell::RefCell,
@@ -62,11 +42,8 @@ use fs_mutator::{
 #[cfg(has_fuse3)]
 use fs_mutator::ffi::{fuse_vfs_lib_init, fuse_vfs_lib_is_mounted, fuse_vfs_lib_run};
 
-// ── libcrun FFI ───────────────────────────────────────────────────────────────
-// #[link] attributes here are PER-BINARY — they do not affect vfs_bench, fuzz,
-// or any other binary in the package.  build.rs only emits cargo:rustc-link-lib
-// for crun_harness.a (the thin wrapper, no SanCov); the SanCov-instrumented
-// static archives are linked exclusively through these attributes so that
+// #[link] attributes here are PER-BINARY — they don't affect other binaries in
+// the package. The SanCov-instrumented archives are linked exclusively here so
 // non-fuzzing binaries never see the SanCov symbol requirements.
 
 #[cfg_attr(has_libcrun, link(name = "crun", kind = "static"))]
@@ -93,8 +70,6 @@ extern "C" {
 
 static ITER: AtomicU64 = AtomicU64::new(0);
 
-// ── FUSE startup ──────────────────────────────────────────────────────────────
-
 #[cfg(has_fuse3)]
 fn start_fuse(vfs: *mut VfsT, mountpoint: &str) {
     unsafe { fuse_vfs_lib_init(vfs) };
@@ -120,8 +95,6 @@ fn start_fuse(_vfs: *mut VfsT, _mountpoint: &str) {
     eprintln!("ERROR: libfuse3-dev not found at build time.");
     std::process::exit(1);
 }
-
-// ── VFS baseline ──────────────────────────────────────────────────────────────
 
 unsafe fn init_vfs(vfs: *mut VfsT, config_bytes: &[u8], bin_true: &[u8]) {
     vfs_create_file(
@@ -171,8 +144,6 @@ unsafe fn init_vfs(vfs: *mut VfsT, config_bytes: &[u8], bin_true: &[u8]) {
     mkfile!(c"/rootfs/etc/resolv.conf", b"nameserver 8.8.8.8\n");
 }
 
-// ── config.json helpers ───────────────────────────────────────────────────────
-
 fn make_baseline_config(uid: u32, gid: u32, rootfs_path: &str) -> Vec<u8> {
     serde_json::json!({
         "ociVersion": "1.0.0",
@@ -198,9 +169,6 @@ fn make_baseline_config(uid: u32, gid: u32, rootfs_path: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Patch root.path in a (possibly mutated) config.json byte slice.
-/// Valid JSON → patch root.path so crun always finds the FUSE rootfs.
-/// Invalid JSON → return as-is so crun's own parser is the fuzzing target.
 fn patch_root_path(config_bytes: &[u8], rootfs_path: &str) -> Vec<u8> {
     match serde_json::from_slice::<serde_json::Value>(config_bytes) {
         Ok(mut v) => {
@@ -217,8 +185,6 @@ fn patch_root_path(config_bytes: &[u8], rootfs_path: &str) -> Vec<u8> {
         Err(_) => config_bytes.to_vec(),
     }
 }
-
-// ── Seed corpus ───────────────────────────────────────────────────────────────
 
 fn config_seeds(uid: u32, gid: u32) -> Vec<FsDelta> {
     let ns = serde_json::json!([{"type":"pid"},{"type":"mount"},{"type":"user"}]);
@@ -241,13 +207,10 @@ fn config_seeds(uid: u32, gid: u32) -> Vec<FsDelta> {
     };
 
     vec![
-        // 1. Minimal valid spec (pid + mount + user ns only)
         to_delta(serde_json::json!({"ociVersion":"1.0.0","process":proc_min,
             "root":root,"hostname":"fuzz","linux":linux})),
-        // 2. Read-only rootfs
         to_delta(serde_json::json!({"ociVersion":"1.0.0","process":proc_min,
             "root":{"path":"PLACEHOLDER","readonly":true},"hostname":"fuzz","linux":linux})),
-        // 3. Elevated capabilities — large bounding set
         to_delta(serde_json::json!({"ociVersion":"1.0.0",
             "process":{"terminal":false,"user":{"uid":0,"gid":0},"args":["/bin/true"],
                 "env":["PATH=/bin"],"cwd":"/",
@@ -262,7 +225,6 @@ fn config_seeds(uid: u32, gid: u32) -> Vec<FsDelta> {
                     "ambient":    []
                 }},
             "root":root,"hostname":"fuzz","linux":linux})),
-        // 5. Empty capabilities — exercises empty cap set validation
         to_delta(serde_json::json!({"ociVersion":"1.0.0",
             "process":{"terminal":false,"user":{"uid":0,"gid":0},"args":["/bin/true"],
                 "env":["PATH=/bin"],"cwd":"/",
@@ -271,7 +233,6 @@ fn config_seeds(uid: u32, gid: u32) -> Vec<FsDelta> {
                     "inheritable":[],"ambient":[]
                 }},
             "root":root,"hostname":"fuzz","linux":linux})),
-        // 6. Extra rlimits — exercises rlimit setup codepath
         to_delta(serde_json::json!({"ociVersion":"1.0.0",
             "process":{"terminal":false,"user":{"uid":0,"gid":0},"args":["/bin/true"],
                 "env":["PATH=/bin"],"cwd":"/",
@@ -281,28 +242,22 @@ fn config_seeds(uid: u32, gid: u32) -> Vec<FsDelta> {
                     {"type":"RLIMIT_AS","hard":536870912,"soft":536870912}
                 ]},
             "root":root,"hostname":"fuzz","linux":linux})),
-        // 7. noNewPrivileges = false
         to_delta(serde_json::json!({"ociVersion":"1.0.0",
             "process":{"terminal":false,"user":{"uid":0,"gid":0},"args":["/bin/true"],
                 "env":["PATH=/bin"],"cwd":"/","noNewPrivileges":false},
             "root":root,"hostname":"fuzz","linux":linux})),
-        // 8. Annotations block
         to_delta(serde_json::json!({"ociVersion":"1.0.0","process":proc_min,
             "root":root,"hostname":"fuzz",
             "annotations":{"com.example.key":"value"},
             "linux":linux})),
-        // 9. Empty args — exercises arg-validation path
         to_delta(serde_json::json!({"ociVersion":"1.0.0",
             "process":{"terminal":false,"user":{"uid":0,"gid":0},"args":[],
                 "env":["PATH=/bin"],"cwd":"/"},
             "root":root,"hostname":"fuzz","linux":linux})),
-        // 10. Non-existent binary — exercises execve error path in crun
         to_delta(serde_json::json!({"ociVersion":"1.0.0",
             "process":{"terminal":false,"user":{"uid":0,"gid":0},
                 "args":["/bin/nonexistent"],"env":["PATH=/bin"],"cwd":"/"},
             "root":root,"hostname":"fuzz","linux":linux})),
-        // 11. Incomplete OCI spec (valid JSON, missing required fields) — exercises
-        //     libocispec validation error path (not yajl parse error)
         to_delta(serde_json::json!({"ociVersion":"1.0.0"})),
     ]
 }
@@ -336,8 +291,6 @@ fn rootfs_seeds(bin_true: &[u8]) -> Vec<FsDelta> {
     seeds
 }
 
-// ── CLI ───────────────────────────────────────────────────────────────────────
-
 struct Args {
     dry_run: Option<u64>,
 }
@@ -360,8 +313,6 @@ impl Args {
         Self { dry_run }
     }
 }
-
-// ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
     #[cfg(not(has_libcrun))]
@@ -400,11 +351,9 @@ fn main() {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
-    // ── VFS + FUSE ────────────────────────────────────────────────────────────
     let vfs = unsafe { vfs_create() };
     assert!(!vfs.is_null(), "vfs_create() returned null");
 
-    // rootfs_path in config.json must point to the FUSE mount
     let fuse_rootfs_path = format!("{mountpoint}/rootfs");
     let baseline_config = make_baseline_config(uid, gid, &fuse_rootfs_path);
 
@@ -438,10 +387,8 @@ fn main() {
 
     start_fuse(vfs, &mountpoint);
 
-    // CStrings for the harness (stable pointers across iterations)
     let state_dir_cstr = CString::new(state_dir.clone()).unwrap();
 
-    // ── Seed corpus ───────────────────────────────────────────────────────────
     let mut initial: Vec<FsDelta> = Vec::new();
     initial.extend(config_seeds(uid, gid));
     initial.extend(rootfs_seeds(&bin_true));
@@ -453,7 +400,6 @@ fn main() {
     let live_corpus: LiveCorpus = Rc::new(RefCell::new(initial.clone()));
     println!("Seed corpus: {} entries\n", initial.len());
 
-    // ── Coverage observer ─────────────────────────────────────────────────────
     let map_size = unsafe {
         if MAX_EDGES_FOUND > 0 {
             MAX_EDGES_FOUND
@@ -517,7 +463,6 @@ fn main() {
     let scheduler = QueueScheduler::new();
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
-    // ── Harness ───────────────────────────────────────────────────────────────
     let fuse_config_path = format!("{mountpoint}/config.json");
 
     let mut harness = |input: &FsDelta| -> ExitKind {
@@ -525,16 +470,14 @@ fn main() {
         unsafe { vfs_reset_to_snapshot(vfs) };
         let _ = apply_delta(vfs, input);
 
-        // Read config.json from FUSE (may have been mutated by FsDelta ops)
         let raw = std::fs::read(&fuse_config_path).unwrap_or_else(|_| baseline_config.clone());
 
         // Patch root.path so crun always finds the FUSE rootfs regardless of
-        // what the mutator did to the rest of the config.
+        // what the mutator did to the config.
         let patched = patch_root_path(&raw, &fuse_rootfs_path);
 
-        // NUL-terminate for C
         let Ok(config_cstr) = CString::new(patched) else {
-            return ExitKind::Ok; // embedded NUL — skip
+            return ExitKind::Ok;
         };
 
         let iter = ITER.fetch_add(1, Ordering::Relaxed);
@@ -543,12 +486,9 @@ fn main() {
             return ExitKind::Ok;
         };
 
-        // Call libcrun in-process — SanCov fires here.
-        // Return value is the container exit code or -1 for parse/validation
-        // errors; both are expected and treated as Ok. Real crashes (SIGSEGV,
-        // SIGABRT, etc.) are caught by InProcessExecutor's signal handlers and
-        // reported as ExitKind::Crash — the harness return value is irrelevant
-        // for those cases.
+        // SanCov fires inside the call. Real crashes (SIGSEGV, SIGABRT, etc.)
+        // are caught by InProcessExecutor's signal handlers and reported as
+        // ExitKind::Crash; exit code -1 (parse/validation error) is expected.
         let _ret = unsafe {
             fuzz_crun_run_container(
                 config_cstr.as_ptr(),
@@ -586,7 +526,7 @@ fn main() {
     println!("  corpus  → corpus_crun/");
     println!("  crashes → solutions_crun/\n");
 
-    let start = Instant::now(); // reset after seeding so exec/sec is accurate
+    let start = Instant::now(); // reset after seeding so exec/sec counts only fuzz iterations
     let mut total: u64 = 0;
 
     loop {
@@ -598,14 +538,12 @@ fn main() {
 
         total += 1;
 
-        // maybe_report_progress is time-based (fires every 2s regardless of
-        // corpus growth) and reports cumulative edge coverage from MaxMapFeedback.
-        // The monitor callback flushes stdout so lines reach the log file
-        // immediately even when piped through tee.
+        // maybe_report_progress fires every 2s and reports cumulative edge coverage.
+        // Flushing stdout ensures lines reach the log immediately when piped through tee.
         mgr.maybe_report_progress(&mut state, Duration::from_secs(2))
             .expect("progress report failed");
 
-        // Keep live_corpus in sync for SpliceDelta
+        // Keep live_corpus in sync for SpliceDelta.
         let after = state.corpus().count();
         for idx in before..after {
             let cid = CorpusId::from(idx);

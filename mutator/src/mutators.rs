@@ -33,9 +33,7 @@ static PATH_COMPONENTS: &[&str] = &[
     "test", "run",
 ];
 
-/// Dictionary of structurally interesting content values.
-///
-// 40% chance to draw from this; rest is random bytes
+// 40% chance to draw from this dictionary; rest is random bytes.
 static CONTENT_DICTIONARY: &[&[u8]] = &[
     b"random_shit",
     b"cone_ice",
@@ -148,8 +146,8 @@ where
         let op = &mut input.ops[chosen];
         let content_len = op.content.len();
 
-        // 20%: append random bytes
         if state.rand_mut().below(nz(100)) < 20 {
+            // Append random bytes instead of flipping.
             let n_append = 1 + state.rand_mut().below(nz(8));
             for _ in 0..n_append {
                 op.content.push(state.rand_mut().below(nz(256)) as u8);
@@ -158,7 +156,6 @@ where
             return Ok(MutationResult::Mutated);
         }
 
-        // 80%: set 1–4 bytes to a random value
         let n_sets = 1 + state.rand_mut().below(nz(4));
         for _ in 0..n_sets {
             let byte_idx = state.rand_mut().below(nz(content_len));
@@ -267,7 +264,7 @@ where
             random_path(state.rand_mut())
         };
 
-        // bias toward CreateFile when using a guided ENOENT path
+        // Prefer CreateFile when using a guided ENOENT path.
         let file_bias = if using_guided { 90 } else { 70 };
         let op = if state.rand_mut().below(nz(100)) < file_bias {
             FsOp::create_file(path, random_content(state.rand_mut()))
@@ -661,12 +658,10 @@ impl UpdateExistingFile {
     }
 }
 
-/// Small perturbation of a byte slice: flip, append, truncate, or dict splice.
 fn perturb_bytes<R: Rand>(rand: &mut R, base: &[u8]) -> Vec<u8> {
     let mut out = base.to_vec();
     match rand.below(nz(4)) {
         0 => {
-            // Flip 1–4 random bits (graceful no-op on empty base).
             if !out.is_empty() {
                 let n_flips = 1 + rand.below(nz(4));
                 for _ in 0..n_flips {
@@ -677,21 +672,18 @@ fn perturb_bytes<R: Rand>(rand: &mut R, base: &[u8]) -> Vec<u8> {
             }
         }
         1 => {
-            // Append 1–32 random bytes.
             let n = 1 + rand.below(nz(32));
             for _ in 0..n {
                 out.push(rand.below(nz(256)) as u8);
             }
         }
         2 => {
-            // Truncate to a shorter length (at least 1 byte, or empty if base was empty).
             if out.len() > 1 {
                 let new_len = rand.below(nz(out.len()));
                 out.truncate(new_len);
             }
         }
         _ => {
-            // Splice a dictionary entry into a random offset.
             let entry = *pick(rand, CONTENT_DICTIONARY);
             let off = if out.is_empty() {
                 0
@@ -748,7 +740,7 @@ where
             }
         };
 
-        // update in-place if possible to avoid dead ops (last write wins)
+        // Prefer in-place update to avoid dead ops (last write wins).
         if let Some(existing) = input
             .ops
             .iter_mut()
@@ -856,7 +848,7 @@ where
             return Ok(MutationResult::Skipped);
         };
 
-        // collect comparison pairs from CmpLog, both directions
+        // Collect comparison pairs from CmpLog, both directions.
         let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for val in &meta.list {
             match val {

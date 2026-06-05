@@ -1,13 +1,3 @@
-//! fuzz_combined_afl — Campaign 3: Nautilus config grammar + FUSE rootfs mutation.
-//!
-//! Both dimensions are mutated every iteration:
-//!   config.json  ← Nautilus grammar (OCI JSON), root.path overridden to FUSE mount
-//!   rootfs       ← FUSE VFS mutated via FsDelta
-//!
-//! Run (as root, from /tmp/campaign3/):
-//!   mkdir -p /tmp/campaign3
-//!   cd /tmp/campaign3
-//!   sudo unshare -m /path/to/fuzz_combined_afl <crun> <grammar.py> 2>&1 | tee /tmp/c3.log
 
 use std::{
     borrow::Cow,
@@ -76,13 +66,10 @@ use fs_mutator::ffi::{fuse_vfs_lib_init, fuse_vfs_lib_is_mounted, fuse_vfs_lib_r
 
 const MAP_SIZE: usize = 65536;
 
-// ── CombinedInput ─────────────────────────────────────────────────────────────
-// The corpus entry for Campaign 3. Both halves are mutated each round.
-
 #[derive(Clone, Debug, Hash, Serialize, Deserialize)]
 pub struct CombinedInput {
-    pub config: NautilusInput, // drives config.json content via Nautilus grammar
-    pub rootfs: FsDelta,       // drives FUSE VFS state
+    pub config: NautilusInput,
+    pub rootfs: FsDelta,
 }
 
 impl Input for CombinedInput {
@@ -91,19 +78,13 @@ impl Input for CombinedInput {
     }
 }
 
-// Required by IndexesLenTimeMinimizerScheduler.
-// Use FsDelta op count + 1 as a proxy for input "size".
+// op count + tree size as a proxy for input length, required by the minimizer scheduler
 impl HasLen for CombinedInput {
     fn len(&self) -> usize {
         self.rootfs.len().saturating_add(self.config.tree.size())
     }
 }
 
-// ── Mutator wrappers ──────────────────────────────────────────────────────────
-//
-// LibAFL mutators are typed as Mutator<NautilusInput, S> or Mutator<FsDelta, S>.
-// These thin wrappers let both operate on CombinedInput by delegating to the
-// appropriate sub-field.
 
 pub struct ConfigMutator<M> {
     inner: M,
@@ -179,15 +160,6 @@ where
     }
 }
 
-// ── CombinedConverter ─────────────────────────────────────────────────────────
-// Called by StdFuzzer before every forkserver execution.
-//
-// Steps per iteration:
-//  1. Reset FUSE VFS to baseline snapshot, apply FsDelta  → rootfs mutation
-//  2. Convert NautilusInput → JSON bytes via NautilusBytesConverter
-//  3. Override "root.path" in the JSON with the FUSE mountpoint path
-//  4. Write the modified JSON to config_path on disk      → config mutation
-//  5. Return placeholder [0u8] — crun reads from argv[1], not stdin
 
 struct CombinedConverter {
     context:         &'static NautilusContext,
@@ -203,42 +175,56 @@ unsafe impl Sync for CombinedConverter {}
 
 impl ToTargetBytes<CombinedInput> for CombinedConverter {
     fn to_target_bytes<'a>(&mut self, input: &'a CombinedInput) -> OwnedSlice<'a, u8> {
-        // 1. Rootfs mutation
         unsafe { vfs_reset_to_snapshot(self.vfs) };
         let _ = apply_delta(self.vfs, &input.rootfs);
 
-        // 2. Nautilus config → JSON
         let mut bytes_conv = NautilusBytesConverter::new(self.context);
         let raw = bytes_conv.to_target_bytes(&input.config);
 
-        // 3. Override root.path
         let cfg = override_rootfs_path(&*raw, &self.fuse_rootfs)
             .unwrap_or_else(|| self.fallback_cfg.clone());
 
-        // 4. Write config to disk
         let _ = std::fs::write(&self.config_path, &cfg);
 
-        // 4b. Persist the full mutated input so it survives a forkserver death.
-        //     Written every iteration — when crun crashes or goes D-state, this
-        //     file holds the exact input that was about to be executed, not the
-        //     pre-mutation base corpus entry.
+        // Written every iteration so if the forkserver dies mid-run this holds
+        // the exact input that was about to execute, not the pre-mutation base.
         if let Ok(json) = serde_json::to_string_pretty(&input.rootfs) {
             let _ = std::fs::write(&self.last_input_path, json);
         }
 
-        // 5. Placeholder — crun reads config from argv[1]
+        // crun reads config from argv[1], not stdin
         OwnedSlice::from(vec![0u8])
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Parse the Nautilus-generated JSON and force "root.path" to the FUSE mountpoint.
-/// Returns None only if the JSON is completely unparseable.
+/// Force "root.path" to the FUSE mountpoint. Returns None only if the JSON is completely unparseable.
 fn override_rootfs_path(json: &[u8], fuse_rootfs: &str) -> Option<Vec<u8>> {
     let mut v: serde_json::Value = serde_json::from_slice(json).ok()?;
     let obj = v.as_object_mut()?;
-    // Ensure "root" key exists, then override "path"
+
+    // Without a mount namespace crun performs mounts in the fuzzer's own namespace.
+    // A symlink escape + grammar-generated mount can then shadow the FUSE mountpoint
+    // and kill the fuzzer process.
+    {
+        let linux = obj
+            .entry("linux")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(l) = linux.as_object_mut() {
+            let ns = l
+                .entry("namespaces")
+                .or_insert_with(|| serde_json::json!([]));
+            if let Some(arr) = ns.as_array_mut() {
+                let has_mount = arr
+                    .iter()
+                    .any(|n| n.get("type").and_then(|t| t.as_str()) == Some("mount"));
+                if !has_mount {
+                    arr.push(serde_json::json!({"type": "mount"}));
+                }
+            }
+        }
+    }
+
+
     let root = obj
         .entry("root")
         .or_insert_with(|| serde_json::json!({"readonly": false}));
@@ -251,9 +237,7 @@ fn override_rootfs_path(json: &[u8], fuse_rootfs: &str) -> Option<Vec<u8>> {
     serde_json::to_vec(&v).ok()
 }
 
-/// Write a human-readable JSON sidecar for a corpus entry so the fuzz_dashboard can display it.
-/// The sidecar is named `combined_<idx>.json` and lives in the corpus dir.
-/// Format: { "config": "<rendered config string>", "ops": [<FsOp objects>] }
+/// Writes a JSON sidecar next to each corpus entry for the dashboard to read.
 fn write_corpus_sidecar(
     corpus_dir: &std::path::Path,
     idx: usize,
@@ -273,7 +257,7 @@ fn write_corpus_sidecar(
     let _ = std::fs::write(&path, json.to_string());
 }
 
-/// Minimal valid OCI config used when Nautilus JSON fails to parse.
+/// Fallback OCI config used when the Nautilus-generated JSON can't be parsed.
 fn make_fallback_config(rootfs_path: &str) -> Vec<u8> {
     serde_json::json!({
         "ociVersion": "1.0.0",
@@ -302,12 +286,9 @@ fn make_fallback_config(rootfs_path: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-// ── VFS baseline ──────────────────────────────────────────────────────────────
-
 unsafe fn init_vfs(vfs: *mut VfsT, bin_true: &[u8]) {
     for dir in &[
         c"/bin", c"/proc", c"/dev", c"/sys", c"/tmp", c"/etc", c"/var", c"/run",
-        // dirs for grammar CWD_VAL entries and process paths
         c"/usr", c"/usr/bin", c"/app", c"/home", c"/home/user",
     ] {
         vfs_mkdir(vfs, dir.as_ptr());
@@ -317,14 +298,13 @@ unsafe fn init_vfs(vfs: *mut VfsT, bin_true: &[u8]) {
             vfs_create_file(vfs, $path.as_ptr(), $content.as_ptr(), $content.len())
         };
     }
-    // All grammar ARGS_LIST binaries — each gets the same static exit(0) blob
-    // so find_executable succeeds for every grammar-generated process path.
-    // Grammar entries: /bin/sh, /bin/bash, ./app (cwd=/app → /app/app), /usr/bin/nginx
+    // Every binary the grammar can reference gets the same static exit(0) blob
+    // so find_executable succeeds regardless of which process path is generated.
     if !bin_true.is_empty() {
         mkfile!(c"/bin/true",       bin_true);
         mkfile!(c"/bin/sh",         bin_true);
         mkfile!(c"/bin/bash",       bin_true);
-        mkfile!(c"/app/app",        bin_true); // for "args": ["./app"], "cwd": "/app"
+        mkfile!(c"/app/app",        bin_true);
         mkfile!(c"/usr/bin/nginx",  bin_true);
     }
     mkfile!(c"/etc/passwd",
@@ -335,8 +315,6 @@ unsafe fn init_vfs(vfs: *mut VfsT, bin_true: &[u8]) {
     mkfile!(c"/etc/hostname",   b"fuzz\n");
     mkfile!(c"/etc/resolv.conf", b"nameserver 8.8.8.8\n");
 }
-
-// ── FUSE startup ──────────────────────────────────────────────────────────────
 
 #[cfg(has_fuse3)]
 fn start_fuse(vfs: *mut VfsT, mountpoint: &str) {
@@ -362,21 +340,14 @@ fn start_fuse(_vfs: *mut VfsT, _mountpoint: &str) {
     std::process::exit(1);
 }
 
-// ── Rootfs seed corpus ────────────────────────────────────────────────────────
-// Identical to Campaign 2's seed set — all 6 groups.
-
 fn rootfs_seeds(bin_true: &[u8]) -> Vec<FsDelta> {
     let mut seeds = vec![
 
-        // ── Group 1: baseline and mount-target removals ───────────────────────
-        // Clean rootfs — exercises full success path end-to-end
         FsDelta::new(vec![]),
-        // Missing mount targets — exercises crun's mount-setup error paths
         FsDelta::new(vec![FsOp::rmdir("/proc")]),
         FsDelta::new(vec![FsOp::rmdir("/dev")]),
         FsDelta::new(vec![FsOp::rmdir("/sys")]),
         FsDelta::new(vec![FsOp::rmdir("/tmp")]),
-        // Multiple mount targets missing at once
         FsDelta::new(vec![FsOp::rmdir("/proc"), FsOp::rmdir("/sys")]),
         FsDelta::new(vec![FsOp::rmdir("/dev"),  FsOp::rmdir("/tmp")]),
         FsDelta::new(vec![
@@ -384,8 +355,6 @@ fn rootfs_seeds(bin_true: &[u8]) -> Vec<FsDelta> {
             FsOp::rmdir("/sys"),  FsOp::rmdir("/tmp"),
         ]),
 
-        // ── Group 2: binary execution variants ───────────────────────────────
-        // Missing binary — ENOENT in execve
         FsDelta::new(vec![FsOp::delete_file("/bin/true")]),
         // Zero-length binary — ENOEXEC
         FsDelta::new(vec![FsOp::truncate("/bin/true", 0)]),
@@ -402,7 +371,6 @@ fn rootfs_seeds(bin_true: &[u8]) -> Vec<FsDelta> {
             b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00".to_vec())]),
         // Shell script without interpreter (ENOENT on /bin/sh)
         FsDelta::new(vec![FsOp::update_file("/bin/true", b"#!/bin/sh\nexit 0\n".to_vec())]),
-        // Remove binary + its directory
         FsDelta::new(vec![FsOp::delete_file("/bin/true"), FsOp::rmdir("/bin")]),
 
         // ── Group 3: rich valid rootfs — exercises deeper success paths ───────
@@ -502,23 +470,21 @@ fn rootfs_seeds(bin_true: &[u8]) -> Vec<FsDelta> {
     ];
 
     if bin_true.len() > 8 {
-        // Corrupt ELF class field (offset 4)
+        // corrupt ELF class field (offset 4)
         let mut c4 = bin_true.to_vec();
         c4[4] ^= 0xff;
         seeds.push(FsDelta::new(vec![FsOp::update_file("/bin/true", c4)]));
 
-        // Corrupt ELF data field (offset 5 — endianness)
+        // corrupt ELF endianness field (offset 5)
         let mut c5 = bin_true.to_vec();
         c5[5] ^= 0xff;
         seeds.push(FsDelta::new(vec![FsOp::update_file("/bin/true", c5)]));
 
-        // Truncate to first 128 bytes — valid header, no content
         seeds.push(FsDelta::new(vec![FsOp::update_file(
             "/bin/true",
             bin_true[..128.min(bin_true.len())].to_vec(),
         )]));
 
-        // Truncate to first 64 bytes — partial ELF header
         seeds.push(FsDelta::new(vec![FsOp::update_file(
             "/bin/true",
             bin_true[..64.min(bin_true.len())].to_vec(),
@@ -528,15 +494,13 @@ fn rootfs_seeds(bin_true: &[u8]) -> Vec<FsDelta> {
     seeds
 }
 
-// ── crun-specific symlink seed corpus ─────────────────────────────────────────
-//
-// All seeds use replace_with_symlink so non-empty dirs (like /etc, /bin) are
-// handled correctly — raw rmdir + create_symlink silently fails on non-empty dirs.
+// replace_with_symlink is used throughout so non-empty dirs are handled correctly;
+// raw rmdir + create_symlink silently fails on dirs with children.
 
 fn crun_symlink_seeds(index: &BaselineIndex) -> Vec<FsDelta> {
     let mut seeds = Vec::new();
 
-    // ── Mount destination escapes — relative targets ──────────────────────────
+
     for (path, target) in &[
         ("/proc", "../../proc"),
         ("/dev",  "../../dev"),
@@ -546,7 +510,7 @@ fn crun_symlink_seeds(index: &BaselineIndex) -> Vec<FsDelta> {
         seeds.push(FsDelta::new(replace_with_symlink(path, target, index)));
     }
 
-    // All mount destinations simultaneously
+
     let mut combined = Vec::new();
     for (path, target) in &[("/proc", "../../proc"), ("/dev", "../../dev"), ("/sys", "../../sys")] {
         combined.extend(replace_with_symlink(path, target, index));
@@ -555,7 +519,7 @@ fn crun_symlink_seeds(index: &BaselineIndex) -> Vec<FsDelta> {
         seeds.push(FsDelta::new(combined));
     }
 
-    // ── Mount destination escapes — absolute targets ──────────────────────────
+
     for (path, target) in &[
         ("/proc", "/proc"),
         ("/dev",  "/proc/self/fd"),
@@ -565,15 +529,15 @@ fn crun_symlink_seeds(index: &BaselineIndex) -> Vec<FsDelta> {
         seeds.push(FsDelta::new(replace_with_symlink(path, target, index)));
     }
 
-    // ── Mount destination → wrong type ───────────────────────────────────────
+
     seeds.push(FsDelta::new(replace_with_symlink("/proc", "/etc/passwd", index)));
     seeds.push(FsDelta::new(replace_with_symlink("/dev",  "/bin/true",   index)));
 
-    // ── Mount destination → dangling ─────────────────────────────────────────
+
     seeds.push(FsDelta::new(replace_with_symlink("/proc", "/nonexistent", index)));
     seeds.push(FsDelta::new(replace_with_symlink("/dev",  "/missing",     index)));
 
-    // ── Parent component symlinks — non-leaf, historically dangerous ──────────
+
     for (path, target) in &[
         ("/etc", "../../etc"),
         ("/bin", "../../bin"),
@@ -584,7 +548,7 @@ fn crun_symlink_seeds(index: &BaselineIndex) -> Vec<FsDelta> {
         seeds.push(FsDelta::new(replace_with_symlink(path, target, index)));
     }
 
-    // ── Binary path → proc/dev special files ─────────────────────────────────
+
     for target in &[
         "/proc/self/exe",
         "/proc/self/mem",
@@ -596,13 +560,13 @@ fn crun_symlink_seeds(index: &BaselineIndex) -> Vec<FsDelta> {
         seeds.push(FsDelta::new(replace_with_symlink("/bin/true", target, index)));
     }
 
-    // ── Config-reading files → host escape ───────────────────────────────────
+
     seeds.push(FsDelta::new(replace_with_symlink("/etc/passwd", "../../etc/passwd",      index)));
     seeds.push(FsDelta::new(replace_with_symlink("/etc/passwd", "/etc/passwd",           index)));
     seeds.push(FsDelta::new(replace_with_symlink("/etc/passwd", "../../../etc/shadow",   index)));
     seeds.push(FsDelta::new(replace_with_symlink("/etc/group",  "../../etc/group",       index)));
 
-    // ── Symlink loops ─────────────────────────────────────────────────────────
+
     seeds.push(FsDelta::new(vec![FsOp::create_symlink("/loop", "/loop")]));
     seeds.push(FsDelta::new(vec![
         FsOp::create_symlink("/a", "/b"),
@@ -610,30 +574,51 @@ fn crun_symlink_seeds(index: &BaselineIndex) -> Vec<FsDelta> {
         FsOp::create_symlink("/c", "/a"),
     ]));
 
-    // ── Relative escape via deep path ─────────────────────────────────────────
+
     seeds.push(FsDelta::new(replace_with_symlink("/etc/passwd", "../../../etc/shadow", index)));
     seeds.push(FsDelta::new(vec![
         FsOp::create_symlink("/bin/sh", "../../../proc/sysrq-trigger"),
     ]));
 
-    // ── Dangling symlink at a path crun opens ────────────────────────────────
+
     seeds.push(FsDelta::new(vec![FsOp::create_symlink("/bin/sh", "/nonexistent")]));
     seeds.push(FsDelta::new(replace_with_symlink("/proc", "/nonexistent", index)));
 
-    // ── Targets with path noise ───────────────────────────────────────────────
+
     seeds.push(FsDelta::new(vec![FsOp::create_symlink("/bin/x", "////proc//self//exe")]));
     seeds.push(FsDelta::new(vec![FsOp::create_symlink("/bin/x", "../../../proc/./self/./exe")]));
 
-    // Drop any empty deltas (can happen when replace_with_symlink returns no ops)
+
     seeds.retain(|d| !d.is_empty());
     seeds
 }
 
-// ── main ──────────────────────────────────────────────────────────────────────
+fn is_forkserver_death(e: &Error) -> bool {
+    let s = format!("{e:?}");
+    s.contains("Unable to communicate with fork server")
+        || s.contains("Failed to start forkserver")
+}
 
+// Kill any crun processes whose cwd matches ours — fork-children that outlived the forkserver.
+fn kill_stray_crun_in_cwd() {
+    use nix::{sys::signal::Signal, unistd::Pid};
+    let Ok(cwd) = std::env::current_dir() else { return };
+    let Ok(rd) = std::fs::read_dir("/proc") else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(pid_str) = name.to_str() else { continue };
+        if !pid_str.bytes().all(|b| b.is_ascii_digit()) { continue; }
+        let Ok(proc_cwd) = std::fs::read_link(format!("/proc/{pid_str}/cwd")) else { continue };
+        if proc_cwd != cwd { continue; }
+        let comm = std::fs::read_to_string(format!("/proc/{pid_str}/comm"))
+            .unwrap_or_default();
+        if comm.trim() != "crun" { continue; }
+        let Ok(pid) = pid_str.parse::<i32>() else { continue };
+        let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+}
 
 fn main() {
-    // Python runtime required for Nautilus grammar evaluation
     pyo3::prepare_freethreaded_python();
 
     let args: Vec<String> = std::env::args().collect();
@@ -669,11 +654,9 @@ fn main() {
     }
     std::fs::create_dir_all(&mountpoint).expect("failed to create FUSE mountpoint");
 
-    // Statically linked exit(0) binary — always available, no host dependency.
-    // Compiled with: gcc -static -nostartfiles -nostdlib -Os (raw exit syscall).
+    // raw exit(0) syscall, gcc -static -nostartfiles -nostdlib -Os
     static BIN_TRUE: &[u8] = include_bytes!("../../static/true");
 
-    // ── VFS + FUSE ────────────────────────────────────────────────────────────
     let vfs = unsafe { vfs_create() };
     assert!(!vfs.is_null(), "vfs_create() returned null");
     unsafe { init_vfs(vfs, BIN_TRUE) };
@@ -693,25 +676,29 @@ fn main() {
     start_fuse(vfs, &mountpoint);
     println!("  rootfs  : {mountpoint}");
 
-    // ── Nautilus context (Box::leak → 'static so all components can borrow it) ─
+    // Box::leak gives 'static lifetime so all components can borrow it freely
     let context: &'static NautilusContext =
         Box::leak(Box::new(NautilusContext::from_file(100, grammar_path).unwrap()));
 
     let fallback_cfg = make_fallback_config(&mountpoint);
 
-    // ── AFL shared memory (coverage map) ─────────────────────────────────────
+    // `shmem` stays alive for the entire campaign; both the initial executor and any
+    // rebuilt executor use from_mut_ptr (raw pointer, no borrow), so `executor` can
+    // be reassigned on restart without changing the observer type. Historical
+    // coverage lives in MaxMapFeedback's virgin map on the heap and is unaffected.
     let mut shmem_provider = UnixShMemProvider::new().unwrap();
     let mut shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();
     unsafe { shmem.write_to_env("__AFL_SHM_ID").unwrap() };
-    let shmem_buf = shmem.as_slice_mut();
+    let shmem_ptr: *mut u8 = shmem.as_slice_mut().as_mut_ptr();
 
     let edges_observer = unsafe {
-        HitcountsMapObserver::new(StdMapObserver::new("shared_mem", shmem_buf)).track_indices()
+        HitcountsMapObserver::new(
+            StdMapObserver::from_mut_ptr("shared_mem", shmem_ptr, MAP_SIZE)
+        ).track_indices()
     };
     let time_observer  = TimeObserver::new("time");
     let map_feedback   = MaxMapFeedback::new(&edges_observer);
 
-    // ── AflStatsStage ─────────────────────────────────────────────────────────
     let tokens = libafl::mutators::Tokens::new();
     let afl_stats_stage = AflStatsStage::builder()
         .stats_file(PathBuf::from_str("fuzzer_stats").unwrap())
@@ -725,7 +712,7 @@ fn main() {
         .build()
         .expect("AflStatsStage build failed");
 
-    // ── Feedbacks + state ─────────────────────────────────────────────────────
+
     let mut feedback = feedback_or!(
         MaxMapFeedback::new(&edges_observer),
         TimeFeedback::new(&time_observer),
@@ -741,25 +728,20 @@ fn main() {
     )
     .expect("StdState");
 
-    // Nautilus tree chunk cache (required by NautilusRecursionMutator)
     let _ = state.metadata_or_insert_with::<NautilusChunksMetadata>(|| {
         NautilusChunksMetadata::new("/tmp/".into())
     });
-    // Token metadata (required by AflStatsStage)
     state.add_metadata(tokens.clone());
 
-    // ── Monitor + event manager ───────────────────────────────────────────────
     let monitor = SimpleMonitor::new(|s| {
         println!("{s}");
         let _ = std::io::Write::flush(&mut std::io::stdout());
     });
     let mut mgr = SimpleEventManager::new(monitor);
 
-    // ── Scheduler ─────────────────────────────────────────────────────────────
     let observer_ref = edges_observer.handle();
     let scheduler    = IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
 
-    // ── Converter ─────────────────────────────────────────────────────────────
     let converter = CombinedConverter {
         context,
         vfs,
@@ -769,7 +751,6 @@ fn main() {
         last_input_path: last_input_path.clone(),
     };
 
-    // ── Fuzzer ────────────────────────────────────────────────────────────────
     let mut fuzzer = StdFuzzerBuilder::new()
         .input_filter(BloomInputFilter::default())
         .target_bytes_converter(converter)
@@ -778,7 +759,6 @@ fn main() {
         .objective(objective)
         .build();
 
-    // ── Executor ──────────────────────────────────────────────────────────────
     let mut executor = ForkserverExecutor::builder()
         .program(crun_binary)
         .arg(config_path.to_str().expect("config path not UTF-8"))
@@ -795,29 +775,9 @@ fn main() {
             .truncate(dynamic_map_size);
     }
 
-    // ── LiveCorpus for SpliceDelta (updated after every fuzz_one) ─────────────
     let mut r_seeds = rootfs_seeds(BIN_TRUE);
     r_seeds.extend(crun_symlink_seeds(&baseline_index));
     let live_corpus: LiveCorpus = Rc::new(RefCell::new(r_seeds.clone()));
-
-    // ── Mutators ──────────────────────────────────────────────────────────────
-    //
-    // Config mutators (operate on CombinedInput.config via ConfigMutator wrapper):
-    //   NautilusRandomMutator × 4  — random tree node replacements
-    //   NautilusRecursionMutator   — recursive tree expansion
-    //
-    // Rootfs mutators (operate on CombinedInput.rootfs via RootfsMutator wrapper):
-    //   ByteFlipFileContent, ReplaceFileContent, AddFileOp, RemoveOp,
-    //   MutatePath, SpliceDelta (uses LiveCorpus), DestructiveMutator,
-    //   UpdateExistingFile, ReplayWriteFile
-    //
-    // Symlink mutators:
-    //   MountDestinationSymlinkMutator (×2, highest weight)
-    //   MountOptionSymlinkMutator
-    //   ExecutableSymlinkMutator
-    //   ParentComponentSymlinkMutator
-    //   SymlinkEscapeMutator
-    //   LoopAndDepthMutator (lowest weight)
 
     let mutators = tuple_list!(
         ConfigMutator::new(NautilusRandomMutator::new(context)),
@@ -858,12 +818,8 @@ fn main() {
     let havoc_stage = StdMutationalStage::new(scheduled);
     let mut stages  = tuple_list!(havoc_stage, afl_stats_stage);
 
-    // ── Seed corpus ───────────────────────────────────────────────────────────
-    //
-    // Strategy: generate N Nautilus configs × empty rootfs, then pair the full
-    // rootfs seed set with the first generated config.  This seeds both
-    // mutation dimensions from the start without requiring cross-product explosion.
-
+    // seed both dimensions: N generated configs × empty rootfs,
+    // plus the full rootfs seed set paired with the first generated config
     let mut generator = NautilusGenerator::new(context);
     let mut initial_configs: Vec<NautilusInput> = (0..32)
         .filter_map(|_| generator.generate(&mut state).ok())
@@ -873,13 +829,13 @@ fn main() {
     }
     let baseline_config = initial_configs[0].clone();
 
-    // Configs × empty rootfs
+
     let mut seeds: Vec<CombinedInput> = initial_configs
         .drain(..)
         .map(|c| CombinedInput { config: c, rootfs: FsDelta::new(vec![]) })
         .collect();
 
-    // Rootfs seeds × baseline config
+
     for r in r_seeds {
         seeds.push(CombinedInput { config: baseline_config.clone(), rootfs: r });
     }
@@ -925,9 +881,8 @@ fn main() {
         }
     }
 
-    // Prime LiveCorpus and NautilusChunksMetadata from seeds that made it into the corpus.
-    // NautilusChunksMetadata must be populated manually since NautilusFeedback can't be used
-    // with CombinedInput corpus — this replicates what NautilusFeedback.append_metadata does.
+    // NautilusChunksMetadata must be populated manually — NautilusFeedback can't be used
+    // with CombinedInput, so we replicate what NautilusFeedback.append_metadata does.
     for idx in 0..state.corpus().count() {
         let cid = CorpusId::from(idx);
         if let Ok(input) = state.corpus().cloned_input_for_id(cid) {
@@ -946,19 +901,66 @@ fn main() {
     println!("  config  → {}", config_path.display());
     println!("  stats   → fuzzer_stats, plot_data\n");
 
-    // ── Fuzzing loop ──────────────────────────────────────────────────────────
+
     let mut solutions_before = state.solutions().count();
     loop {
         let before = state.corpus().count();
 
-        fuzzer
-            .fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr)
-            .expect("fuzz_one failed");
+        match fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr) {
+            Ok(_) => {}
+            Err(ref e) if is_forkserver_death(e) => {
+                eprintln!(
+                    "[forkserver] died ({e}) — killing stray crun, rebuilding \
+                     (virgin map intact, no coverage loss)..."
+                );
+                kill_stray_crun_in_cwd();
+                thread::sleep(Duration::from_millis(500));
+
+                // SHM is owned by `shmem` on the stack, not the executor, so
+                // the buffer and __AFL_SHM_ID env var survive the drop.
+                drop(executor);
+
+                let new_time_observer = TimeObserver::new("time");
+                let new_edges_observer = unsafe {
+                    HitcountsMapObserver::new(
+                        StdMapObserver::from_mut_ptr("shared_mem", shmem_ptr, MAP_SIZE)
+                    ).track_indices()
+                };
+
+                executor = ForkserverExecutor::builder()
+                    .program(crun_binary)
+                    .arg(config_path.to_str().expect("config path not UTF-8"))
+                    .debug_child(false)
+                    .coverage_map_size(MAP_SIZE)
+                    .timeout(Duration::from_millis(1200))
+                    .kill_signal(Signal::SIGKILL)
+                    .build(tuple_list!(new_time_observer, new_edges_observer))
+                    .expect("ForkserverExecutor rebuild failed");
+
+                if let Some(dynamic_map_size) = executor.coverage_map_size() {
+                    executor.observers_mut()[&observer_ref]
+                        .as_mut()
+                        .truncate(dynamic_map_size);
+                }
+
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let _ = std::fs::OpenOptions::new()
+                    .create(true).append(true).open("restarts.log")
+                    .and_then(|mut f| { use std::io::Write; writeln!(f, "{ts}") });
+
+                eprintln!("[forkserver] restarted — continuing");
+                continue;
+            }
+            Err(e) => panic!("fuzz_one failed: {e:?}"),
+        }
 
         mgr.maybe_report_progress(&mut state, Duration::from_secs(2))
             .expect("progress report failed");
 
-        // Write JSON sidecars for any new crash entries so they are human-readable.
+
         let solutions_after = state.solutions().count();
         for idx in solutions_before..solutions_after {
             let cid = CorpusId::from(idx);
@@ -968,8 +970,7 @@ fn main() {
         }
         solutions_before = solutions_after;
 
-        // Sync newly discovered corpus entries into LiveCorpus (for SpliceDelta)
-        // and NautilusChunksMetadata (for NautilusSpliceMutator).
+        // Sync new corpus entries into LiveCorpus and NautilusChunksMetadata.
         let after = state.corpus().count();
         for idx in before..after {
             let cid = CorpusId::from(idx);

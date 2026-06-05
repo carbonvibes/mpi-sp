@@ -15,8 +15,6 @@ use crate::{
     symlink_utils::{replace_with_symlink, BaselineIndex},
 };
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
 fn nz(v: usize) -> std::num::NonZeroUsize {
     std::num::NonZeroUsize::new(v.max(1)).unwrap()
 }
@@ -25,10 +23,8 @@ fn pick<'a, R: Rand, T>(rng: &mut R, slice: &'a [T]) -> &'a T {
     &slice[rng.below(nz(slice.len()))]
 }
 
-/// Mount destinations crun always sets up pre-pivot.
 static MOUNT_DESTINATIONS: &[&str] = &["/proc", "/dev", "/sys", "/tmp"];
 
-/// Relative escape targets (suffix after `../`-chain).
 static RELATIVE_TARGETS: &[&str] = &[
     "etc/passwd",
     "etc/shadow",
@@ -42,7 +38,6 @@ static RELATIVE_TARGETS: &[&str] = &[
     "proc/self/fd",
 ];
 
-/// Absolute symlink targets — direct escapes if crun resolves from host context.
 static ABSOLUTE_TARGETS: &[&str] = &[
     "/proc",
     "/proc/self",
@@ -56,7 +51,6 @@ static ABSOLUTE_TARGETS: &[&str] = &[
     "/bin/sh",
 ];
 
-/// Parent components crun is likely to access during container setup.
 static PARENT_COMPONENTS: &[&str] = &[
     "/etc",
     "/bin",
@@ -67,7 +61,6 @@ static PARENT_COMPONENTS: &[&str] = &[
     "/run",
 ];
 
-/// Synthetic executable paths to create as symlinks.
 static EXEC_PATHS: &[&str] = &[
     "/bin/target",
     "/usr/local/bin/target",
@@ -75,7 +68,6 @@ static EXEC_PATHS: &[&str] = &[
     "/sbin/target",
 ];
 
-/// Interesting targets for an executable-path symlink.
 static EXEC_SYMLINK_TARGETS: &[&str] = &[
     "/proc/self/exe",
     "/proc/self/mem",
@@ -87,10 +79,6 @@ static EXEC_SYMLINK_TARGETS: &[&str] = &[
     "/nonexistent",
 ];
 
-// ── 1. MountDestinationSymlinkMutator ────────────────────────────────────────
-
-/// Replaces crun's mandatory mount destinations (proc, dev, sys, tmp) with
-/// symlinks using `replace_with_symlink`. Fires on every corpus entry.
 pub struct MountDestinationSymlinkMutator {
     pub index: Arc<BaselineIndex>,
 }
@@ -121,21 +109,16 @@ where
         let r = state.rand_mut().below(nz(100));
 
         let target = if r < 35 {
-            // Relative escape to same-named host path
             let depth = 2 + state.rand_mut().below(nz(4));
             format!("{}{}", "../".repeat(depth), &path[1..])
         } else if r < 60 {
-            // Absolute target
             (*pick(state.rand_mut(), ABSOLUTE_TARGETS)).to_string()
         } else if r < 80 {
-            // Cross-type: symlink to wrong-type path
             let wrong = if path == "/proc" { "/etc/passwd" } else { "/bin/true" };
             wrong.to_string()
         } else if r < 95 {
-            // Dangling
             "/nonexistent".to_string()
         } else {
-            // Special proc/dev special file
             (*pick(state.rand_mut(), &["/dev/null", "/proc/self/fd"])).to_string()
         };
 
@@ -153,14 +136,6 @@ where
     }
 }
 
-// ── 2. MountOptionSymlinkMutator ─────────────────────────────────────────────
-
-/// Creates symlinks at paths involved in bind mounts (rootfs/destination side).
-/// Tests crun's dest-nofollow and symlink-aware bind mount handling.
-///
-/// Source-side options (copy-symlink, src-nofollow) require a host-side symlink
-/// as mount.source — that coordination belongs in a CombinedInput mutator.
-/// This mutator handles the rootfs (container) destination side.
 pub struct MountOptionSymlinkMutator {
     pub index: Arc<BaselineIndex>,
 }
@@ -187,10 +162,7 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        // Pick a destination path for the bind mount
         let dst = *pick(state.rand_mut(), MOUNT_DESTINATIONS);
-
-        // Pick a symlink target — bias toward interesting special files
         let target = *pick(state.rand_mut(), &[
             "/proc/self/fd",
             "/proc/self/exe",
@@ -213,11 +185,6 @@ where
     }
 }
 
-// ── 3. ExecutableSymlinkMutator ───────────────────────────────────────────────
-
-/// Creates a symlink at a synthetic executable path. Explores the "config says
-/// run X, rootfs has X as a symlink" scenario (rootfs side only; config
-/// coordination via override_args requires a CombinedInput mutator).
 pub struct ExecutableSymlinkMutator {
     pub index: Arc<BaselineIndex>,
 }
@@ -261,11 +228,6 @@ where
     }
 }
 
-// ── 4. ParentComponentSymlinkMutator ─────────────────────────────────────────
-
-/// Replaces a *non-leaf* path component with a symlink — the historically
-/// dangerous class for container escapes (e.g. /etc → ../../etc means
-/// /etc/passwd resolves on the host).
 pub struct ParentComponentSymlinkMutator {
     pub index: Arc<BaselineIndex>,
 }
@@ -295,7 +257,6 @@ where
         let component = *pick(state.rand_mut(), PARENT_COMPONENTS);
         let depth = 2 + state.rand_mut().below(nz(3));
 
-        // 50% relative escape, 50% absolute target
         let target = if state.rand_mut().below(nz(2)) == 0 {
             format!("{}{}", "../".repeat(depth), &component[1..])
         } else {
@@ -316,11 +277,6 @@ where
     }
 }
 
-// ── 5. SymlinkEscapeMutator ───────────────────────────────────────────────────
-
-/// Generates symlink targets crafted to escape the rootfs, both relative
-/// (via `../`-chains) and absolute (direct host paths). Applied at a random
-/// existing path or at a synthetic new path.
 pub struct SymlinkEscapeMutator {
     pub index: Arc<BaselineIndex>,
 }
@@ -347,18 +303,15 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        // 40% absolute, 60% relative
         let target = if state.rand_mut().below(nz(100)) < 40 {
             (*pick(state.rand_mut(), ABSOLUTE_TARGETS)).to_string()
         } else {
-            let depth = 2 + state.rand_mut().below(nz(7)); // 2–8 hops
+            let depth = 2 + state.rand_mut().below(nz(7));
             let suffix = *pick(state.rand_mut(), RELATIVE_TARGETS);
             format!("{}{}", "../".repeat(depth), suffix)
         };
 
-        // 60% synthetic path, 40% replace an existing path from index
         let path = if state.rand_mut().below(nz(100)) < 60 || self.index.entries.is_empty() {
-            // Synthetic path at a crun-relevant location
             let base = *pick(state.rand_mut(), &["/bin", "/etc", "/lib", "/proc", "/dev"]);
             format!("{}/escape", base)
         } else {
@@ -380,10 +333,6 @@ where
     }
 }
 
-// ── 6. LoopAndDepthMutator ────────────────────────────────────────────────────
-
-/// Creates symlink loops and chains. Useful for ELOOP robustness testing.
-/// Lower mutation weight than the crun-specific mutators above.
 pub struct LoopAndDepthMutator;
 
 impl LoopAndDepthMutator {
@@ -420,7 +369,7 @@ where
             }
             input.ops.push(FsOp::create_symlink(path, path));
         } else if r < 40 {
-            // Two-cycle: /a -> /b, /b -> /a
+            // Two-cycle
             if input.ops.len() + 2 > MAX_OPS {
                 return Ok(MutationResult::Skipped);
             }

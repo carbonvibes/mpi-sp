@@ -17,13 +17,12 @@ pub enum FsOpKind {
 #[derive(Clone, Debug, Hash, Serialize, Deserialize)]
 pub struct FsOp {
     pub kind: FsOpKind,
-    /// Absolute path — must start with '/'.
+    /// Must start with '/'.
     pub path: String,
-    /// Content bytes for CreateFile / UpdateFile ops.
     pub content: Vec<u8>,
-    /// Semantic size: content length for file ops, new size for Truncate, 0 otherwise.
+    /// Content length for file ops, new size for Truncate, 0 otherwise.
     pub size: usize,
-    /// Symlink target for CreateSymlink ops. Separate from content to keep JSON readable.
+    // Kept separate from content so the JSON sidecar stays human-readable.
     #[serde(default)]
     pub target: String,
     pub mtime_sec: i64,
@@ -172,8 +171,7 @@ impl FsDelta {
         self.ops.len()
     }
 
-    /// Strip redundant content ops — for any path with multiple
-    /// CreateFile/UpdateFile ops, only the last one matters.
+    /// For any path with multiple CreateFile/UpdateFile ops, only the last one is kept.
     pub fn dedup_content_ops(&self) -> Self {
         let mut last_content_idx: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
@@ -227,13 +225,12 @@ impl Input for FsDelta {
     }
 }
 
-/// Build a minimal valid starting delta using UpdateFile so it hits the
-/// existing /input baseline without EEXIST.
+// UpdateFile rather than CreateFile so it doesn't hit EEXIST on the baseline /input.
 pub fn generate_seed() -> FsDelta {
     FsDelta::new(vec![FsOp::update_file("/input", b"seed".to_vec())])
 }
 
-/// Generate a set of structurally diverse seed deltas against known baseline paths.
+/// Structurally diverse seed deltas targeting known baseline paths.
 pub fn generate_seed_corpus(baseline_files: &[String]) -> Vec<FsDelta> {
     let primary = baseline_files
         .first()
@@ -270,7 +267,7 @@ pub fn generate_seed_corpus(baseline_files: &[String]) -> Vec<FsDelta> {
     ]
 }
 
-/// Fixed donor pool for SpliceDelta before a real corpus has accumulated.
+/// Donor pool for SpliceDelta before the corpus has grown.
 pub fn initial_corpus_pool() -> Vec<FsDelta> {
     vec![
         FsDelta::new(vec![FsOp::update_file(
@@ -339,7 +336,7 @@ mod tests {
 
     #[test]
     fn seed_one_uses_update_not_create() {
-        // UpdateFile avoids EEXIST on /input which already exists in the baseline
+        // CreateFile would hit EEXIST because /input already exists in the baseline
         let files = vec!["/input".to_string()];
         let corpus = generate_seed_corpus(&files);
         let first_op = &corpus[0].ops[0];

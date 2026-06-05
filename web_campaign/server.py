@@ -12,12 +12,12 @@ from pathlib import Path
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8090
 
 CAMPAIGNS = [
-    {"id": "c1_0", "label": "C1-inst-0", "dir": Path("/tmp/c1_0"), "color": "#58a6ff"},
-    {"id": "c1_1", "label": "C1-inst-1", "dir": Path("/tmp/c1_1"), "color": "#79c0ff"},
-    {"id": "c1_2", "label": "C1-inst-2", "dir": Path("/tmp/c1_2"), "color": "#a5d6ff"},
-    {"id": "c3_0", "label": "C3-inst-0", "dir": Path("/tmp/c3_0"), "color": "#ffa657"},
-    {"id": "c3_1", "label": "C3-inst-1", "dir": Path("/tmp/c3_1"), "color": "#ffb74d"},
-    {"id": "c3_2", "label": "C3-inst-2", "dir": Path("/tmp/c3_2"), "color": "#ffd180"},
+    {"id": "c3_0", "label": "C3-inst-0", "dir": Path("/tmp/c3_0"), "color": "#58a6ff"},
+    {"id": "c3_1", "label": "C3-inst-1", "dir": Path("/tmp/c3_1"), "color": "#3fb950"},
+    {"id": "c3_2", "label": "C3-inst-2", "dir": Path("/tmp/c3_2"), "color": "#f78166"},
+    {"id": "c3_3", "label": "C3-inst-3", "dir": Path("/tmp/c3_3"), "color": "#d2a8ff"},
+    {"id": "c3_4", "label": "C3-inst-4", "dir": Path("/tmp/c3_4"), "color": "#ffa657"},
+    {"id": "c3_5", "label": "C3-inst-5", "dir": Path("/tmp/c3_5"), "color": "#39d353"},
 ]
 
 def parse_fuzzer_stats(path):
@@ -79,6 +79,32 @@ def parse_plot_data(path):
     indices = sorted(set(round(i * step) for i in range(n)))
     return [series[i] for i in indices]
 
+def parse_restarts(campaign_dir):
+    """Return list of Unix timestamps from restarts.log (one per restart event)."""
+    events = []
+    try:
+        with open(campaign_dir / "restarts.log") as f:
+            for line in f:
+                line = line.strip()
+                if line.isdigit():
+                    events.append(int(line))
+    except FileNotFoundError:
+        pass
+    return events
+
+def count_crashes(campaign_dir):
+    """Count actual crash files — LibAFL's saved_crashes counter is always 0 (known bug).
+    Each crash produces: combined_N (binary) + combined_N.json (sidecar) + dot-prefixed
+    metadata. Count only the binary files: named combined_* with no extension."""
+    crashes_dir = campaign_dir / "crashes"
+    try:
+        return sum(
+            1 for f in crashes_dir.iterdir()
+            if f.name.startswith("combined_") and "." not in f.name
+        )
+    except FileNotFoundError:
+        return 0
+
 def get_campaign_data(c):
     stats  = parse_fuzzer_stats(c["dir"] / "fuzzer_stats")
     series = parse_plot_data(c["dir"] / "plot_data")
@@ -90,7 +116,7 @@ def get_campaign_data(c):
         "exec_sec": execs_done / max(run_time, 1),
         "edges":   int(stats.get("edges_found",   0) or 0),
         "corpus":  int(stats.get("corpus_count",  0) or 0),
-        "crashes": int(stats.get("saved_crashes", 0) or 0),
+        "crashes": count_crashes(c["dir"]),
         "run_time": run_time,
     }
     stats_path = c["dir"] / "fuzzer_stats"
@@ -100,12 +126,13 @@ def get_campaign_data(c):
         alive = False
 
     return {
-        "id":      c["id"],
-        "label":   c["label"],
-        "color":   c["color"],
-        "running": alive,
-        "latest":  latest,
-        "series":  series,
+        "id":       c["id"],
+        "label":    c["label"],
+        "color":    c["color"],
+        "running":  alive,
+        "latest":   latest,
+        "series":   series,
+        "restarts": parse_restarts(c["dir"]),
     }
 
 def get_data():

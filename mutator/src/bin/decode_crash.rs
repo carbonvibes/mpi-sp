@@ -1,11 +1,3 @@
-//! decode_crash — dump a binary CombinedInput crash artifact as JSON.
-//!
-//! Usage:
-//!   decode_crash <crash_file> [grammar.py]
-//!
-//! If grammar.py is omitted it defaults to the standard path in the Nix store.
-//! Prints the config JSON and rootfs ops to stdout.
-
 use std::path::PathBuf;
 
 use fs_mutator::delta::FsDelta;
@@ -38,20 +30,18 @@ fn main() {
             .to_string()
     });
 
-    // Load grammar context (needed to render NautilusInput → JSON bytes)
     let context: &'static NautilusContext =
         Box::leak(Box::new(NautilusContext::from_file(100, &grammar_path).unwrap_or_else(|e| {
             eprintln!("Failed to load grammar from {grammar_path}: {e}");
             std::process::exit(1);
         })));
 
-    // Deserialize the crash file (postcard binary, LibAFL default format)
+    // postcard binary format, LibAFL default
     let input = CombinedInput::from_file(&crash_path).unwrap_or_else(|e| {
         eprintln!("Failed to decode {crash_path}: {e}");
         std::process::exit(1);
     });
 
-    // Render config via Nautilus
     let mut conv = NautilusBytesConverter::new(context);
     let config_bytes = conv.to_target_bytes(&input.config);
     let config_json: serde_json::Value = serde_json::from_slice(&*config_bytes)
@@ -59,7 +49,6 @@ fn main() {
             String::from_utf8_lossy(&*config_bytes).to_string(),
         ));
 
-    // Build output
     let out = serde_json::json!({
         "source": crash_path,
         "config": config_json,

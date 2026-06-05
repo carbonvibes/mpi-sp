@@ -34,9 +34,9 @@ use fs_mutator::ffi::{
 };
 
 const DEFAULT_GRAMMAR: &str =
-    "/nix/store/2hpav3yiv5fffrs9g3mf0lx21y7dxk41-crun-fuzzer-0.0.1/share/grammar.py";
+    "/nix/store/w6332yzld9fj1q6mymki1kmcvk2ks9y2-crun-fuzzer-0.0.1/share/grammar.py";
 const DEFAULT_HARNESS: &str =
-    "/nix/store/arwkshyi5pj6f4j6a6nrvrf89irhgdp4-crun-harness-1.23.1/bin/crun";
+    "/nix/store/nm1sr5r2gzckh90y68avwa6fzp8hq83i-crun-harness-1.23.1/bin/crun";
 
 // ── CombinedInput ─────────────────────────────────────────────────────────────
 // Identical layout to the one in fuzz_combined_afl.rs and decode_crash.rs.
@@ -117,6 +117,29 @@ fn start_fuse(_vfs: *mut VfsT, _mountpoint: &str) {
 fn override_rootfs_path(json: &[u8], fuse_rootfs: &str) -> Option<Vec<u8>> {
     let mut v: serde_json::Value = serde_json::from_slice(json).ok()?;
     let obj = v.as_object_mut()?;
+
+    // Without a mount namespace crun performs mounts in the caller's own namespace.
+    // A symlink escape + grammar-generated mount can then shadow the FUSE mountpoint.
+    // Identical to fuzz_combined_afl.rs.
+    {
+        let linux = obj
+            .entry("linux")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(l) = linux.as_object_mut() {
+            let ns = l
+                .entry("namespaces")
+                .or_insert_with(|| serde_json::json!([]));
+            if let Some(arr) = ns.as_array_mut() {
+                let has_mount = arr
+                    .iter()
+                    .any(|n| n.get("type").and_then(|t| t.as_str()) == Some("mount"));
+                if !has_mount {
+                    arr.push(serde_json::json!({"type": "mount"}));
+                }
+            }
+        }
+    }
+
     let root = obj
         .entry("root")
         .or_insert_with(|| serde_json::json!({"readonly": false}));
@@ -253,6 +276,7 @@ fn main() {
     let config_path = format!("/tmp/replay_config_{}.json", std::process::id());
     std::fs::write(&config_path, &cfg_bytes).expect("failed to write config.json");
     eprintln!("[replay] config.json → {config_path}");
+    eprintln!("[replay] config contents:\n{}", String::from_utf8_lossy(&cfg_bytes));
 
     // ── Run harness ───────────────────────────────────────────────────────────
     let output = Command::new(&harness)

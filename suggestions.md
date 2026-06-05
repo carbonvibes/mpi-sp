@@ -95,6 +95,3 @@ pivot_root — now the FUSE mount is /
 After pivot_root: find_executable("/bin/bash") → access("/bin/bash", X_OK) → hits our FUSE file now served as 0755 → passes
 exec("/bin/bash") → our static exit(0) runs → exits
 Parent cleans up cgroup + state dir
-
-
-Hello , quick update on coverage, we were plateauing at ~14% and figured out something. After `pivot_root`, crun checks execute permission on the process binary before exec'ing it, but our FUSE layer was serving files as 0644 so that check always failed and exec never happened. Fixed the FUSE mode to 0755 and replaced the dummy placeholder binaries in the rootfs baseline (like `/bin/bash`) with actual static exit(0) binaries, they were essentially empty/non-executable before so exec always failed anyway. Also populated the baseline with the other paths the grammar generates. So technically we can now cover code past crun exec'ing. Now hitting 1680 edges (15%+) within the first few minutes vs plateauing at 1650 after 10+ hours before.

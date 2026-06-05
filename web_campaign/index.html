@@ -123,6 +123,24 @@
   .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; }
   .legend-swatch { width: 12px; height: 12px; border-radius: 2px; flex-shrink: 0; }
   .legend-dead { color: var(--muted); text-decoration: line-through; }
+
+  /* ── Restarts table ── */
+  .restarts-grid {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 10px;
+  }
+  .restart-col { }
+  .restart-col-header {
+    font-size: 11px; font-weight: 700; letter-spacing: .8px;
+    text-transform: uppercase; margin-bottom: 6px;
+    padding-bottom: 4px; border-bottom: 1px solid var(--border);
+  }
+  .restart-none { color: var(--muted); font-size: 11px; }
+  .restart-event {
+    font-size: 11px; color: var(--yellow);
+    padding: 2px 0; border-bottom: 1px solid #ffffff08;
+  }
 </style>
 </head>
 <body>
@@ -174,6 +192,15 @@
     </div>
     <div class="chart-wrap"><canvas id="chart-execsec"></canvas></div>
     <div class="legend" id="legend-execsec"></div>
+  </div>
+
+  <!-- Forkserver restarts -->
+  <div class="section">
+    <div class="section-header">
+      <span>Forkserver Restarts</span>
+      <span id="hdr-restarts" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--yellow)">—</span>
+    </div>
+    <div id="restarts-table" style="padding:12px 18px;font-family:'JetBrains Mono',monospace;font-size:12px;"></div>
   </div>
 
 </main>
@@ -369,6 +396,7 @@ function render(data) {
   const cardsEl = document.getElementById('cards');
   cardsEl.innerHTML = campaigns.map(c => {
     const l = c.latest;
+    const restarts = (c.restarts || []).length;
     const edgesPct = l.edges ? ((l.edges / 11072) * 100).toFixed(1) : '0.0';
     const deadCls = c.running ? '' : ' dead';
     const pillCls = c.running ? 'running' : 'dead';
@@ -383,6 +411,7 @@ function render(data) {
       <div class="card-edges" style="color:${c.color}">${fmtExactNum(l.edges)}<span style="color:var(--muted);font-size:13px"> / 11072</span></div>
       <div class="card-sub">${edgesPct}% edges &nbsp;·&nbsp; ${fmtNum(l.exec_sec)} ex/s</div>
       <div class="card-sub">corpus: ${l.corpus} &nbsp;·&nbsp; crashes: ${l.crashes}</div>
+      <div class="card-sub" style="color:${restarts > 0 ? 'var(--yellow)' : 'var(--muted)'}">restarts: ${restarts}</div>
       <div class="card-elapsed">${fmtElapsed(l.run_time)}</div>
     </div>`;
   }).join('');
@@ -404,6 +433,30 @@ function render(data) {
   buildLegend('legend-edges',   campaigns);
   buildLegend('legend-corpus',  campaigns);
   buildLegend('legend-execsec', campaigns);
+
+  // Restarts section
+  const totalRestarts = campaigns.reduce((s, c) => s + (c.restarts || []).length, 0);
+  document.getElementById('hdr-restarts').textContent =
+    totalRestarts === 0 ? 'none' : `${totalRestarts} total`;
+  document.getElementById('hdr-restarts').style.color =
+    totalRestarts === 0 ? 'var(--green)' : 'var(--yellow)';
+
+  document.getElementById('restarts-table').innerHTML =
+    `<div class="restarts-grid">${campaigns.map(c => {
+      const events = c.restarts || [];
+      const eventsHtml = events.length === 0
+        ? '<div class="restart-none">none</div>'
+        : events.map(ts => {
+            const d = new Date(ts * 1000);
+            const hms = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+            const date = d.toLocaleDateString([], {month:'short', day:'numeric'});
+            return `<div class="restart-event">${date} ${hms}</div>`;
+          }).join('');
+      return `<div class="restart-col">
+        <div class="restart-col-header" style="color:${c.color}">${c.label} (${events.length})</div>
+        ${eventsHtml}
+      </div>`;
+    }).join('')}</div>`;
 }
 
 // Kick off

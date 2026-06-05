@@ -104,10 +104,10 @@ for rootfs, running together in one fuzzer.
 
 > **All three campaigns use the exact same Nix-built crun binary from SemanticSanitizer.**
 
+### Production binary (main campaigns — full speed, no overhead)
 ```
 /nix/store/arwkshyi5pj6f4j6a6nrvrf89irhgdp4-crun-harness-1.23.1/bin/crun
 ```
-
 This is crun 1.23.1 patched with `0001-crun-add-harness.patch` (7th rebuild — all bugs fixed),
 compiled with `afl-clang-lto` via Nix. Using the same binary across all campaigns guarantees:
 - Identical instrumentation
@@ -116,6 +116,33 @@ compiled with `afl-clang-lto` via Nix. Using the same binary across all campaign
 
 Do NOT use the manually built `crun-afl/crun` — it produces 19776 edges (different
 systemd linkage) making cross-campaign comparison invalid.
+
+### ASAN binary (triage and crash analysis only — not for campaign runs)
+
+The harness patch has an `#ifdef ENABLE_ASAN` block that sets up ASAN options at process
+startup (writes reports to `/tmp/asan_reports/crun_asan.<pid>`, `abort_on_error=1` so
+AFL++ still sees SIGABRT, no leak detection). A separate Nix package builds it:
+
+```
+/nix/store/rc2jnhbq6n62xjql87jm22xibad02n2n-crun-harness-asan-1.23.1/bin/crun
+```
+
+Rebuild if needed:
+```bash
+cd /home/arjun/mpi-sp/SemanticSanitizer
+/nix/var/nix/profiles/default/bin/nix build "path:/home/arjun/mpi-sp/SemanticSanitizer#artifact-eval.crun-harness-asan"
+# result/bin/crun → new store path
+```
+
+Use this binary only with `replay_crash` to get stack traces for known crashes.
+ASAN reports land in `/tmp/asan_reports/crun_asan.<pid>` — one file per crash,
+includes error type, full stack trace, and allocation/free sites.
+
+**To remove ASAN completely and restore full performance:**
+1. Delete `SemanticSanitizer/nix/packages/by-name/artifact-eval/crun-harness-asan/` — removes the ASAN derivation
+2. The `#ifdef ENABLE_ASAN` block in the patch is dead code in the production binary — no rebuild needed
+3. `launch_campaigns.sh` already points to `arwkshyi5...` — no change needed
+4. `rm -rf /tmp/asan_reports` to clean up reports
 
 ---
 
@@ -596,3 +623,173 @@ instead of climbing to thousands.
 saved_crashes is initialized to 0 on line 828 and is never incremented anywhere in the file. There's no saved_crashes += 1 anywhere. It's a LibAFL 0.15.4 bug — the counter field exists in the struct but the update code is missing. The stat is permanently hardcoded to 0.
 
 The last_crash and execs_since_crash fields are only updated inside #[cfg(feature = "track_hit_feedbacks")] blocks — meaning they require a non-default feature flag that almost certainly isn't enabled. So last_crash stays at start_time (the initialized value) and execs_since_crash stays at execs_done.
+
+---
+
+#### Bug 14 — False positive crash detection: synthetic SIGSEGV and ret>128 re-raise recorded non-bugs as crashes
+
+**Discovered:** 2026-05-30
+**Symptom:** 264 saved crashes across all instances, zero ASAN reports in `/tmp/asan_reports/`. Running with ASAN binary confirmed: no actual memory corruption in any of the 264 recorded crashes.
+
+**Root cause — two synthetic raise paths:**
+
+1. `child_crashed` detection: when `libcrun_container_run` returned `ret < 0` with `err->status == 0` and a sync-channel message, the harness called `raise(SIGSEGV)`. This fires when the container init child died by signal before exec — which is expected and correct behavior for invalid OCI configs (missing `/dev`, broken namespace combos, seccomp blocking a needed syscall). These are not crun bugs; crun correctly set up what the config requested and the child died as a result.
+
+2. `ret > 128` re-raise: when the container process was killed by a signal (e.g., SIGKILL from OOM, or SIGSYS from seccomp), `libcrun_container_run` returns `128 + N`. The harness re-raised signal N, causing AFL to record it as a crash. Again, this is expected container behavior, not a crun bug.
+
+**Why ASAN reports were empty:** ASAN only writes a report on actual memory violations (heap overflow, UAF, stack overflow). `raise()` bypasses ASAN entirely — it never ran its detection logic. All 264 crashes were synthetic.
+
+**Fix:** Remove both raise paths. Only real crashes remain:
+- Genuine SIGSEGV/SIGABRT inside crun's own code path (ASAN would catch the root cause and write a report)
+- ASAN-detected memory errors → report written to `/tmp/asan_reports/crun_asan.<pid>`, process exits via SIGABRT (`abort_on_error=1`), AFL records crash
+
+The harness now calls `libcrun_error_release`, `rmdir_rec`, and `libcrun_container_free` unconditionally (success or failure) and loops with `continue`. No synthetic signals.
+
+**ASAN binary rebuilt:** 8th rebuild:
+```
+/nix/store/4w5j3vmpd4rl71c0vxzkl5mwq4mqjnz7-crun-harness-asan-1.23.1/bin/crun  ← current ASAN binary
+```
+
+`launch_campaigns.sh` updated to point to this path.
+
+---
+
+### Build commands reference
+
+**Build ASAN harness** (stage changes first — Nix uses git index):
+```bash
+cd /home/arjun/mpi-sp/SemanticSanitizer
+git add case-studies/oci/0001-crun-add-harness.patch
+/nix/var/nix/profiles/default/bin/nix build .#"artifact-eval.crun-harness-asan"
+```
+
+**Build production harness** (no ASAN):
+```bash
+/nix/var/nix/profiles/default/bin/nix build .#"artifact-eval.crun-harness"
+```
+
+**Get binary path from result symlink after either build:**
+```bash
+readlink -f result/bin/crun
+# or: echo "$(readlink result)/bin/crun"
+```
+
+Then paste the printed path into `CRUN=` in `launch_campaigns.sh`.
+
+---
+
+## Phase 2 — Grammar Expansion (completed 2026-06-02)
+
+### Coverage analysis findings (Phase 1 result)
+
+Ran LLVM coverage replay over 1561 corpus entries across 6 instances.
+Overall: **17.41% line coverage, 30.38% function coverage**.
+
+Key gaps confirmed (parent-side, genuinely unreached):
+- `seccomp.c` 22.52% — filter building parent-side, no syscall rules with arg filters or architectures
+- `container.c` 19.11% — hooks dispatch (`do_hooks`) never called, no hooks in grammar
+- `cgroup-resources.c` 21.82% — no devices/blockIO/hugepageLimits in grammar
+- `linux.c` 15.31% — no capabilities, rlimits, sysctl, hostname in grammar
+- `signals.c` 0% — no stopSignal in grammar
+- `mount_flags.c` 0% — no mount propagation options in grammar
+
+Full analysis in `better.md` (Phase 1 Results section).
+
+### Grammar changes made
+
+**Source:** `SemanticSanitizer/case-studies/oci/grammar.py`
+
+**New grammar Nix store path:**
+```
+/nix/store/p3bm9g848p95kr4avw01ags8gf1rp8nk-crun-fuzzer-0.0.1/share/grammar.py
+```
+
+**Both scripts updated:**
+- `launch_campaigns.sh` — `FUZZER` and `GRAMMAR` point to new path
+- `run_coverage.sh` — `GRAMMAR` points to new path
+
+**What was added to the grammar:**
+
+| Section | What was added |
+|---|---|
+| `OCI_CONFIG` | Variants with `hooks` and `hostname`/`domainName` at top level |
+| `PROCESS` | New variants including capabilities, rlimits, noNewPrivileges, stopSignal |
+| `CAPABILITIES` | New — all 5 sets (bounding/effective/permitted/inheritable/ambient), 20 capability values |
+| `RLIMITS` | New — 13 rlimit types (RLIMIT_NOFILE, NPROC, CORE, CPU, DATA, FSIZE, etc.) with hard/soft |
+| `NO_NEW_PRIVS` | New — `noNewPrivileges: true/false` |
+| `STOP_SIGNAL` | New — 7 signal variants (SIGTERM, SIGKILL, SIGHUP, etc.) |
+| `HOSTNAME_FIELD` | New — hostname + optional domainName |
+| `HOOKS` | New — prestart, poststart, poststop, createRuntime, createContainer, startContainer with path/args/env/timeout |
+| `RESOURCES` | New variants adding devices (allow/deny rules), blockIO (weight), hugepageLimits |
+| `SECCOMP` | Added: architectures field, syscall arg filters (index/value/op/MASKED_EQ), SCMP_ACT_NOTIFY/LOG/TRACE/KILL_PROCESS, 15+ new syscall name groups |
+| `SYSCTL` | Added: 9 more sysctl keys, multi-key entries |
+| `MOUNTS` | Added: options field (propagation flags, ro/nosuid/nodev), multiple mounts (2-3 per config) |
+| `LINUX` | Added: 5 new variant combinations |
+| `NAMESPACE_TYPE` | Added: `time` namespace |
+
+### Build command for grammar
+
+```bash
+cd /home/arjun/mpi-sp/SemanticSanitizer
+git add case-studies/oci/grammar.py
+/nix/var/nix/profiles/default/bin/nix build .#"artifact-eval.crun-fuzzer"
+readlink -f result/share/grammar.py   # prints new Nix store path
+```
+
+Then update `GRAMMAR=` and `FUZZER=` in `launch_campaigns.sh` and `GRAMMAR=` in `run_coverage.sh`.
+
+### Next step
+
+Start fresh campaigns with new grammar (not `--resume` — new grammar needs fresh seeds):
+```bash
+sudo bash launch_campaigns.sh
+```
+
+After 4-6 hours, run coverage again to measure improvement:
+```bash
+sudo bash run_coverage.sh
+```
+
+Expected: AFL++ edges from ~1688 → 3000-4500, seccomp.c from 22% → 70%+, container.c hooks from 0% → 30%+.
+
+---
+
+## Phase 2b — Grammar Patch 2 (2026-06-03)
+
+### Coverage results from Phase 2 (measured 2026-06-03)
+
+- Overall lines: 17.41% → **21.05%** (+3.64pp)
+- Functions: 30.38% → **35.12%** (+4.74pp)
+- Branches: 11.52% → **14.31%** (+2.79pp)
+- Big win: `ebpf.c` 0% → 57% (RESOURCES_DEVICES triggering BPF device code)
+- `seccomp.c` get_seccomp_action still 0% (corpus restart + defaultAction=ERRNO kills container)
+
+### Grammar path history
+
+| Version | Path |
+|---|---|
+| Original (Phase 1) | `/nix/store/2hpav3yiv5fffrs9g3mf0lx21y7dxk41-crun-fuzzer-0.0.1/share/grammar.py` |
+| Patch 1 (Phase 2, 2026-06-02) | `/nix/store/w6332yzld9fj1q6mymki1kmcvk2ks9y2-crun-fuzzer-0.0.1/share/grammar.py` |
+| Patch 2 (Phase 2b, 2026-06-03) | `/nix/store/p3bm9g848p95kr4avw01ags8gf1rp8nk-crun-fuzzer-0.0.1/share/grammar.py` |
+
+`launch_campaigns.sh` and `run_coverage.sh` already updated to this path.
+
+### Changes in patch 2
+
+1. **4 safe-ALLOW seccomp static rules** — defaultAction=ALLOW + specific ERRNO/KILL/LOG per-syscall rules. Container runs successfully → corpus entry (not crash) → `get_seccomp_action` gets called during filter building.
+2. **`run.oci.handler` + `module.wasm.image/variant` annotations** — triggers `custom-handler.c` (crun's wasm/module delegation). Different from OCI lifecycle hooks which go through container.c.
+3. **3 new LINUX variants with `cgroupsPath`** — exercises `cgroup-setup.c` which was at 9.47%.
+4. **2 more `cgroupsPath` values** — more cgroup path diversity.
+
+### Build command used
+
+```bash
+cd /home/arjun/mpi-sp/SemanticSanitizer
+git add case-studies/oci/grammar.py
+/nix/var/nix/profiles/default/bin/nix build .#"artifact-eval.crun-fuzzer"
+readlink -f result/share/grammar.py
+```
+
+### Next measurement
+
+After 24h: `sudo bash run_coverage.sh` — check `get_seccomp_action`, `custom-handler.c`, `cgroup-setup.c`.
