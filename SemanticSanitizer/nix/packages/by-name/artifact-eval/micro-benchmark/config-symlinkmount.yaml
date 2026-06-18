@@ -1,0 +1,2 @@
+comm: benchmark-symlinkmount
+symlinkMount: true

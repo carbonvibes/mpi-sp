@@ -1,0 +1,13 @@
+name: dirownership
+
+kprobes:
+  unsafe_move_mount:
+    function: do_move_mount
+  unsafe_rmdir:
+    function: vfs_rmdir
+  unsafe_chmod:
+    function: chmod_common
+  unsafe_chown:
+    function: chown_common
+  unsafe_execve:
+    function: bprm_execve

@@ -1,0 +1,41 @@
+name: afl-benchmark
+description: Run the AFL++ performance benchmark
+
+inputs:
+  artifact-name:
+    description: Name of the results artifact to upload
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Clone AFL++ Repository
+      shell: bash
+      run: |
+        git clone --depth 1 --branch v4.31c https://github.com/AFLplusplus/AFLplusplus
+        cd AFLplusplus
+
+    - name: Use AFL++ Compilers from Nix
+      shell: bash
+      run: |
+          afl_path=$(nix build .#aflplusplus --no-link --print-out-paths)
+          ln -s $afl_path/bin/afl-cc AFLplusplus/afl-cc
+          ln -s $afl_path/bin/afl-clang-lto AFLplusplus/afl-clang-lto
+
+    - name: Configure System for AFL++
+      shell: bash
+      run: |
+          sudo AFLplusplus/afl-system-config
+          echo YES | sudo AFLplusplus/afl-persistent-config
+
+    - name: Run Benchmark
+      shell: nix shell .#aflplusplus --command bash {0}
+      run: |
+        cd AFLplusplus/benchmark
+        python3 benchmark.py
+
+    - name: Upload Benchmark Results
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+          name: ${{ inputs.artifact-name }}
+          path: AFLplusplus/benchmark/benchmark-results.jsonl

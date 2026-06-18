@@ -1,0 +1,49 @@
+name: AFL++ Performance Benchmark
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 8 * * *'
+
+jobs:
+  sanitized:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Nix Environment
+        uses: ./.github/actions/setup-nix
+        with:
+            github-token: ${{ github.token }}
+
+      - name: Start sanitizer
+        shell: bash
+        run: |
+            just codegen
+            cp benchmark/test-config.yaml config.yaml
+            just run attach &
+
+      - name: Run AFL++ Benchmark
+        uses: ./.github/actions/afl-benchmark
+        with:
+            artifact-name: afl-benchmark-results-sanitized.jsonl
+
+  unsanitized:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Nix Environment
+        uses: ./.github/actions/setup-nix
+        with:
+            github-token: ${{ github.token }}
+
+      - name: Run AFL++ Benchmark
+        uses: ./.github/actions/afl-benchmark
+        with:
+            artifact-name: afl-benchmark-results-unsanitized.jsonl

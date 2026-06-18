@@ -1,0 +1,29 @@
+name: Artifact Eval
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 8 * * *'
+
+jobs:
+  micro-benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Nix Environment
+        uses: ./.github/actions/setup-nix
+        with:
+            github-token: ${{ github.token }}
+
+      - name: Run Micro-Benchmark
+        shell: bash
+        run: |
+          just codegen
+          just build
+          nix run .#artifact-eval.micro-benchmark
+           

@@ -1,0 +1,32 @@
+name: symlinkmount
+
+bindingStructs:
+  - definition: type SymlinkEventT struct { Inode uint64; Name uintptr }
+
+maps:
+  - name: symlink_events
+    type: lru_hashmap
+    keyType: uint64
+    valueType: symlink_event_t
+    maxEntries: 1024
+
+  - name: last_symlink
+    type: array
+    keyType: uint32
+    valueType: char[255]
+    maxEntries: 1
+
+  - name: dev_name
+    type: array
+    keyType: uint32
+    valueType: char[255]
+    maxEntries: 1
+
+kprobes:
+  trace_vfs_symlink:
+    function: vfs_symlink
+
+tracepoints:
+  symlink_mount:
+    group: syscalls
+    name: sys_enter_mount

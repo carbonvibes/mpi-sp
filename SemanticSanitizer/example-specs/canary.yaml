@@ -1,0 +1,16 @@
+name: canary
+
+bindingStructs:
+  - definition: type CanaryRule struct { ArgIdx uint32; DisallowedStr [256]byte }
+
+maps:
+  - name: canaries
+    type: array
+    keyType: uint32
+    valueType: struct canary_rule
+    maxEntries: 400
+
+tracepoints:
+  sys_enter:
+    group: raw_syscalls
+    name: sys_enter

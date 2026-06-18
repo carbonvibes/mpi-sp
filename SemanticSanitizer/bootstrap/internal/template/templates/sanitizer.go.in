@@ -1,0 +1,47 @@
+package {{ .Name | goFilename }}
+{{ $goName := .Name | goFilename}}
+import (
+	"fmt"
+
+	"github.com/cilium/ebpf/link"
+	"github.com/msanft/SemanticSanitizer/internal/config"
+)
+
+{{ range $_, $bindingStruct := .BindingStructs }}
+{{ $bindingStruct.GoDefinition }}
+
+{{ end }}
+func Attach(conf *config.SanitizerConfig) ([]link.Link, error) {
+	objs := {{ $goName }}Objects{}
+	if err := load{{ $goName | firstUpper }}Objects(&objs, nil); err != nil {
+		return nil, fmt.Errorf("load {{ $goName }} objects: %w", err)
+	}
+	defer objs.Close()
+
+    // (Optional) TODO: Use configuration values and transform to BPF map, as necessary.
+
+    {{ range $name, $tp := .Tracepoints }}
+    {{ $goName := $name | cToGoName}}
+	{{ $goName }}Tracepoint, err := link.Tracepoint(
+        "{{ $tp.Group }}", "{{ $tp.Name }}", objs.{{ $goName | firstUpper }}Wrapper, nil,
+    )
+	if err != nil {
+		return nil, fmt.Errorf("attach to tracepoint '{{ $goName }}': %w", err)
+	}
+    {{ end }}
+    {{ range $name, $kp := .Kprobes }}
+    {{ $goName := $name | cToGoName}}
+	{{ $goName }}Kprobe, err := link.Kprobe(
+        "{{ $kp.Function }}", objs.{{ $goName | firstUpper }}Wrapper, nil,
+    )
+	if err != nil {
+		return nil, fmt.Errorf("attach to kprobe '{{ $kp.Function }}': %w", err)
+	}
+    {{ end }}
+
+	return []link.Link{
+        {{ range $name, $_ := .Tracepoints }}{{ $name | cToGoName }}Tracepoint,
+        {{ end }}{{ range $name, $_ := .Kprobes }}{{ $name | cToGoName }}Kprobe,
+        {{ end }}
+    }, nil
+}

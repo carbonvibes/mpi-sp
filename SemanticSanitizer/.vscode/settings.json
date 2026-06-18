@@ -1,0 +1,6 @@
+{
+    "go.buildTags": "integration",
+    "rust-analyzer.linkedProjects": [
+        "case-studies/oci/fuzzer/Cargo.toml",
+    ]
+}

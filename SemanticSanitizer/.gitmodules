@@ -1,0 +1,6 @@
+[submodule "case-studies/oci/nautilus"]
+	path = case-studies/oci/nautilus
+	url = git@github.com:nautilus-fuzz/nautilus
+[submodule "case-studies/oci/crun"]
+	path = case-studies/oci/crun
+	url = git@github.com:containers/crun

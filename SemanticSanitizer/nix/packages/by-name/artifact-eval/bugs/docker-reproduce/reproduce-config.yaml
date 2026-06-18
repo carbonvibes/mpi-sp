@@ -1,0 +1,3 @@
+comm: dockerd
+dirOwnership: true
+dirOwnershipOpenNoFollow: true

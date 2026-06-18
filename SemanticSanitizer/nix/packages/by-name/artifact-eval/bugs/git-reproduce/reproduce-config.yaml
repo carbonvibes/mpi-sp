@@ -1,0 +1,5 @@
+comm: gitweb.cgi
+canary:
+  execve:
+    argIndex: 1
+    substring: pwned

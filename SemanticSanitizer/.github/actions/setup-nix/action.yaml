@@ -1,0 +1,28 @@
+name: nix-environment
+description: Provision the CI Nix environment
+
+inputs:
+  github-token:
+    description: 'GitHub access token'
+    required: true
+  working-directory:
+    description: 'Working directory'
+    required: false
+    default: '.'
+  enter-dev-shell:
+    description: 'Whether to enter the development shell'
+    default: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Nix
+      uses: cachix/install-nix-action@02a151ada4993995686f9ed4f1be7cfbb229e56f # v31
+      with:
+        github_access_token: ${{ inputs.github-token }}
+
+    - name: Enter Nix shell
+      if: inputs.enter-dev-shell
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: nix run github:nicknovitski/nix-develop/flake-package -- .#default

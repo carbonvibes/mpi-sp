@@ -1,0 +1,78 @@
+//go:build ignore
+
+#define __TARGET_ARCH_x86
+
+#include "../lib/vmlinux.h" // IWYU pragma: keep
+
+#include <linux/types.h>
+#include <linux/limits.h>
+#include <linux/stat.h>
+#include <bpf/bpf_core_read.h>
+#include <bpf/bpf_tracing.h>
+#include "../lib/util.h"
+
+char __license[] SEC("license") = "Dual MIT/GPL";
+
+{{ range $_, $map := .Maps }}
+struct {
+  __uint(type, {{ $map.Type }});
+  __type(key, {{ $map.KeyType }});
+  __type(value, {{ $map.ValueType }});
+  __uint(max_entries, {{ $map.MaxEntries }});
+} {{ $map.Name }} SEC(".maps");
+
+{{ end }}
+{{ range $_, $bindingStruct := .BindingStructs }}
+{{ $bindingStruct.CDefinition }}
+
+{{ end }}
+{{ range $name, $tp := .Tracepoints }}
+static __always_inline int {{ $name }}_filter(struct context *sctx) {
+  __u8 is_violated = 0;
+
+  // Sanitizer logic goes here
+
+  if (is_violated)
+    term_action();
+
+  return 0;
+}
+
+SEC("tracepoint/{{ $tp.Group }}/{{ $tp.Name }}")
+int {{ $name }}_wrapper(struct trace_event_raw_sys_enter *raw_ctx) {
+  if (is_expected_comm() != 0)
+    return 1;
+
+  struct context sctx;
+  INIT_SYSCALL_CTX(&sctx, raw_ctx);
+
+  return {{ $name }}_filter(&sctx);
+}
+
+{{ end }}
+{{ range $name, $kp := .Kprobes }}
+static __always_inline int {{ $name }}_filter(struct context *sctx) {
+  __u8 is_violated = 0;
+
+  // Sanitizer logic goes here
+
+  if (is_violated)
+    term_action();
+
+  return 0;
+}
+
+SEC("kprobe/{{ $kp.Function }}")
+int BPF_KPROBE({{ $name }}_wrapper) {
+  // TODO: Add arguments to BPF_KPROBE as needed, e.g.:
+  // int BPF_KPROBE({{ $name }}_wrapper, struct path *path, umode_t mode)
+
+  struct context sctx;
+  INIT_KFUNC_CTX(&sctx, "{{ $kp.Function }}");
+  // TODO: Set function arguments using INIT_KFUNC_CTX_ARG, e.g.:
+  // INIT_KFUNC_CTX_ARG(&sctx, 0, path);
+
+  return {{ $name }}_filter(&sctx);
+}
+
+{{ end }}

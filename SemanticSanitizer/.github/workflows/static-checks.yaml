@@ -1,0 +1,48 @@
+name: Static Checks
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Nix Environment
+        uses: ./.github/actions/setup-nix
+        with:
+            github-token: ${{ github.token }}
+
+      - name: Format code
+        shell: bash
+        run: |
+          nix fmt
+
+      - name: Check for diff
+        shell: bash
+        run: |
+          diff=$(git diff)
+          if [[ -z "$diff" ]]; then
+            echo "Good job! Everything looks nice and tidy."
+            exit 0
+          fi
+
+          cat << EOF >> "${GITHUB_STEP_SUMMARY}"
+          Please run \`just fmt\` to format your code.
+          Formatter Output:
+          \`\`\`diff
+          ${diff}
+          \`\`\`
+          EOF
+
+          echo "Formatting issues detected. Please run 'just fmt' to format your code."
+          exit 1

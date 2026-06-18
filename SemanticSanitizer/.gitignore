@@ -1,0 +1,58 @@
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Evaluation results
+*.pdf
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# direnv cache
+.direnv/
+
+# Nix output directories
+result*/
+result
+
+# Generated ebpf-go files
+*_bpfel.go
+*_bpfeb.go
+*_bpfel.o
+*_bpfeb.o
+
+# Config file, for testing
+config.yaml
+
+# Spec file, for testing
+spec.yaml
+
+# Generated object files
+*.o
+main
+bootstrap-cli
+semsan-cli
+
+# Eval stuff
+target/
+build/
+mprocs.log

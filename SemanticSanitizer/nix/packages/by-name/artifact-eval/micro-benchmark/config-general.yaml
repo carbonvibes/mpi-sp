@@ -1,0 +1,4 @@
+comm: benchmark-general
+syscalls:
+  ptrace:
+    number: 101

@@ -1,0 +1,5 @@
+comm: rcs
+canary:
+  openat:
+    argIndex: 1
+    substring: secret.txt

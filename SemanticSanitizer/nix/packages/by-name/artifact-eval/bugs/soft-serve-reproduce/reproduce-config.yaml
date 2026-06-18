@@ -1,0 +1,5 @@
+comm: git
+canary:
+  openat:
+    argIndex: 1
+    substring: pwned

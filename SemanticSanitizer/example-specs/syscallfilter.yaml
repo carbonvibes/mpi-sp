@@ -1,0 +1,13 @@
+name: syscallfilter
+
+maps:
+  - name: disallowed_syscalls
+    type: array
+    keyType: uint32
+    valueType: uint8
+    maxEntries: 400
+
+tracepoints:
+  sys_enter:
+    group: raw_syscalls
+    name: sys_enter

@@ -1,0 +1,5 @@
+comm: benchmark-canary
+canary:
+  openat:
+    argIndex: 1
+    substring: canary
