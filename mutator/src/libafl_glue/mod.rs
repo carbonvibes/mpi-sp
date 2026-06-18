@@ -1,3 +1,10 @@
+#[cfg(has_fuse3)]
+pub mod fuse_log_observer;
+#[cfg(has_fuse3)]
+pub mod fs_access_feedback;
+#[cfg(has_fuse3)]
+pub mod bounded_fs_access_feedback;
+
 use crate::delta::{FsDelta, FsOpKind};
 
 /// Returns content of the first CreateFile/UpdateFile op, or empty for metadata-only deltas.

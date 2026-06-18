@@ -94,6 +94,36 @@ extern "C" {
     pub fn fuse_vfs_lib_run(mountpoint: *const c_char) -> c_int;
     pub fn fuse_vfs_lib_is_mounted() -> c_int;
     pub fn fuse_vfs_lib_stop();
+
+    // Per-iteration FUSE access log
+    pub fn fuse_log_clear();
+    pub fn fuse_log_set_active(active: c_int);
+    pub fn fuse_log_get() -> *const FuseIterLog;
+}
+
+pub const FUSE_LOG_CREATE:      u8 = 0;
+pub const FUSE_LOG_WRITE:       u8 = 1;
+pub const FUSE_LOG_MKDIR:       u8 = 2;
+pub const FUSE_LOG_RENAME_FROM: u8 = 3;
+pub const FUSE_LOG_RENAME_TO:   u8 = 4;
+pub const FUSE_LOG_UNLINK:      u8 = 5;
+pub const FUSE_LOG_RMDIR:       u8 = 6;
+pub const FUSE_LOG_ENOENT:      u8 = 7;
+pub const FUSE_LOG_SYMLINK:     u8 = 8;
+
+pub const FUSE_LOG_MAX_ENTRIES: usize = 512;
+pub const FUSE_LOG_PATH_MAX:    usize = 256;
+
+#[repr(C)]
+pub struct FuseLogEntry {
+    pub path: [u8; FUSE_LOG_PATH_MAX],
+    pub kind: u8,
+}
+
+#[repr(C)]
+pub struct FuseIterLog {
+    pub entries: [FuseLogEntry; FUSE_LOG_MAX_ENTRIES],
+    pub n:       c_int,
 }
 
 // failed > 0 is normal fuzzer behaviour, not an error.

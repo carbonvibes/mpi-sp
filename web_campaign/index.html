@@ -148,6 +148,7 @@
 <header>
   <div class="logo"><span>Fuzz</span> Parallel Dashboard</div>
   <div class="hdr-right">
+    <div class="badge" id="semsan-badge" title="" style="cursor:help">SemSan —</div>
     <div class="badge running-count" id="hdr-status">—</div>
     <div class="badge elapsed" id="hdr-elapsed">00:00:00</div>
     <div class="badge"><span class="status-dot dot-pulse" style="background:var(--green)"></span>auto-refresh 5s</div>
@@ -385,6 +386,20 @@ function render(data) {
   document.getElementById('ts-badge').textContent =
     d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
 
+  // SemSan monitor badge (findings count; recent findings on hover)
+  const s = data.semsan || {present: false};
+  const sb = document.getElementById('semsan-badge');
+  if (!s.present) {
+    sb.textContent = 'SemSan off';
+    sb.style.color = 'var(--muted)';
+    sb.title = 'no /tmp/semsan.log — monitor not running';
+  } else {
+    sb.textContent = `SemSan: ${s.findings} finding${s.findings === 1 ? '' : 's'}`;
+    sb.style.color = s.findings > 0 ? 'var(--red)' : (s.running ? 'var(--green)' : 'var(--yellow)');
+    sb.title = (s.recent && s.recent.length) ? s.recent.join('\n')
+             : (s.running ? 'monitoring crun — no findings yet' : 'attaching…');
+  }
+
   // Running/dead count in header
   const alive = campaigns.filter(c => c.running).length;
   const total = campaigns.length;
@@ -397,7 +412,9 @@ function render(data) {
   cardsEl.innerHTML = campaigns.map(c => {
     const l = c.latest;
     const restarts = (c.restarts || []).length;
-    const edgesPct = l.edges ? ((l.edges / 11072) * 100).toFixed(1) : '0.0';
+    // per-binary edge total (ASAN/UBSan differ from base's 11072); fall back to base.
+    const edgesTotal = l.edges_total || 11072;
+    const edgesPct = l.edges ? ((l.edges / edgesTotal) * 100).toFixed(1) : '0.0';
     const deadCls = c.running ? '' : ' dead';
     const pillCls = c.running ? 'running' : 'dead';
     const pillTxt = c.running ? '● RUNNING' : '● DEAD';
@@ -408,7 +425,7 @@ function render(data) {
         </div>
         <span class="status-pill ${pillCls}">${pillTxt}</span>
       </div>
-      <div class="card-edges" style="color:${c.color}">${fmtExactNum(l.edges)}<span style="color:var(--muted);font-size:13px"> / 11072</span></div>
+      <div class="card-edges" style="color:${c.color}">${fmtExactNum(l.edges)}<span style="color:var(--muted);font-size:13px"> / ${fmtExactNum(edgesTotal)}</span></div>
       <div class="card-sub">${edgesPct}% edges &nbsp;·&nbsp; ${fmtNum(l.exec_sec)} ex/s</div>
       <div class="card-sub">corpus: ${l.corpus} &nbsp;·&nbsp; crashes: ${l.crashes}</div>
       <div class="card-sub" style="color:${restarts > 0 ? 'var(--yellow)' : 'var(--muted)'}">restarts: ${restarts}</div>

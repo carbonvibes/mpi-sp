@@ -2,7 +2,8 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
-    path::PathBuf,
+    collections::HashSet,
+    path::{Path, PathBuf},
     rc::Rc,
     str::FromStr,
     thread,
@@ -13,11 +14,11 @@ use libafl::{
     BloomInputFilter, HasMetadata, StdFuzzerBuilder,
     corpus::{Corpus, CorpusId, OnDiskCorpus, Testcase},
     events::{ProgressReporter, SimpleEventManager},
-    executors::{HasObservers, StdChildArgs, forkserver::ForkserverExecutor},
+    executors::{Executor, ExitKind, HasObservers, HasTimeout, StdChildArgs, forkserver::ForkserverExecutor},
     feedback_or,
     feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback,
                 NautilusChunksMetadata},
-    fuzzer::{Evaluator, Fuzzer},
+    fuzzer::{Evaluator, ExecuteInputResult, Fuzzer},
     generators::{Generator, NautilusContext, NautilusGenerator},
     inputs::{Input, NautilusBytesConverter, NautilusInput, ToTargetBytes},
     monitors::SimpleMonitor,
@@ -25,7 +26,7 @@ use libafl::{
         HavocScheduledMutator, MutationResult, Mutator,
         NautilusRandomMutator, NautilusRecursionMutator, NautilusSpliceMutator,
     },
-    observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver},
+    observers::{CanTrack, HitcountsMapObserver, ObserversTuple, StdMapObserver, TimeObserver},
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
     stages::{AflStatsStage, StdMutationalStage},
     state::{HasCorpus, HasSolutions, StdState},
@@ -37,7 +38,7 @@ use libafl_bolts::{
     ownedref::OwnedSlice,
     rands::StdRand,
     shmem::{ShMem, ShMemProvider, UnixShMemProvider},
-    tuples::{Handled, tuple_list},
+    tuples::{Handled, RefIndexable, tuple_list},
 };
 use nix::sys::signal::Signal;
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,9 @@ use fs_mutator::{
 
 #[cfg(has_fuse3)]
 use fs_mutator::ffi::{fuse_vfs_lib_init, fuse_vfs_lib_is_mounted, fuse_vfs_lib_run};
+
+#[cfg(has_fuse3)]
+use fs_mutator::libafl_glue::fuse_log_observer::FuseLogObserver;
 
 const MAP_SIZE: usize = 65536;
 
@@ -161,6 +165,214 @@ where
 }
 
 
+/// Re-execution gate that suppresses non-reproducible ("flaky") crashes before
+/// they ever reach the `CrashFeedback` objective.
+///
+/// Why this exists: a file lands in `crashes/` iff `WIFSIGNALED(status)` is true
+/// for the crun child (see libafl forkserver `run_target`). But the saved input
+/// (config JSON + FsDelta) is NOT a self-contained reproducer — the run also
+/// depended on the live in-process FUSE filesystem and accumulated kernel/mount
+/// residue across forks. So a signal that fired once due to a transient race is
+/// recorded as a "crash" even though replaying the bytes alone won't reproduce it.
+///
+/// This wrapper intercepts every `ExitKind::Crash`, re-runs the SAME input
+/// `reruns` more times (each re-run goes through the converter, i.e.
+/// `vfs_reset_to_snapshot` + `apply_delta`, so the intended rootfs is faithfully
+/// rebuilt), and only propagates the crash — letting `CrashFeedback` save it — if
+/// it reproduces in at least `threshold` of the `reruns + 1` total runs.
+/// Otherwise it reports `ExitKind::Ok`, so the flaky input is dropped.
+///
+/// Cost is paid only on the rare crash path (~1 in 10k execs), so steady-state
+/// throughput is unaffected.
+struct CalibratedExecutor<E> {
+    inner:     E,
+    reruns:    usize,
+    threshold: usize,
+    /// Path to the rendered OCI config for the current input, so a SIGKILL/SIGSYS
+    /// can be checked against the config that produced it (see `is_real_crash`).
+    config_path: PathBuf,
+}
+
+/// Reads the terminating signal of the most recent target run.
+///
+/// Implemented locally for `ForkserverExecutor` (orphan-rule OK: local trait,
+/// foreign type) so the calibration wrapper can tell a real fault crash apart
+/// from a config-driven kernel/seccomp kill. The forkserver records every
+/// `WIFSIGNALED` death as `ExitKind::Crash` but discards the signal number;
+/// this recovers it from the raw wait status it keeps.
+trait TermSignal {
+    /// `Some(signo)` if the last run was terminated by a signal, else `None`.
+    fn term_signal(&self) -> Option<i32>;
+}
+
+impl<I, OT, S, SHM> TermSignal for ForkserverExecutor<I, OT, S, SHM>
+where
+    OT: ObserversTuple<I, S>,
+    SHM: ShMem,
+{
+    fn term_signal(&self) -> Option<i32> {
+        let status = self.forkserver().status();
+        if libc::WIFSIGNALED(status) {
+            Some(libc::WTERMSIG(status))
+        } else {
+            None
+        }
+    }
+}
+
+impl<E> CalibratedExecutor<E> {
+    fn new(inner: E, reruns: usize, threshold: usize, config_path: PathBuf) -> Self {
+        // threshold of 1 means "the first crash alone confirms" (no gating);
+        // clamp to >= 1 and never above the total number of runs.
+        let total = reruns + 1;
+        Self { inner, reruns, threshold: threshold.clamp(1, total), config_path }
+    }
+}
+
+/// True if the rendered OCI config at `config_path` explicitly *asks* for a kill
+/// that would surface as `sig` — i.e. the kill is the input's doing, not a crun
+/// bug. A near-zero `RLIMIT_CPU` budget => SIGKILL; a seccomp KILL default action
+/// => SIGSYS. Crucially, a SIGKILL/SIGSYS *without* such a knob is a genuine
+/// resource-exhaustion / seccomp blowup in crun and must be kept, not filtered.
+fn config_requested_kill(config_path: &Path, sig: i32) -> bool {
+    let Ok(bytes) = std::fs::read(config_path) else { return false };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
+
+    // True if process.rlimits has `rtype` with a near-zero (0..=2) hard OR soft
+    // budget — the value that makes the kernel signal the process. -1 is
+    // RLIM_INFINITY (unlimited) and must NOT count as near-zero.
+    let rlimit_near_zero = |rtype: &str| -> bool {
+        v.pointer("/process/rlimits")
+            .and_then(|r| r.as_array())
+            .map_or(false, |rls| {
+                rls.iter().any(|rl| {
+                    rl.get("type").and_then(|t| t.as_str()) == Some(rtype)
+                        && [rl.get("hard"), rl.get("soft")]
+                            .iter()
+                            .filter_map(|x| x.and_then(|v| v.as_i64()))
+                            .any(|n| (0..=2).contains(&n))
+                })
+            })
+    };
+
+    match sig {
+        // RLIMIT_CPU: hard limit reached => SIGKILL, soft limit reached => SIGXCPU.
+        // (memory.limit can't OOM here — the harness clamps it to >= 128 MiB.)
+        s if s == libc::SIGKILL || s == libc::SIGXCPU => rlimit_near_zero("RLIMIT_CPU"),
+        // RLIMIT_FSIZE: a write past a tiny file-size budget => SIGXFSZ.
+        s if s == libc::SIGXFSZ => rlimit_near_zero("RLIMIT_FSIZE"),
+        // A seccomp KILL default action terminates the container => SIGSYS.
+        s if s == libc::SIGSYS => matches!(
+            v.pointer("/linux/seccomp/defaultAction").and_then(|a| a.as_str()),
+            Some("SCMP_ACT_KILL" | "SCMP_ACT_KILL_PROCESS" | "SCMP_ACT_KILL_THREAD")
+        ),
+        _ => false,
+    }
+}
+
+impl<E: TermSignal> CalibratedExecutor<E> {
+    /// A `Crash` is a *real* (possibly bug-indicating) crash unless it is a
+    /// SIGKILL/SIGSYS that the config itself requested (near-zero RLIMIT_CPU, or
+    /// seccomp KILL). A signal-kill the config did NOT ask for is kept — it may
+    /// be a genuine resource-exhaustion / DoS bug in crun (e.g. unbounded
+    /// allocation from a pathological config), which a blanket signal filter
+    /// would silently hide.
+    fn is_real_crash(&self, ek: ExitKind) -> bool {
+        if ek != ExitKind::Crash {
+            return false;
+        }
+        match self.inner.term_signal() {
+            // Resource/seccomp signals the config can request: SIGKILL/SIGXCPU
+            // (RLIMIT_CPU), SIGXFSZ (RLIMIT_FSIZE), SIGSYS (seccomp KILL). Kept
+            // only if the config did NOT ask for them.
+            Some(s)
+                if s == libc::SIGKILL
+                    || s == libc::SIGXCPU
+                    || s == libc::SIGXFSZ
+                    || s == libc::SIGSYS =>
+            {
+                !config_requested_kill(&self.config_path, s)
+            }
+            _ => true,
+        }
+    }
+}
+
+impl<E, EM, I, S, Z> Executor<EM, I, S, Z> for CalibratedExecutor<E>
+where
+    E: Executor<EM, I, S, Z> + TermSignal,
+{
+    fn run_target(
+        &mut self,
+        fuzzer: &mut Z,
+        state:  &mut S,
+        mgr:    &mut EM,
+        input:  &I,
+    ) -> Result<ExitKind, Error> {
+        let first = self.inner.run_target(fuzzer, state, mgr, input)?;
+        if first != ExitKind::Crash {
+            return Ok(first);
+        }
+
+        // Drop config-requested SIGKILL/SIGSYS before calibration: the input
+        // itself asked for the kill (near-zero RLIMIT_CPU, seccomp KILL), so it
+        // is not a crun bug and re-running just wastes the rerun budget. A
+        // signal-kill the config did NOT request falls through to calibration —
+        // it may be a genuine resource/DoS bug.
+        if !self.is_real_crash(first) {
+            eprintln!(
+                "[signal-filter] crash DROPPED — config-requested kill (RLIMIT_CPU/seccomp), not a crun bug"
+            );
+            return Ok(ExitKind::Ok);
+        }
+
+        // Real fault crash; re-run to check reproducibility, counting only
+        // fault-signal crashes (a flaky input may SIGKILL on some runs and
+        // fault on others — only the faults count toward the threshold).
+        let mut crashes = 1usize;
+        for _ in 0..self.reruns {
+            let ek = self.inner.run_target(fuzzer, state, mgr, input)?;
+            if self.is_real_crash(ek) {
+                crashes += 1;
+            }
+        }
+
+        let total = self.reruns + 1;
+        if crashes >= self.threshold {
+            eprintln!("[calibrate] crash CONFIRMED ({crashes}/{total} runs) — saving");
+            Ok(ExitKind::Crash)
+        } else {
+            eprintln!("[calibrate] flaky crash DROPPED ({crashes}/{total} runs) — not saving");
+            Ok(ExitKind::Ok)
+        }
+    }
+}
+
+impl<E> HasObservers for CalibratedExecutor<E>
+where
+    E: HasObservers,
+{
+    type Observers = E::Observers;
+    fn observers(&self) -> RefIndexable<&Self::Observers, Self::Observers> {
+        self.inner.observers()
+    }
+    fn observers_mut(&mut self) -> RefIndexable<&mut Self::Observers, Self::Observers> {
+        self.inner.observers_mut()
+    }
+}
+
+impl<E> HasTimeout for CalibratedExecutor<E>
+where
+    E: HasTimeout,
+{
+    fn timeout(&self) -> Duration {
+        self.inner.timeout()
+    }
+    fn set_timeout(&mut self, timeout: Duration) {
+        self.inner.set_timeout(timeout);
+    }
+}
+
 struct CombinedConverter {
     context:         &'static NautilusContext,
     vfs:             *mut VfsT,
@@ -192,7 +404,6 @@ impl ToTargetBytes<CombinedInput> for CombinedConverter {
             let _ = std::fs::write(&self.last_input_path, json);
         }
 
-        // crun reads config from argv[1], not stdin
         OwnedSlice::from(vec![0u8])
     }
 }
@@ -494,7 +705,6 @@ fn rootfs_seeds(bin_true: &[u8]) -> Vec<FsDelta> {
     seeds
 }
 
-// replace_with_symlink is used throughout so non-empty dirs are handled correctly;
 // raw rmdir + create_symlink silently fails on dirs with children.
 
 fn crun_symlink_seeds(index: &BaselineIndex) -> Vec<FsDelta> {
@@ -623,11 +833,27 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let resume = args.iter().any(|a| a == "--resume");
+    let sync_dir: Option<PathBuf> = args.iter()
+        .position(|a| a == "--sync-dir")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from);
+    let instance_id: u32 = args.iter()
+        .position(|a| a == "--instance")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // Read-only sync consumer: import peers' discoveries from --sync-dir but
+    // never export our own back. Used by the ASAN/UBSan instances so they vet
+    // the shared corpus of the base fleet without contributing to it.
+    let no_export = args.iter().any(|a| a == "--no-export");
     let positional: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).collect();
     if positional.len() < 2 {
-        eprintln!("Usage: {} <crun-afl-binary> <grammar.py> [--resume]", args[0]);
+        eprintln!("Usage: {} <crun-afl-binary> <grammar.py> [--resume] [--sync-dir <path>] [--instance <N>]", args[0]);
         eprintln!("  Run as root from /tmp/campaign3/");
-        eprintln!("  --resume  reload existing corpus instead of starting fresh");
+        eprintln!("  --resume            reload existing corpus instead of starting fresh");
+        eprintln!("  --sync-dir <path>   shared dir for cross-instance corpus exchange");
+        eprintln!("  --instance <N>      instance ID (0–N) used to name sync exports");
+        eprintln!("  --no-export         import from --sync-dir but never export (read-only consumer)");
         std::process::exit(1);
     }
     let crun_binary  = positional[0];
@@ -635,8 +861,13 @@ fn main() {
     let pid          = std::process::id();
 
     println!("=== fuzz_combined_afl: Campaign 3 — Nautilus config + FUSE rootfs ===");
-    println!("  crun    : {crun_binary}");
-    println!("  grammar : {}", grammar_path.display());
+    println!("  crun     : {crun_binary}");
+    println!("  grammar  : {}", grammar_path.display());
+    println!("  instance : {instance_id}");
+    if let Some(ref sd) = sync_dir {
+        println!("  sync-dir : {} ({})", sd.display(),
+                 if no_export { "read-only: import, no export" } else { "read+write" });
+    }
 
     let cwd = std::env::current_dir()
         .expect("cannot determine CWD — run from /tmp/campaign3/");
@@ -649,6 +880,12 @@ fn main() {
     for d in &[&corpus_dir, &solutions_dir] {
         std::fs::create_dir_all(d).unwrap_or_else(|e| {
             eprintln!("ERROR: cannot create {}: {e}", d.display());
+            std::process::exit(1);
+        });
+    }
+    if let Some(ref sd) = sync_dir {
+        std::fs::create_dir_all(sd).unwrap_or_else(|e| {
+            eprintln!("ERROR: cannot create sync dir {}: {e}", sd.display());
             std::process::exit(1);
         });
     }
@@ -713,6 +950,16 @@ fn main() {
         .expect("AflStatsStage build failed");
 
 
+    let fuse_log_observer = FuseLogObserver::new();
+
+    // Corpus admission is edge-coverage only (MaxMapFeedback). TimeFeedback never
+    // admits — it has no is_interesting impl and falls through to the trait default
+    // (always false); it only attaches exec-time metadata. FsAccessFeedback was
+    // previously here, but it admits on any never-before-seen filesystem path — an
+    // unbounded, coverage-irrelevant dimension — which grew the corpus ~1100 entries
+    // per new edge after coverage saturated. It still drives mutation guidance via
+    // FuseLogObserver → update_live() → peek_live(), which is independent of corpus
+    // admission, so guidance is unaffected by removing it here.
     let mut feedback = feedback_or!(
         MaxMapFeedback::new(&edges_observer),
         TimeFeedback::new(&time_observer),
@@ -759,6 +1006,22 @@ fn main() {
         .objective(objective)
         .build();
 
+    // Crash calibration: re-run each crashing input to filter non-reproducible
+    // ("flaky") crashes before they reach the objective corpus. Tunable per-run
+    // without rebuilding via env vars. Defaults reruns=4 + threshold=2 mean a
+    // crash is saved only if it reproduces in >=2 of 5 total runs — which drops
+    // essentially all one-off environmental signal-deaths while keeping any
+    // genuinely input-driven crash. Set CRASH_CAL_THRESHOLD=1 to disable gating.
+    let crash_cal_reruns: usize = std::env::var("CRASH_CAL_RERUNS")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let crash_cal_threshold: usize = std::env::var("CRASH_CAL_THRESHOLD")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    println!(
+        "  crash calibration: reruns={crash_cal_reruns}, threshold={crash_cal_threshold} \
+         (save iff >={crash_cal_threshold}/{} runs crash)",
+        crash_cal_reruns + 1
+    );
+
     let mut executor = ForkserverExecutor::builder()
         .program(crun_binary)
         .arg(config_path.to_str().expect("config path not UTF-8"))
@@ -766,7 +1029,9 @@ fn main() {
         .coverage_map_size(MAP_SIZE)
         .timeout(Duration::from_millis(1200))
         .kill_signal(Signal::SIGKILL)
-        .build(tuple_list!(time_observer, edges_observer))
+        // fuse_log_observer must be first so pre_exec fires before the target
+        // starts and post_exec fires after it exits, publishing guidance.
+        .build(tuple_list!(fuse_log_observer, time_observer, edges_observer))
         .expect("ForkserverExecutor build failed");
 
     if let Some(dynamic_map_size) = executor.coverage_map_size() {
@@ -774,6 +1039,10 @@ fn main() {
             .as_mut()
             .truncate(dynamic_map_size);
     }
+
+    // Wrap the raw forkserver in the calibration gate. All later uses
+    // (fuzz_one, add_input) drive it through the Executor trait.
+    let mut executor = CalibratedExecutor::new(executor, crash_cal_reruns, crash_cal_threshold, config_path.clone());
 
     let mut r_seeds = rootfs_seeds(BIN_TRUE);
     r_seeds.extend(crun_symlink_seeds(&baseline_index));
@@ -902,6 +1171,11 @@ fn main() {
     println!("  stats   → fuzzer_stats, plot_data\n");
 
 
+    // Track which sync-dir filenames this instance has already processed so we
+    // never re-import our own exports or double-import a foreign entry.
+    let mut seen_foreign: HashSet<String> = HashSet::new();
+    let mut sync_tick: u64 = 0;
+
     let mut solutions_before = state.solutions().count();
     loop {
         let before = state.corpus().count();
@@ -927,21 +1201,24 @@ fn main() {
                     ).track_indices()
                 };
 
-                executor = ForkserverExecutor::builder()
+                let mut rebuilt = ForkserverExecutor::builder()
                     .program(crun_binary)
                     .arg(config_path.to_str().expect("config path not UTF-8"))
                     .debug_child(false)
                     .coverage_map_size(MAP_SIZE)
                     .timeout(Duration::from_millis(1200))
                     .kill_signal(Signal::SIGKILL)
-                    .build(tuple_list!(new_time_observer, new_edges_observer))
+                    .build(tuple_list!(FuseLogObserver::new(), new_time_observer, new_edges_observer))
                     .expect("ForkserverExecutor rebuild failed");
 
-                if let Some(dynamic_map_size) = executor.coverage_map_size() {
-                    executor.observers_mut()[&observer_ref]
+                if let Some(dynamic_map_size) = rebuilt.coverage_map_size() {
+                    rebuilt.observers_mut()[&observer_ref]
                         .as_mut()
                         .truncate(dynamic_map_size);
                 }
+
+                // Re-wrap in the calibration gate (same settings as initial build).
+                executor = CalibratedExecutor::new(rebuilt, crash_cal_reruns, crash_cal_threshold, config_path.clone());
 
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -970,15 +1247,73 @@ fn main() {
         }
         solutions_before = solutions_after;
 
-        // Sync new corpus entries into LiveCorpus and NautilusChunksMetadata.
+        // Sync new corpus entries into LiveCorpus and NautilusChunksMetadata,
+        // and export each new discovery to the shared sync dir.
         let after = state.corpus().count();
         for idx in before..after {
             let cid = CorpusId::from(idx);
             if let Ok(input) = state.corpus().cloned_input_for_id(cid) {
                 write_corpus_sidecar(&corpus_dir, idx, &input, context);
-                live_corpus.borrow_mut().push(input.rootfs);
+                live_corpus.borrow_mut().push(input.rootfs.clone());
                 if let Some(meta) = state.metadata_map_mut().get_mut::<NautilusChunksMetadata>() {
                     meta.cks.add_tree(input.config.tree.clone(), &context.ctx);
+                }
+                // Export to sync dir so peer instances can import this discovery
+                // — skipped for read-only consumers (--no-export: ASAN/UBSan).
+                if let Some(sd) = sync_dir.as_ref().filter(|_| !no_export) {
+                    let fname = format!("i{instance_id}_{idx}.sync");
+                    let path  = sd.join(&fname);
+                    if let Ok(json) = serde_json::to_vec(&input) {
+                        let _ = std::fs::write(&path, json);
+                    }
+                    // Mark our own exports as seen so we never re-import them.
+                    seen_foreign.insert(fname);
+                }
+            }
+        }
+
+        // Every 256 iterations, scan the sync dir for entries from peer instances.
+        sync_tick += 1;
+        if sync_tick % 256 == 0 {
+            if let Some(ref sd) = sync_dir {
+                let mut new_files: Vec<_> = std::fs::read_dir(sd)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|e| {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        name.ends_with(".sync") && !seen_foreign.contains(&name)
+                    })
+                    .collect();
+                new_files.sort_by_key(|e| e.file_name());
+
+                // Cap at 32 per tick so a large backlog doesn't stall the loop.
+                for entry in new_files.into_iter().take(32) {
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    seen_foreign.insert(fname.clone());
+                    let Ok(bytes) = std::fs::read(entry.path()) else { continue };
+                    let Ok(input) = serde_json::from_slice::<CombinedInput>(&bytes) else {
+                        eprintln!("[sync] failed to deserialize {fname}");
+                        continue;
+                    };
+                    // Run through executor + feedbacks: only add if it hits a new
+                    // edge in this instance's own virgin map (admission is now
+                    // edge-only). This is the same filter AFL++ applies when
+                    // syncing queues.
+                    match fuzzer.evaluate_input(&mut state, &mut executor, &mut mgr, &input) {
+                        Ok((ExecuteInputResult::Corpus, Some(cid))) => {
+                            let idx = usize::from(cid);
+                            if let Ok(imported) = state.corpus().cloned_input_for_id(cid) {
+                                write_corpus_sidecar(&corpus_dir, idx, &imported, context);
+                                live_corpus.borrow_mut().push(imported.rootfs.clone());
+                                if let Some(meta) = state.metadata_map_mut().get_mut::<NautilusChunksMetadata>() {
+                                    meta.cks.add_tree(imported.config.tree.clone(), &context.ctx);
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[sync] evaluate error for {fname}: {e}"),
+                    }
                 }
             }
         }

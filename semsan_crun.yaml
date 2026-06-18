@@ -1,0 +1,12 @@
+# SemSan config for the crun campaign — monitors every `crun` process
+# system-wide (so it covers all 6 fuzzer instances) and flags symlink-mount
+# escapes: when crun mounts through a symlink (the container-escape class our
+# rootfs symlink mutators target). These are semantic bugs that never crash, so
+# the coverage/crash fuzzer is blind to them — SemSan is the oracle.
+#
+# Matches the SemSan authors' tested crun config
+# (SemanticSanitizer/nix/packages/by-name/artifact-eval/crun-campaign/fuzz-config.yaml).
+# Run as root alongside the campaign:
+#   sudo SemanticSanitizer/semsan-cli attach --config semsan_crun.yaml
+comm: 'crun'
+symlinkMount: true

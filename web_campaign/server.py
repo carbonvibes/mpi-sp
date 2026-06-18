@@ -18,7 +18,26 @@ CAMPAIGNS = [
     {"id": "c3_3", "label": "C3-inst-3", "dir": Path("/tmp/c3_3"), "color": "#d2a8ff"},
     {"id": "c3_4", "label": "C3-inst-4", "dir": Path("/tmp/c3_4"), "color": "#ffa657"},
     {"id": "c3_5", "label": "C3-inst-5", "dir": Path("/tmp/c3_5"), "color": "#39d353"},
+    {"id": "c3_asan",  "label": "ASAN",  "dir": Path("/tmp/c3_asan"),  "color": "#ff7b72"},
+    {"id": "c3_ubsan", "label": "UBSan", "dir": Path("/tmp/c3_ubsan"), "color": "#e3b341"},
 ]
+
+SEMSAN_LOG = Path("/tmp/semsan.log")
+
+def read_semsan(max_recent=8):
+    """SemSan prints findings to stdout (redirected to /tmp/semsan.log by the
+    launcher). Each finding line is prefixed '[comm:tgid] ...'; status lines
+    ('Attaching ...', 'All sanitizers are running') are not."""
+    if not SEMSAN_LOG.exists():
+        return {"present": False, "running": False, "findings": 0, "recent": []}
+    try:
+        lines = SEMSAN_LOG.read_text(errors="replace").splitlines()
+    except OSError:
+        return {"present": False, "running": False, "findings": 0, "recent": []}
+    findings = [l for l in lines if l.startswith("[")]
+    running = any("All sanitizers are running" in l for l in lines)
+    return {"present": True, "running": running,
+            "findings": len(findings), "recent": findings[-max_recent:]}
 
 def parse_fuzzer_stats(path):
     stats = {}
@@ -49,14 +68,15 @@ def parse_plot_data(path):
                 if len(parts) < 13:
                     continue
                 try:
-                    t          = float(parts[0])
-                    corpus     = int(parts[3])
-                    crashes    = int(parts[7])
-                    execs_done = float(parts[11])
-                    edges      = int(parts[12])
-                    exec_sec   = execs_done / t if t > 0 else 0.0
-                    series.append({"t": t, "edges": edges, "corpus": corpus,
-                                   "exec_sec": exec_sec, "crashes": crashes})
+                    t           = float(parts[0])
+                    corpus      = int(parts[3])
+                    edges_total = int(parts[6])   # per-binary instrumented-edge total
+                    crashes     = int(parts[7])
+                    execs_done  = float(parts[11])
+                    edges       = int(parts[12])
+                    exec_sec    = execs_done / t if t > 0 else 0.0
+                    series.append({"t": t, "edges": edges, "edges_total": edges_total,
+                                   "corpus": corpus, "exec_sec": exec_sec, "crashes": crashes})
                 except (ValueError, IndexError):
                     pass
     except FileNotFoundError:
@@ -118,6 +138,10 @@ def get_campaign_data(c):
         "corpus":  int(stats.get("corpus_count",  0) or 0),
         "crashes": count_crashes(c["dir"]),
         "run_time": run_time,
+        # per-binary instrumented-edge total (denominator for the % — differs for
+        # ASAN/UBSan vs base). fuzzer_stats first, else the latest plot_data row.
+        "edges_total": int(stats.get("total_edges", 0) or 0)
+                       or (series[-1]["edges_total"] if series else 0),
     }
     stats_path = c["dir"] / "fuzzer_stats"
     try:
@@ -136,7 +160,8 @@ def get_campaign_data(c):
     }
 
 def get_data():
-    return {"campaigns": [get_campaign_data(c) for c in CAMPAIGNS], "ts": time.time()}
+    return {"campaigns": [get_campaign_data(c) for c in CAMPAIGNS],
+            "semsan": read_semsan(), "ts": time.time()}
 
 HTML = open(Path(__file__).parent / "index.html").read()
 

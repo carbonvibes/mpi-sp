@@ -256,10 +256,11 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        let using_guided = self.guidance.has_enoent() && state.rand_mut().below(nz(100)) < 70;
+        let guidance = crate::guidance::peek_live();
+        let using_guided = guidance.has_enoent() && state.rand_mut().below(nz(100)) < 70;
 
         let path = if using_guided {
-            pick(state.rand_mut(), &self.guidance.enoent_paths).clone()
+            pick(state.rand_mut(), &guidance.enoent_paths).clone()
         } else {
             random_path(state.rand_mut())
         };
@@ -414,20 +415,22 @@ where
                 pick_or_random(state.rand_mut(), &self.baseline_all_paths, 80)
             }
 
-            // Creation ops: synthetic/random paths are the point.
-            // Guidance block left intact for future FUSE-log integration.
+            // Creation ops: use live FUSE guidance to bias toward paths the
+            // target requested but didn't find (ENOENT), paths it wrote to,
+            // or paths it deleted.
             FsOpKind::CreateFile | FsOpKind::Mkdir | FsOpKind::CreateSymlink => {
-                let have_swap_target = self.guidance.has_enoent()
-                    || self.guidance.has_write()
-                    || self.guidance.has_recreate()
+                let guidance = crate::guidance::peek_live();
+                let have_swap_target = guidance.has_enoent()
+                    || guidance.has_write()
+                    || guidance.has_recreate()
                     || !self.baseline_all_paths.is_empty();
                 if have_swap_target && state.rand_mut().below(nz(100)) < 30 {
-                    let pool: &[String] = if self.guidance.has_enoent() {
-                        &self.guidance.enoent_paths
-                    } else if self.guidance.has_write() {
-                        &self.guidance.write_paths
-                    } else if self.guidance.has_recreate() {
-                        &self.guidance.recreate_paths
+                    let pool: &[String] = if guidance.has_enoent() {
+                        &guidance.enoent_paths
+                    } else if guidance.has_write() {
+                        &guidance.write_paths
+                    } else if guidance.has_recreate() {
+                        &guidance.recreate_paths
                     } else {
                         &self.baseline_all_paths
                     };
@@ -585,18 +588,19 @@ where
             return Ok(MutationResult::Skipped);
         }
 
+        let guidance = crate::guidance::peek_live();
         let op = match state.rand_mut().below(nz(4)) {
             0 => {
-                let path = if self.guidance.has_recreate() && state.rand_mut().below(nz(100)) < 50 {
-                    pick(state.rand_mut(), &self.guidance.recreate_paths).clone()
+                let path = if guidance.has_recreate() && state.rand_mut().below(nz(100)) < 50 {
+                    pick(state.rand_mut(), &guidance.recreate_paths).clone()
                 } else {
                     pick_or_random(state.rand_mut(), &self.baseline_file_paths, 70)
                 };
                 FsOp::delete_file(path)
             }
             1 => {
-                let path = if self.guidance.has_recreate() && state.rand_mut().below(nz(100)) < 50 {
-                    pick(state.rand_mut(), &self.guidance.recreate_paths).clone()
+                let path = if guidance.has_recreate() && state.rand_mut().below(nz(100)) < 50 {
+                    pick(state.rand_mut(), &guidance.recreate_paths).clone()
                 } else {
                     pick_or_random(state.rand_mut(), &self.baseline_dir_paths, 70)
                 };
@@ -712,9 +716,9 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        let path = if self.guidance.has_write() && state.rand_mut().below(nz(100)) < 70 {
-            let baseline_writes: Vec<&String> = self
-                .guidance
+        let guidance = crate::guidance::peek_live();
+        let path = if guidance.has_write() && state.rand_mut().below(nz(100)) < 70 {
+            let baseline_writes: Vec<&String> = guidance
                 .write_paths
                 .iter()
                 .filter(|p| self.baseline_file_paths.contains(*p))
@@ -795,8 +799,8 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        let new_paths: Vec<&String> = self
-            .guidance
+        let guidance = crate::guidance::peek_live();
+        let new_paths: Vec<&String> = guidance
             .write_paths
             .iter()
             .filter(|p| !self.baseline_file_paths.contains(*p))
@@ -934,9 +938,13 @@ where
 mod tests {
     use super::*;
     use crate::delta::{FsDelta, FsOp};
+    use crate::guidance::{update_live, MutationGuidance};
     use libafl::mutators::MutationResult;
     use libafl::state::HasRand;
     use libafl_bolts::rands::StdRand;
+
+    // Guidance tests touch a global; serialize them to prevent interference.
+    static GUIDANCE_TEST_MU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct TestState {
         rand: StdRand,
@@ -1042,12 +1050,15 @@ mod tests {
 
     #[test]
     fn add_file_op_uses_guidance_enoent_paths() {
+        let _guard = GUIDANCE_TEST_MU.lock().unwrap();
+        let mut g = MutationGuidance::none();
+        g.enoent_paths = vec!["/guided/path".to_string()];
+        update_live(g);
+
         let mut state = TestState::new();
         let mut m = AddFileOp::new();
-        m.guidance.enoent_paths = vec!["/guided/path".to_string()];
         let delta = file_delta();
 
-        // Run many times; at least one should use the guided path (70% bias).
         let mut used_guided = false;
         for _ in 0..50 {
             let mut d = delta.clone();
@@ -1057,6 +1068,7 @@ mod tests {
                 break;
             }
         }
+        update_live(MutationGuidance::none());
         assert!(used_guided, "guided path was never chosen in 50 tries");
     }
 
@@ -1437,15 +1449,13 @@ mod tests {
 
     #[test]
     fn mutate_path_whole_swap_prefers_enoent_paths() {
+        let _guard = GUIDANCE_TEST_MU.lock().unwrap();
+        let mut g = MutationGuidance::none();
+        g.enoent_paths = vec!["/wanted/by/target".to_string()];
+        update_live(g);
+
         let mut state = TestState::new();
-        let mut guidance = MutationGuidance::none();
-        guidance.enoent_paths = vec!["/wanted/by/target".to_string()];
-        let mut m = MutatePath::with_baseline(
-            vec![],
-            vec![],
-            vec!["/etc/config".to_string()],
-        )
-        .with_guidance(guidance);
+        let mut m = MutatePath::with_baseline(vec![], vec![], vec!["/etc/config".to_string()]);
 
         let mut used_enoent = false;
         for _ in 0..100 {
@@ -1456,6 +1466,7 @@ mod tests {
                 break;
             }
         }
+        update_live(MutationGuidance::none());
         assert!(
             used_enoent,
             "guidance.enoent_paths never used in whole-swap across 100 tries"
@@ -1464,15 +1475,17 @@ mod tests {
 
     #[test]
     fn destructive_mutator_delete_prefers_recreate_paths() {
+        let _guard = GUIDANCE_TEST_MU.lock().unwrap();
+        let mut g = MutationGuidance::none();
+        g.recreate_paths = vec!["/deleted/by/target".to_string()];
+        update_live(g);
+
         let mut state = TestState::new();
-        let mut guidance = MutationGuidance::none();
-        guidance.recreate_paths = vec!["/deleted/by/target".to_string()];
         let mut m = DestructiveMutator::with_baseline(
             vec!["/input".to_string()],
             vec!["/etc".to_string()],
             vec!["/input".to_string(), "/etc".to_string()],
-        )
-        .with_guidance(guidance);
+        );
 
         let mut used_recreate = false;
         for _ in 0..200 {
@@ -1486,6 +1499,7 @@ mod tests {
                 break;
             }
         }
+        update_live(MutationGuidance::none());
         assert!(
             used_recreate,
             "recreate_paths never used by destructive in 200 tries"
@@ -1494,16 +1508,13 @@ mod tests {
 
     #[test]
     fn update_existing_file_prefers_write_paths() {
-        // write_paths entry that IS in the baseline should be preferred (70%
-        // bias).  Non-baseline write_paths are filtered out; those belong to
-        // ReplayWriteFile.
-        let mut state = TestState::new();
-        let mut guidance = MutationGuidance::default();
-        // "/input" is in the baseline — qualifies for the bias.
-        guidance.write_paths = vec!["/input".to_string()];
+        let _guard = GUIDANCE_TEST_MU.lock().unwrap();
+        let mut g = MutationGuidance::none();
+        g.write_paths = vec!["/input".to_string()];
+        update_live(g);
 
+        let mut state = TestState::new();
         let mut m = UpdateExistingFile::new(vec!["/input".to_string(), "/etc/config".to_string()]);
-        m.guidance = guidance;
 
         let mut used_write = false;
         for _ in 0..100 {
@@ -1515,26 +1526,24 @@ mod tests {
                 break;
             }
         }
+        update_live(MutationGuidance::none());
         assert!(used_write, "guidance.write_paths (baseline-intersecting) never preferred by UpdateExistingFile in 100 tries");
     }
 
     #[test]
     fn mutate_path_whole_swap_prefers_write_paths_over_recreate() {
-        // write_paths must rank above recreate_paths in the whole-swap
-        // preference chain.
-        let mut state = TestState::new();
-        let mut guidance = MutationGuidance::default();
-        guidance.write_paths = vec!["/written/path".to_string()];
-        guidance.recreate_paths = vec!["/recreate/path".to_string()];
+        let _guard = GUIDANCE_TEST_MU.lock().unwrap();
+        let mut g = MutationGuidance::none();
+        g.write_paths = vec!["/written/path".to_string()];
+        g.recreate_paths = vec!["/recreate/path".to_string()];
+        update_live(g);
 
-        // Mkdir uses the CreateFile/Mkdir branch where guidance priority chain applies.
-        // (UpdateFile no longer uses guidance — it picks directly from baseline_file_paths.)
+        let mut state = TestState::new();
         let mut m = MutatePath::with_baseline(
             vec!["/input".to_string()],
             vec![],
             vec!["/input".to_string()],
-        )
-        .with_guidance(guidance);
+        );
 
         let mut used_write = false;
         for _ in 0..200 {
@@ -1545,6 +1554,7 @@ mod tests {
                 break;
             }
         }
+        update_live(MutationGuidance::none());
         assert!(
             used_write,
             "write_paths never preferred over recreate_paths in whole-swap"
@@ -1553,6 +1563,8 @@ mod tests {
 
     #[test]
     fn replay_write_file_skips_with_no_guidance() {
+        let _guard = GUIDANCE_TEST_MU.lock().unwrap();
+        update_live(MutationGuidance::none()); // ensure empty guidance
         let mut state = TestState::new();
         let mut m = ReplayWriteFile::new(vec!["/input".to_string()]);
         let mut delta = file_delta();
@@ -1562,25 +1574,32 @@ mod tests {
 
     #[test]
     fn replay_write_file_skips_when_all_write_paths_in_baseline() {
-        // If every write_path is already in the baseline, ∖ is empty → Skipped.
-        let mut state = TestState::new();
+        let _guard = GUIDANCE_TEST_MU.lock().unwrap();
         let baseline = vec!["/input".to_string(), "/etc/config".to_string()];
-        let mut m = ReplayWriteFile::new(baseline.clone());
-        m.guidance.write_paths = baseline; // identical set → complement is empty
+        let mut g = MutationGuidance::none();
+        g.write_paths = baseline.clone(); // identical set → complement is empty
+        update_live(g);
+        let mut state = TestState::new();
+        let mut m = ReplayWriteFile::new(baseline);
         let mut delta = file_delta();
         let res = m.mutate(&mut state, &mut delta).unwrap();
+        update_live(MutationGuidance::none());
         assert_eq!(res, MutationResult::Skipped);
     }
 
     #[test]
     fn replay_write_file_creates_non_baseline_path() {
-        // A write_path absent from the baseline should produce CreateFile.
+        let _guard = GUIDANCE_TEST_MU.lock().unwrap();
+        let mut g = MutationGuidance::none();
+        g.write_paths = vec!["/target/created/this".to_string()];
+        update_live(g);
+
         let mut state = TestState::new();
         let mut m = ReplayWriteFile::new(vec!["/input".to_string()]);
-        m.guidance.write_paths = vec!["/target/created/this".to_string()];
         let mut delta = file_delta();
         let before = delta.ops.len();
         let res = m.mutate(&mut state, &mut delta).unwrap();
+        update_live(MutationGuidance::none());
         assert_eq!(res, MutationResult::Mutated);
         assert_eq!(delta.ops.len(), before + 1);
         let new_op = delta.ops.last().unwrap();
@@ -1590,14 +1609,16 @@ mod tests {
 
     #[test]
     fn replay_write_file_ignores_baseline_write_paths() {
-        // Mixed write_paths: one in baseline, one not.  Only the non-baseline
-        // path should ever be selected.
-        let mut state = TestState::new();
-        let mut m = ReplayWriteFile::new(vec!["/input".to_string()]);
-        m.guidance.write_paths = vec![
+        let _guard = GUIDANCE_TEST_MU.lock().unwrap();
+        let mut g = MutationGuidance::none();
+        g.write_paths = vec![
             "/input".to_string(),         // in baseline — must be ignored
             "/target/output".to_string(), // not in baseline — only valid pick
         ];
+        update_live(g);
+
+        let mut state = TestState::new();
+        let mut m = ReplayWriteFile::new(vec!["/input".to_string()]);
         for _ in 0..100 {
             let mut delta = file_delta();
             m.mutate(&mut state, &mut delta).unwrap();
@@ -1607,5 +1628,6 @@ mod tests {
                 "ReplayWriteFile picked a baseline path — should be filtered out"
             );
         }
+        update_live(MutationGuidance::none());
     }
 }

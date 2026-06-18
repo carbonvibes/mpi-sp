@@ -3,6 +3,7 @@
 #include <fuse3/fuse.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,83 @@
 #include "../vfs/vfs.h"
 
 static vfs_t *g_vfs;
+
+/* ── Per-iteration FUSE access log ───────────────────────────────────────────
+ * When g_target_running == 1, every FUSE callback appends an entry to g_log.
+ * The fuzzer main thread reads and clears the log between iterations via the
+ * exported fuse_log_* functions.  A mutex protects concurrent access because
+ * FUSE callbacks run in a background thread.
+ *
+ * Deduplication: multiple WRITE calls to the same path collapse to one entry.
+ * Capacity: 512 entries — more than enough for any single container run.
+ */
+
+#define FUSE_LOG_CREATE      0
+#define FUSE_LOG_WRITE       1
+#define FUSE_LOG_MKDIR       2
+#define FUSE_LOG_RENAME_FROM 3
+#define FUSE_LOG_RENAME_TO   4
+#define FUSE_LOG_UNLINK      5
+#define FUSE_LOG_RMDIR       6
+#define FUSE_LOG_ENOENT      7
+#define FUSE_LOG_SYMLINK     8
+
+#define FUSE_LOG_MAX_ENTRIES 512
+#define FUSE_LOG_PATH_MAX    256
+
+typedef struct {
+    char    path[FUSE_LOG_PATH_MAX];
+    uint8_t kind;
+} fuse_log_entry_t;
+
+typedef struct {
+    fuse_log_entry_t entries[FUSE_LOG_MAX_ENTRIES];
+    int              n;
+} fuse_iter_log_t;
+
+static volatile int    g_target_running = 0;
+static fuse_iter_log_t g_log;
+static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void log_event(const char *path, uint8_t kind)
+{
+    if (!g_target_running) return;
+    pthread_mutex_lock(&g_log_mu);
+    if (g_log.n < FUSE_LOG_MAX_ENTRIES) {
+        /* Deduplicate consecutive WRITEs to the same path. */
+        if (kind == FUSE_LOG_WRITE) {
+            for (int i = 0; i < g_log.n; i++) {
+                if (g_log.entries[i].kind == FUSE_LOG_WRITE &&
+                    strcmp(g_log.entries[i].path, path) == 0) {
+                    pthread_mutex_unlock(&g_log_mu);
+                    return;
+                }
+            }
+        }
+        strncpy(g_log.entries[g_log.n].path, path, FUSE_LOG_PATH_MAX - 1);
+        g_log.entries[g_log.n].path[FUSE_LOG_PATH_MAX - 1] = '\0';
+        g_log.entries[g_log.n].kind = kind;
+        g_log.n++;
+    }
+    pthread_mutex_unlock(&g_log_mu);
+}
+
+void fuse_log_clear(void)
+{
+    pthread_mutex_lock(&g_log_mu);
+    g_log.n = 0;
+    pthread_mutex_unlock(&g_log_mu);
+}
+
+void fuse_log_set_active(int active)
+{
+    g_target_running = active;
+}
+
+const fuse_iter_log_t *fuse_log_get(void)
+{
+    return &g_log;
+}
 
 static void vfs_stat_to_stat(const vfs_stat_t *vs, struct stat *st)
 {
@@ -38,7 +116,10 @@ static int fvfs_getattr(const char *path, struct stat *st,
     (void)fi;
     vfs_stat_t vs;
     int r = vfs_getattr(g_vfs, path, &vs);
-    if (r != 0) return r;
+    if (r != 0) {
+        if (r == -ENOENT) log_event(path, FUSE_LOG_ENOENT);
+        return r;
+    }
     vfs_stat_to_stat(&vs, st);
     return 0;
 }
@@ -103,7 +184,9 @@ static int fvfs_read(const char *path, char *buf, size_t size, off_t offset,
 static int fvfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
     (void)mode; (void)fi;
-    return vfs_create_file(g_vfs, path, NULL, 0);
+    int r = vfs_create_file(g_vfs, path, NULL, 0);
+    if (r == 0) log_event(path, FUSE_LOG_CREATE);
+    return r;
 }
 
 static int fvfs_write(const char *path, const char *buf, size_t size,
@@ -132,6 +215,7 @@ static int fvfs_write(const char *path, const char *buf, size_t size,
 
     r = vfs_update_file(g_vfs, path, tmp, newlen);
     free(tmp);
+    if (r == 0) log_event(path, FUSE_LOG_WRITE);
     return (r == 0) ? (int)size : r;
 }
 
@@ -164,31 +248,44 @@ static int fvfs_truncate(const char *path, off_t newsize,
 static int fvfs_mkdir(const char *path, mode_t mode)
 {
     (void)mode;
-    return vfs_mkdir(g_vfs, path);
+    int r = vfs_mkdir(g_vfs, path);
+    if (r == 0) log_event(path, FUSE_LOG_MKDIR);
+    return r;
 }
 
 static int fvfs_unlink(const char *path)
 {
-    return vfs_delete_file(g_vfs, path);
+    int r = vfs_delete_file(g_vfs, path);
+    if (r == 0) log_event(path, FUSE_LOG_UNLINK);
+    return r;
 }
 
 static int fvfs_rmdir(const char *path)
 {
-    return vfs_rmdir(g_vfs, path);
+    int r = vfs_rmdir(g_vfs, path);
+    if (r == 0) log_event(path, FUSE_LOG_RMDIR);
+    return r;
 }
 
 static int fvfs_rename(const char *oldpath, const char *newpath,
                        unsigned int flags)
 {
     (void)flags;
-    return vfs_rename(g_vfs, oldpath, newpath);
+    int r = vfs_rename(g_vfs, oldpath, newpath);
+    if (r == 0) {
+        log_event(oldpath, FUSE_LOG_RENAME_FROM);
+        log_event(newpath, FUSE_LOG_RENAME_TO);
+    }
+    return r;
 }
 
 /* FUSE argument order is (target, linkpath) — opposite of the intuitive order.
  * vfs_symlink takes (vfs, linkpath, target). */
 static int fvfs_symlink(const char *target, const char *linkpath)
 {
-    return vfs_symlink(g_vfs, linkpath, target);
+    int r = vfs_symlink(g_vfs, linkpath, target);
+    if (r == 0) log_event(linkpath, FUSE_LOG_SYMLINK);
+    return r;
 }
 
 static int fvfs_readlink(const char *path, char *buf, size_t size)

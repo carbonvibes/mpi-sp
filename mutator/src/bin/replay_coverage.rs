@@ -151,7 +151,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
         eprintln!(
-            "Usage: sudo unshare -m {} <corpus_dir> <grammar.py> <crun-harness-cov> [--profile-dir DIR]",
+            "Usage: sudo unshare -m {} <corpus_dir> <grammar.py> <crun-harness-cov> [--profile-dir DIR] [--before-epoch TS]",
             args[0]
         );
         std::process::exit(1);
@@ -165,6 +165,13 @@ fn main() {
         .find(|w| w[0] == "--profile-dir")
         .map(|w| PathBuf::from(&w[1]))
         .unwrap_or_else(|| PathBuf::from("/tmp/cov_profiles"));
+
+    // Optional: only replay entries discovered at or before this Unix timestamp.
+    // A corpus entry's mtime is when the fuzzer saved it, so this selects the
+    // "first N hours" of a campaign and skips the post-saturation tail.
+    let before_epoch: Option<u64> = args.windows(2)
+        .find(|w| w[0] == "--before-epoch")
+        .and_then(|w| w[1].parse().ok());
 
     std::fs::create_dir_all(&profile_dir).expect("failed to create profile dir");
 
@@ -218,6 +225,25 @@ fn main() {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(usize::MAX)
     });
+
+    // Apply the --before-epoch cutoff (keep entries saved at or before the cutoff).
+    if let Some(cutoff) = before_epoch {
+        let before = entries.len();
+        entries.retain(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() <= cutoff)
+                .unwrap_or(true) // keep if mtime unreadable rather than silently drop
+        });
+        eprintln!(
+            "[cov] --before-epoch {cutoff}: kept {}/{} entries (dropped {})",
+            entries.len(),
+            before,
+            before - entries.len()
+        );
+    }
 
     eprintln!("[cov] {} corpus entries to replay", entries.len());
     if entries.is_empty() {

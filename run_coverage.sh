@@ -30,6 +30,12 @@ PROFILES_BASE="/tmp/cov_profiles"
 MERGED_PROF="/tmp/cov_merged.profdata"
 REPORT_DIR="/tmp/cov_report"
 
+# Only replay corpus entries discovered within the first CUTOFF_HOURS of the
+# campaign. Coverage saturates early (≈4h in observed runs); the post-saturation
+# tail is mostly redundant entries that add no edges, so replaying it wastes
+# hours. Set CUTOFF_HOURS=0 to replay the entire corpus.
+CUTOFF_HOURS="${CUTOFF_HOURS:-20}"
+
 # ── Sanity checks ─────────────────────────────────────────────────────────────
 
 echo "==> Checking binaries..."
@@ -55,7 +61,10 @@ for dir in "${CAMPAIGN_DIRS[@]}"; do
         echo "    $corpus — not found, skipping"
         continue
     fi
-    count=$(ls "$corpus"/combined_* 2>/dev/null | grep -v '\.' | wc -l)
+    # find (not `ls combined_*`) — a glob expands to one arg per file and blows
+    # past ARG_MAX on large corpora (160k+ entries → "Argument list too long",
+    # which under `set -e` kills the script silently).
+    count=$(find "$corpus" -maxdepth 1 -name 'combined_*' ! -name '*.json' | wc -l)
     echo "    $corpus — $count entries"
     total_entries=$((total_entries + count))
 done
@@ -76,21 +85,39 @@ echo ""
 rm -rf "$PROFILES_BASE"
 mkdir -p "$PROFILES_BASE"
 
+# Echoes "--before-epoch <ts>" so the replay only includes entries discovered in
+# the first CUTOFF_HOURS of the campaign. Campaign start is taken from the mtime
+# of combined_0 (a seed written at startup), falling back to the earliest entry
+# mtime. Echoes nothing when CUTOFF_HOURS=0 or the start time can't be found.
+cutoff_args() {
+    local dir="$1"
+    [[ "$CUTOFF_HOURS" -eq 0 ]] && return 0
+    local start
+    start=$(stat -c %Y "$dir/combined_0" 2>/dev/null)
+    if [[ -z "$start" ]]; then
+        start=$(find "$dir" -maxdepth 1 -name 'combined_*' ! -name '*.json' \
+                    -printf '%T@\n' 2>/dev/null | sort -n | head -1 | cut -d. -f1)
+    fi
+    [[ -z "$start" ]] && return 0
+    echo "--before-epoch $(( start + CUTOFF_HOURS * 3600 ))"
+}
+
 for i in 0 1 2 3 4 5; do
     dir="/tmp/c3_$i/corpus"
     if [[ ! -d "$dir" ]]; then continue; fi
-    count=$(ls "$dir"/combined_* 2>/dev/null | grep -v '\.' | wc -l)
+    count=$(find "$dir" -maxdepth 1 -name 'combined_*' ! -name '*.json' | wc -l)
     if [[ $count -eq 0 ]]; then continue; fi
 
     profile_dir="$PROFILES_BASE/c3_$i"
     mkdir -p "$profile_dir"
 
-    echo "--- Instance c3_$i corpus ($count entries) ---"
+    echo "--- Instance c3_$i corpus ($count entries, first ${CUTOFF_HOURS}h) ---"
     unshare -m "$REPLAY_BIN" \
         "$dir" \
         "$GRAMMAR" \
         "$COV_CRUN" \
-        --profile-dir "$profile_dir"
+        --profile-dir "$profile_dir" \
+        $(cutoff_args "$dir")
     echo ""
 done
 
@@ -102,18 +129,19 @@ echo "==> Step 1b: replaying crashes through coverage binary..."
 for i in 0 1 2 3 4 5; do
     dir="/tmp/c3_$i/crashes"
     if [[ ! -d "$dir" ]]; then continue; fi
-    count=$(ls "$dir"/combined_* 2>/dev/null | grep -v '\.' | wc -l)
+    count=$(find "$dir" -maxdepth 1 -name 'combined_*' ! -name '*.json' | wc -l)
     if [[ $count -eq 0 ]]; then echo "    c3_$i crashes — none"; continue; fi
 
     profile_dir="$PROFILES_BASE/c3_${i}_crashes"
     mkdir -p "$profile_dir"
 
-    echo "--- Instance c3_$i crashes ($count entries) ---"
+    echo "--- Instance c3_$i crashes ($count entries, first ${CUTOFF_HOURS}h) ---"
     unshare -m "$REPLAY_BIN" \
         "$dir" \
         "$GRAMMAR" \
         "$COV_CRUN" \
-        --profile-dir "$profile_dir"
+        --profile-dir "$profile_dir" \
+        $(cutoff_args "$dir")
     echo ""
 done
 
@@ -153,8 +181,14 @@ if [[ $valid_count -eq 0 ]]; then
 fi
 echo "    Merging $valid_count valid profiles..."
 
+# Pass the inputs via --input-files (a file of newline-separated paths) rather
+# than `$(find ...)` on the command line: with hundreds of thousands of .profraw
+# files the argv expansion exceeds ARG_MAX and the merge fails with E2BIG.
+PROFLIST="$PROFILES_BASE/profraw.list"
+find "$PROFILES_BASE" -name "*.profraw" > "$PROFLIST"
+
 "$LLVM_PROFDATA" merge -sparse \
-    $(find "$PROFILES_BASE" -name "*.profraw") \
+    --input-files="$PROFLIST" \
     -o "$MERGED_PROF"
 echo "    Merge done."
 
