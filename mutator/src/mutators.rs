@@ -18,16 +18,14 @@ use crate::{
     guidance::MutationGuidance,
 };
 
-/// Hard cap on ops per delta.
 pub const MAX_OPS: usize = 48;
 
-/// Cap on the live corpus size; evicts a random non-seed entry when full.
+/// evicts a random non-seed entry when full
 pub const MAX_LIVE_CORPUS: usize = 128;
 
-/// Shared live corpus; interior mutability needed since harness pushes between mutator calls.
+/// shared; harness pushes between mutator calls so needs interior mutability
 pub type LiveCorpus = Rc<RefCell<Vec<crate::delta::FsDelta>>>;
 
-/// A small vocabulary of valid path components.
 static PATH_COMPONENTS: &[&str] = &[
     "a", "b", "c", "d", "etc", "tmp", "var", "lib", "usr", "input", "output", "config", "data",
     "test", "run",
@@ -40,19 +38,19 @@ static CONTENT_DICTIONARY: &[&[u8]] = &[
     b"paal_ice",
     b"chocobar",
     b"fahhhhhhh",
-    b"",                                 // empty content
+    b"",
     b"\x7fELF",                          // ELF magic
-    b"#!/bin/sh\n",                      // shell shebang
-    b"[settings]\nverbose=1\ndebug=1\n", // realistic config file
-    b"\x00\x00\x00\x00",                 // 4 zero bytes
-    b"\xff\xff\xff\xff",                 // all-ones
-    b"../../../etc/passwd",              // path traversal
-    b"/dev/null",                        // special path
+    b"#!/bin/sh\n",
+    b"[settings]\nverbose=1\ndebug=1\n",
+    b"\x00\x00\x00\x00",
+    b"\xff\xff\xff\xff",
+    b"../../../etc/passwd",
+    b"/dev/null",
     b"%s%s%s%s",                         // format string
-    b"A",                                // single byte
-    &[0xAA; 64],                         // 64 bytes alternating pattern
-    &[0x00; 256],                        // 256 zero bytes (boundary size)
-    &[0x41; 4096],                       // 4KB of 'A' (page-size content)
+    b"A",
+    &[0xAA; 64],
+    &[0x00; 256],
+    &[0x41; 4096],
 ];
 
 #[inline]
@@ -89,11 +87,11 @@ fn pick_or_random<R: Rand>(rand: &mut R, baseline: &[String], bias_pct: usize) -
 
 fn pick_timestamp<R: Rand>(rand: &mut R) -> i64 {
     const INTERESTING: &[i64] = &[
-        0,               // epoch
-        -1,              // pre-epoch
+        0,
+        -1,
         i32::MAX as i64, // 2038 overflow boundary
-        2_000_000_000,   // ~2033, post-2038 far future
-        1_700_000_000,   // ~Nov 2023, current era
+        2_000_000_000,
+        1_700_000_000,
     ];
     if rand.below(nz(100)) < 40 {
         *pick(rand, INTERESTING)
@@ -102,7 +100,7 @@ fn pick_timestamp<R: Rand>(rand: &mut R) -> i64 {
     }
 }
 
-/// Randomly set 1–4 bytes inside a file op content, or append up to 8 bytes (20%).
+/// sets 1-4 bytes in a file op, or appends up to 8 (20%)
 pub struct ByteFlipFileContent {
     pub guidance: MutationGuidance,
 }
@@ -147,7 +145,6 @@ where
         let content_len = op.content.len();
 
         if state.rand_mut().below(nz(100)) < 20 {
-            // Append random bytes instead of flipping.
             let n_append = 1 + state.rand_mut().below(nz(8));
             for _ in 0..n_append {
                 op.content.push(state.rand_mut().below(nz(256)) as u8);
@@ -170,7 +167,7 @@ where
     }
 }
 
-/// Replace the entire content of a randomly chosen file op.
+/// replaces entire content of a random file op
 pub struct ReplaceFileContent {
     pub guidance: MutationGuidance,
 }
@@ -227,7 +224,7 @@ where
     }
 }
 
-/// Append a new CreateFile or Mkdir op with a random valid path.
+/// appends a CreateFile or Mkdir op
 pub struct AddFileOp {
     pub guidance: MutationGuidance,
 }
@@ -265,7 +262,6 @@ where
             random_path(state.rand_mut())
         };
 
-        // Prefer CreateFile when using a guided ENOENT path.
         let file_bias = if using_guided { 90 } else { 70 };
         let op = if state.rand_mut().below(nz(100)) < file_bias {
             FsOp::create_file(path, random_content(state.rand_mut()))
@@ -282,7 +278,7 @@ where
     }
 }
 
-/// Remove a random op. Skips when only one op remains.
+/// removes a random op; skips if only one remains
 pub struct RemoveOp {
     pub guidance: MutationGuidance,
 }
@@ -320,13 +316,7 @@ where
     }
 }
 
-/// Mutate the path of a randomly chosen op, respecting op semantics.
-///
-/// File-content ops (UpdateFile, Truncate) are redirected only to baseline
-/// files — pointing them at a non-existent path produces a guaranteed no-op.
-/// Rmdir targets dirs; DeleteFile targets files (occasionally random).
-/// Creation ops (CreateFile, Mkdir) keep the old synthetic/component-swap
-/// behaviour since exploring new paths is the whole point.
+/// mutates an op's path, respecting op semantics (see branches below)
 pub struct MutatePath {
     pub guidance: MutationGuidance,
     pub baseline_file_paths: Vec<String>,
@@ -383,8 +373,7 @@ where
         let op = &mut input.ops[op_idx];
 
         let new_path = match op.kind {
-            // Must land on a real baseline file — pointing at a non-existent
-            // path turns the op into a guaranteed no-op.
+            // must hit a real baseline file or it's a no-op
             FsOpKind::UpdateFile | FsOpKind::Truncate => {
                 if self.baseline_file_paths.is_empty() {
                     return Ok(MutationResult::Skipped);
@@ -392,7 +381,7 @@ where
                 pick(state.rand_mut(), &self.baseline_file_paths).clone()
             }
 
-            // Deletion: 80% real files, 20% random to exercise ENOENT paths.
+            // 80% real files, 20% random to hit ENOENT
             FsOpKind::DeleteFile => {
                 if !self.baseline_file_paths.is_empty() && state.rand_mut().below(nz(100)) < 80 {
                     pick(state.rand_mut(), &self.baseline_file_paths).clone()
@@ -401,7 +390,6 @@ where
                 }
             }
 
-            // Rmdir must target a directory.
             FsOpKind::Rmdir => {
                 if !self.baseline_dir_paths.is_empty() && state.rand_mut().below(nz(100)) < 80 {
                     pick(state.rand_mut(), &self.baseline_dir_paths).clone()
@@ -410,14 +398,11 @@ where
                 }
             }
 
-            // SetTimes works on any existing path.
             FsOpKind::SetTimes => {
                 pick_or_random(state.rand_mut(), &self.baseline_all_paths, 80)
             }
 
-            // Creation ops: use live FUSE guidance to bias toward paths the
-            // target requested but didn't find (ENOENT), paths it wrote to,
-            // or paths it deleted.
+            // bias toward FUSE-guided paths (enoent/write/recreate)
             FsOpKind::CreateFile | FsOpKind::Mkdir | FsOpKind::CreateSymlink => {
                 let guidance = crate::guidance::peek_live();
                 let have_swap_target = guidance.has_enoent()
@@ -458,7 +443,7 @@ where
     }
 }
 
-/// Append a random slice of ops from a donor delta in the live corpus pool.
+/// appends a random slice of ops from a donor delta in the pool
 pub struct SpliceDelta {
     pub guidance: MutationGuidance,
     pub corpus_pool: LiveCorpus,
@@ -513,7 +498,6 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        // random start offset so late-donor ops can be spliced independently
         let start = state.rand_mut().below(nz(donor.ops.len()));
         let donor_slice = &donor.ops[start..];
 
@@ -535,7 +519,7 @@ where
     }
 }
 
-/// Append a destructive or metadata op (DeleteFile/Rmdir/Truncate/SetTimes).
+/// appends a DeleteFile/Rmdir/Truncate/SetTimes op
 pub struct DestructiveMutator {
     pub guidance: MutationGuidance,
     pub baseline_file_paths: Vec<String>,
@@ -628,8 +612,7 @@ where
     }
 }
 
-/// Append an UpdateFile op targeting a known baseline file.
-/// Perturbs real content 50% of the time when baseline_contents is populated.
+/// appends an UpdateFile op on a baseline file; perturbs real content 50% when baseline_contents set
 pub struct UpdateExistingFile {
     pub guidance: MutationGuidance,
     pub baseline_file_paths: Vec<String>,
@@ -744,7 +727,7 @@ where
             }
         };
 
-        // Prefer in-place update to avoid dead ops (last write wins).
+        // update in place to avoid dead ops (last write wins)
         if let Some(existing) = input
             .ops
             .iter_mut()
@@ -768,7 +751,7 @@ where
     }
 }
 
-/// CreateFile for paths the target wrote to that are not in the baseline.
+/// CreateFile for target-written paths not in baseline
 pub struct ReplayWriteFile {
     pub guidance: MutationGuidance,
     pub baseline_file_paths: Vec<String>,
@@ -826,8 +809,7 @@ where
     }
 }
 
-/// CmpLog-guided I2S mutator: resolves comparison gates by substituting
-/// known operand pairs directly into file content ops.
+/// CmpLog I2S: substitutes known operand pairs into file content
 pub struct FsDeltaI2SMutator;
 
 impl FsDeltaI2SMutator {
@@ -852,7 +834,7 @@ where
             return Ok(MutationResult::Skipped);
         };
 
-        // Collect comparison pairs from CmpLog, both directions.
+        // both directions
         let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for val in &meta.list {
             match val {
@@ -943,7 +925,7 @@ mod tests {
     use libafl::state::HasRand;
     use libafl_bolts::rands::StdRand;
 
-    // Guidance tests touch a global; serialize them to prevent interference.
+    // guidance tests touch a global; serialize them
     static GUIDANCE_TEST_MU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct TestState {
@@ -989,7 +971,6 @@ mod tests {
 
         let res = m.mutate(&mut state, &mut delta).unwrap();
         assert_eq!(res, MutationResult::Mutated);
-        // At least one byte must differ after flipping.
         assert_ne!(delta.ops[0].content, original);
     }
 
@@ -997,7 +978,6 @@ mod tests {
     fn byte_flip_skips_when_no_file_ops() {
         let mut state = TestState::new();
         let mut m = ByteFlipFileContent::new();
-        // Delta with only a Mkdir op (no content).
         let mut delta = FsDelta::new(vec![FsOp::mkdir("/empty")]);
         let res = m.mutate(&mut state, &mut delta).unwrap();
         assert_eq!(res, MutationResult::Skipped);
@@ -1012,9 +992,8 @@ mod tests {
 
         let res = m.mutate(&mut state, &mut delta).unwrap();
         assert_eq!(res, MutationResult::Mutated);
-        // Content should change (with overwhelming probability with a fixed seed).
         assert_ne!(delta.ops[0].content, original_content);
-        // size field must be kept in sync with the new content length.
+        // size must stay in sync with content len
         assert_eq!(delta.ops[0].size, delta.ops[0].content.len());
     }
 
@@ -1037,14 +1016,12 @@ mod tests {
         let res = m.mutate(&mut state, &mut delta).unwrap();
         assert_eq!(res, MutationResult::Mutated);
         assert_eq!(delta.ops.len(), before + 1);
-        // New op must be either CreateFile or Mkdir.
         let new_op = delta.ops.last().unwrap();
         assert!(
             matches!(new_op.kind, FsOpKind::CreateFile | FsOpKind::Mkdir),
             "unexpected kind: {:?}",
             new_op.kind
         );
-        // Path must be absolute.
         assert!(new_op.path.starts_with('/'));
     }
 
@@ -1098,7 +1075,6 @@ mod tests {
     fn mutate_path_changes_a_component() {
         let mut state = TestState::new();
         let mut m = MutatePath::new();
-        // Run enough times to get a path that differs (not same component chosen).
         let original_path = "/input".to_string();
         let mut changed = false;
         for _ in 0..20 {
@@ -1106,7 +1082,6 @@ mod tests {
             m.mutate(&mut state, &mut delta).unwrap();
             if delta.ops[0].path != original_path {
                 changed = true;
-                // Result must still be an absolute path.
                 assert!(delta.ops[0].path.starts_with('/'));
                 break;
             }
@@ -1153,8 +1128,7 @@ mod tests {
 
     #[test]
     fn splice_delta_sees_live_corpus_updates() {
-        // Shared pool starts empty → skips.  After a donor is pushed to the
-        // shared Rc<RefCell<>> pool, subsequent mutate calls see it.
+        // empty pool skips; after pushing a donor, mutate sees it
         let mut state = TestState::new();
         let pool: LiveCorpus = Rc::new(RefCell::new(vec![]));
         let mut m = SpliceDelta::new(pool.clone());
@@ -1185,7 +1159,6 @@ mod tests {
         assert_eq!(res, MutationResult::Mutated);
         assert_eq!(delta.ops.len(), before + 1);
 
-        // The new op must be one of the four destructive kinds.
         let new_op = delta.ops.last().unwrap();
         assert!(
             matches!(
@@ -1204,13 +1177,11 @@ mod tests {
         let mut m = DestructiveMutator::new();
         let mut seen = std::collections::HashSet::new();
 
-        // Run enough iterations to expect all four kinds with a fixed seed.
         for _ in 0..200 {
             let mut delta = file_delta();
             m.mutate(&mut state, &mut delta).unwrap();
             seen.insert(std::mem::discriminant(&delta.ops.last().unwrap().kind));
         }
-        // All four destructive variants should appear within 200 tries.
         assert_eq!(seen.len(), 4, "not all destructive kinds were generated");
     }
 
@@ -1218,7 +1189,6 @@ mod tests {
     fn add_file_op_skips_at_max_ops() {
         let mut state = TestState::new();
         let mut m = AddFileOp::new();
-        // Build a delta that is exactly at the cap.
         let ops = (0..MAX_OPS)
             .map(|i| FsOp::create_file(format!("/f{i}"), vec![i as u8]))
             .collect();
@@ -1275,7 +1245,6 @@ mod tests {
             all_paths.clone(),
         );
 
-        // Run many iterations; at least one must use a baseline path (70 % bias).
         let mut used_baseline = false;
         for _ in 0..50 {
             let mut delta = file_delta();
@@ -1297,7 +1266,6 @@ mod tests {
         let all_paths = vec!["/input".to_string(), "/etc".to_string()];
         let mut m = DestructiveMutator::with_baseline(file_paths.clone(), dir_paths, all_paths);
 
-        // Run many times; when a Truncate is produced it must use a file path.
         let mut seen_truncate = false;
         for _ in 0..200 {
             let mut delta = file_delta();
@@ -1305,8 +1273,6 @@ mod tests {
             let new_op = delta.ops.last().unwrap();
             if matches!(new_op.kind, FsOpKind::Truncate) {
                 seen_truncate = true;
-                // With 70 % bias and only one file path, must hit it eventually.
-                // We just check the kind here; path bias is tested probabilistically above.
                 assert!(new_op.path.starts_with('/'));
             }
         }
@@ -1317,10 +1283,8 @@ mod tests {
     fn mutate_path_whole_swap_uses_baseline_path() {
         let mut state = TestState::new();
         let baseline = vec!["/etc/config".to_string(), "/input".to_string()];
-        // Mkdir uses the CreateFile/Mkdir branch → whole-path swap from baseline_all_paths.
         let mut m = MutatePath::with_baseline(vec![], vec![], baseline.clone());
 
-        // 30 % whole-path swap; 50 runs should hit it at least once.
         let mut used_baseline = false;
         for _ in 0..50 {
             let mut delta = FsDelta::new(vec![FsOp::mkdir("/random/path")]);
@@ -1354,8 +1318,7 @@ mod tests {
             baseline_files.contains(&new_op.path),
             "path should come from baseline"
         );
-        // Content may occasionally be an empty dictionary entry — that is a
-        // valid UpdateFile.  Only the size/content invariant must hold.
+        // content may be an empty dict entry; only size/content invariant matters
         assert_eq!(new_op.size, new_op.content.len(), "size/content must match");
     }
 
@@ -1385,10 +1348,7 @@ mod tests {
 
     #[test]
     fn update_existing_file_perturbs_baseline_content() {
-        // With the perturb branch active (baseline_contents populated), at
-        // least one call out of 100 should produce content that is a small
-        // perturbation of the baseline — detect this by checking for a
-        // bit-flip: hamming distance ≤ 16 but non-zero on a 4-byte base.
+        // perturb branch should yield a same-length-but-changed content (bit-flip)
         let mut state = TestState::new();
         let base = b"seed".to_vec();
         let contents = vec![("/input".to_string(), base.clone())];
@@ -1404,7 +1364,6 @@ mod tests {
                 && new_op.content.len() == base.len()
                 && new_op.content != base
             {
-                // same length but differing bytes → bit-flip branch
                 found_small_perturb = true;
                 break;
             }
@@ -1417,7 +1376,7 @@ mod tests {
 
     #[test]
     fn perturb_bytes_handles_empty_base() {
-        // Empty base must not panic (below() on zero-length would).
+        // empty base must not panic (below() on zero len would)
         let mut rand = StdRand::with_seed(0x1234);
         for _ in 0..20 {
             let _ = perturb_bytes(&mut rand, &[]);
@@ -1426,8 +1385,7 @@ mod tests {
 
     #[test]
     fn replace_file_content_uses_dictionary_sometimes() {
-        // Over many runs, at least one replacement should exactly match a
-        // dictionary entry — confirms the 40% dictionary branch fires.
+        // confirms the 40% dictionary branch fires
         let mut state = TestState::new();
         let mut m = ReplaceFileContent::new();
 
@@ -1564,7 +1522,7 @@ mod tests {
     #[test]
     fn replay_write_file_skips_with_no_guidance() {
         let _guard = GUIDANCE_TEST_MU.lock().unwrap();
-        update_live(MutationGuidance::none()); // ensure empty guidance
+        update_live(MutationGuidance::none());
         let mut state = TestState::new();
         let mut m = ReplayWriteFile::new(vec!["/input".to_string()]);
         let mut delta = file_delta();
@@ -1577,7 +1535,7 @@ mod tests {
         let _guard = GUIDANCE_TEST_MU.lock().unwrap();
         let baseline = vec!["/input".to_string(), "/etc/config".to_string()];
         let mut g = MutationGuidance::none();
-        g.write_paths = baseline.clone(); // identical set → complement is empty
+        g.write_paths = baseline.clone(); // complement is empty
         update_live(g);
         let mut state = TestState::new();
         let mut m = ReplayWriteFile::new(baseline);
@@ -1612,8 +1570,8 @@ mod tests {
         let _guard = GUIDANCE_TEST_MU.lock().unwrap();
         let mut g = MutationGuidance::none();
         g.write_paths = vec![
-            "/input".to_string(),         // in baseline — must be ignored
-            "/target/output".to_string(), // not in baseline — only valid pick
+            "/input".to_string(),         // in baseline, ignored
+            "/target/output".to_string(), // only valid pick
         ];
         update_live(g);
 

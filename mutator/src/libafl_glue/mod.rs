@@ -7,7 +7,7 @@ pub mod bounded_fs_access_feedback;
 
 use crate::delta::{FsDelta, FsOpKind};
 
-/// Returns content of the first CreateFile/UpdateFile op, or empty for metadata-only deltas.
+/// content of first CreateFile/UpdateFile op, or empty
 pub fn primary_content(delta: &FsDelta) -> &[u8] {
     delta
         .ops

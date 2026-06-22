@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <stdint.h>
 
-// This version only increments when a read starts at offset 0.
+// Increments only on reads starting at offset 0.
 static uint64_t read_counter = 0;
 
 static int counter_getattr(const char *path, struct stat *st,
@@ -29,7 +29,6 @@ static int counter_getattr(const char *path, struct stat *st,
     return -ENOENT;
 }
 
-// Called when someone reads a file
 static int counter_read(const char *path, char *buf, size_t size,
                          off_t offset, struct fuse_file_info *fi) {
     (void)fi;
@@ -53,7 +52,6 @@ static int counter_read(const char *path, char *buf, size_t size,
     return to_copy;
 }
 
-// Called when someone lists a directory
 static int counter_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                             off_t offset, struct fuse_file_info *fi,
                             enum fuse_readdir_flags flags) {

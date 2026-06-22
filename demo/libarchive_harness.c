@@ -28,11 +28,11 @@ void fuzz_libarchive(const uint8_t *data, size_t len)
     archive_read_support_filter_all(a);
     archive_read_support_format_all(a);
 
-    /* Feed content bytes directly — no temp file, no filesystem I/O. */
+    /* feed bytes directly, no temp file */
     if (archive_read_open_memory(a, data, len) == ARCHIVE_OK) {
         struct archive_entry *entry;
         while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
-            /* Drain entry data to exercise decompression and format parsers. */
+            /* drain data to hit decompression and format parsers */
             archive_read_data_skip(a);
         }
     }

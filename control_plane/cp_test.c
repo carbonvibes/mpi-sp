@@ -48,7 +48,6 @@ static void test_delta_lifecycle(void)
 
     CHECK(d->n_ops == 7);
 
-    /* Verify kind fields. */
     CHECK(d->ops[0].kind == FS_OP_CREATE_FILE);
     CHECK(d->ops[1].kind == FS_OP_UPDATE_FILE);
     CHECK(d->ops[2].kind == FS_OP_DELETE_FILE);
@@ -57,23 +56,19 @@ static void test_delta_lifecycle(void)
     CHECK(d->ops[5].kind == FS_OP_SET_TIMES);
     CHECK(d->ops[6].kind == FS_OP_TRUNCATE);
 
-    /* CREATE_FILE: path and content deep-copied. */
     CHECK(strcmp(d->ops[0].path, "/a.txt") == 0);
     CHECK(d->ops[0].content_len == 3);
     CHECK(d->ops[0].content != NULL);
     CHECK(d->ops[0].content[0] == 0x41);
 
-    /* TRUNCATE: new_size stored in content_len, content is NULL. */
     CHECK(d->ops[6].content_len == 100);
     CHECK(d->ops[6].content == NULL);
 
-    /* SET_TIMES: timestamps copied. */
     CHECK(d->ops[5].mtime.tv_sec == 1000);
     CHECK(d->ops[5].atime.tv_nsec == 500);
 
     delta_free(d);
-    /* Double-free must not crash (calling free(NULL) is OK). */
-    delta_free(NULL);
+    delta_free(NULL);  /* must not crash */
 }
 
 
@@ -100,7 +95,7 @@ static void test_delta_serialize(void)
     size_t len = 0;
     uint8_t *buf = delta_serialize(orig, &len);
     CHECK(buf != NULL);
-    CHECK(len > 4);  /* at least header (n_ops u32) */
+    CHECK(len > 4);  /* header is n_ops u32 */
 
     int err = 0;
     fs_delta_t *copy = delta_deserialize(buf, len, &err);
@@ -108,39 +103,32 @@ static void test_delta_serialize(void)
     CHECK(copy != NULL);
     CHECK(copy->n_ops == 7);
 
-    /* CREATE_FILE roundtrip */
     CHECK(copy->ops[0].kind == FS_OP_CREATE_FILE);
     CHECK(strcmp(copy->ops[0].path, "/data/file.bin") == 0);
     CHECK(copy->ops[0].content_len == 4);
     CHECK(copy->ops[0].content != NULL);
     CHECK(memcmp(copy->ops[0].content, content, 4) == 0);
 
-    /* UPDATE_FILE roundtrip */
     CHECK(copy->ops[1].kind == FS_OP_UPDATE_FILE);
     CHECK(copy->ops[1].content_len == 4);
     CHECK(memcmp(copy->ops[1].content, content, 4) == 0);
 
-    /* DELETE_FILE roundtrip */
     CHECK(copy->ops[2].kind == FS_OP_DELETE_FILE);
     CHECK(strcmp(copy->ops[2].path, "/data/file.bin") == 0);
     CHECK(copy->ops[2].content == NULL);
     CHECK(copy->ops[2].content_len == 0);
 
-    /* MKDIR roundtrip */
     CHECK(copy->ops[3].kind == FS_OP_MKDIR);
     CHECK(strcmp(copy->ops[3].path, "/data/subdir") == 0);
 
-    /* RMDIR roundtrip */
     CHECK(copy->ops[4].kind == FS_OP_RMDIR);
 
-    /* SET_TIMES roundtrip: timestamps preserved */
     CHECK(copy->ops[5].kind == FS_OP_SET_TIMES);
     CHECK(copy->ops[5].mtime.tv_sec  == mt.tv_sec);
     CHECK(copy->ops[5].mtime.tv_nsec == mt.tv_nsec);
     CHECK(copy->ops[5].atime.tv_sec  == at.tv_sec);
     CHECK(copy->ops[5].atime.tv_nsec == at.tv_nsec);
 
-    /* TRUNCATE: new_size is content_len; no content data. */
     CHECK(copy->ops[6].kind == FS_OP_TRUNCATE);
     CHECK(copy->ops[6].content_len == 512);
     CHECK(copy->ops[6].content == NULL);
@@ -149,7 +137,7 @@ static void test_delta_serialize(void)
     delta_free(orig);
     delta_free(copy);
 
-    /* Empty delta serializes to NULL. */
+    /* empty delta serializes to NULL */
     fs_delta_t *empty = delta_create();
     size_t elen = 99;
     uint8_t *ebuf = delta_serialize(empty, &elen);
@@ -167,40 +155,38 @@ static void test_delta_deser_errors(void)
     int err;
     fs_delta_t *d;
 
-    /* Buffer too short for header (need 4 bytes for n_ops). */
+    /* buffer too short for 4-byte header */
     uint8_t tiny[] = { 0x00, 0x00, 0x00 };
     d = delta_deserialize(tiny, 3, &err);
     CHECK(d == NULL && err < 0);
 
-    /* n_ops claims far more ops than the buffer could possibly hold. */
+    /* n_ops far exceeds buffer */
     {
-        /* Header says 0x00FFFFFF ops but buffer is only 4 bytes — too small. */
         uint8_t huge_ops[4] = { 0x00, 0xFF, 0xFF, 0xFF };
         d = delta_deserialize(huge_ops, 4, &err);
         CHECK(d == NULL && err < 0);
     }
 
-    /* Zero n_ops (invalid). */
+    /* zero n_ops */
     uint8_t zero_ops[4] = { 0, 0, 0, 0 };
     d = delta_deserialize(zero_ops, 4, &err);
     CHECK(d == NULL && err < 0);
 
-    /* Invalid op kind (0 is reserved). */
+    /* invalid op kind (0 reserved) */
     {
-        /* Build a valid 1-op delta then corrupt the kind byte. */
         fs_delta_t *src = delta_create();
         delta_add_mkdir(src, "/x");
         size_t len = 0;
         uint8_t *buf = delta_serialize(src, &len);
         delta_free(src);
         CHECK(buf != NULL);
-        buf[4] = 0;  /* kind byte → 0 (reserved/invalid); header is 4 bytes */
+        buf[4] = 0;  /* kind byte, header is 4 bytes */
         d = delta_deserialize(buf, len, &err);
         CHECK(d == NULL && err < 0);
         free(buf);
     }
 
-    /* Path that does not start with '/'. */
+    /* path not starting with '/' */
     {
         fs_delta_t *src = delta_create();
         delta_add_mkdir(src, "/valid");
@@ -208,14 +194,13 @@ static void test_delta_deser_errors(void)
         uint8_t *buf = delta_serialize(src, &len);
         delta_free(src);
         CHECK(buf != NULL);
-        /* Path starts at byte 7 (header 4 + kind 1 + path_len 2). */
-        buf[7] = 'x';  /* change '/' to 'x' */
+        buf[7] = 'x';  /* path starts at byte 7 (header 4 + kind 1 + path_len 2) */
         d = delta_deserialize(buf, len, &err);
         CHECK(d == NULL && err < 0);
         free(buf);
     }
 
-    /* Truncated mid-path. */
+    /* truncated mid-path */
     {
         fs_delta_t *src = delta_create();
         delta_add_create_file(src, "/longpath/to/file.txt",
@@ -224,8 +209,7 @@ static void test_delta_deser_errors(void)
         uint8_t *buf = delta_serialize(src, &len);
         delta_free(src);
         CHECK(buf != NULL);
-        /* Truncate to just past the path_len field (header 4 + kind 1 + path_len 2 = 7,
-         * +1 so path_len bytes are present but path data is missing). */
+        /* 8 = past path_len field, before path data */
         d = delta_deserialize(buf, 8, &err);
         CHECK(d == NULL && err < 0);
         free(buf);
@@ -248,11 +232,11 @@ static void test_delta_checksum(void)
     size_t len2 = 0;
     uint8_t *buf2 = delta_serialize(d2, &len2);
 
-    /* Same content → same checksum. */
+    /* same content, same checksum */
     CHECK(len1 == len2);
     CHECK(delta_checksum(buf1, len1) == delta_checksum(buf2, len2));
 
-    /* Different content → different checksum (very high probability). */
+    /* different content, different checksum */
     fs_delta_t *d3 = delta_create();
     delta_add_create_file(d3, "/f.txt", (const uint8_t *)"world", 5);
     size_t len3 = 0;
@@ -262,9 +246,9 @@ static void test_delta_checksum(void)
     free(buf1); free(buf2); free(buf3);
     delta_free(d1); delta_free(d2); delta_free(d3);
 
-    /* Empty buffer checksum does not crash. */
+    /* empty buffer must not crash */
     uint64_t h = delta_checksum(NULL, 0);
-    (void)h;  /* value doesn't matter; just verify no crash */
+    (void)h;
 }
 
 
@@ -276,24 +260,22 @@ static void test_ensure_parents(void)
     vfs_t *v = vfs_create();
     CHECK(v != NULL);
 
-    /* Basic: ensure /a/b for path /a/b/c.txt */
     CHECK(cp_ensure_parents(v, "/a/b/c.txt") == 0);
     vfs_stat_t st;
     CHECK(vfs_getattr(v, "/a", &st) == 0 && st.kind == VFS_DIR);
     CHECK(vfs_getattr(v, "/a/b", &st) == 0 && st.kind == VFS_DIR);
     CHECK(vfs_getattr(v, "/a/b/c.txt", &st) != 0);  /* file not created */
 
-    /* Already exists: calling again returns 0 (EEXIST silenced). */
+    /* already exists: EEXIST silenced */
     CHECK(cp_ensure_parents(v, "/a/b/d.txt") == 0);
 
-    /* Deep path. */
     CHECK(cp_ensure_parents(v, "/x/y/z/w/v/u.txt") == 0);
     CHECK(vfs_getattr(v, "/x/y/z/w/v", &st) == 0 && st.kind == VFS_DIR);
 
-    /* Root: no intermediate dirs needed. */
+    /* root: no intermediate dirs */
     CHECK(cp_ensure_parents(v, "/file.txt") == 0);
 
-    /* Bad path (not absolute). */
+    /* not absolute */
     CHECK(cp_ensure_parents(v, "relative/path") < 0);
 
     vfs_destroy(v);
@@ -367,7 +349,6 @@ static void test_apply_basic(void)
 
     /* SET_TIMES */
     {
-        /* Create a file first. */
         vfs_create_file(v, "/ts.txt", (const uint8_t *)"x", 1);
         struct timespec mt = { .tv_sec = 42, .tv_nsec = 0 };
         struct timespec at = { .tv_sec = 99, .tv_nsec = 0 };
@@ -383,7 +364,6 @@ static void test_apply_basic(void)
 
     /* TRUNCATE */
     {
-        /* Truncate /ts.txt from 1 byte to 8 bytes (extend with zeros). */
         fs_delta_t *d = delta_create();
         delta_add_truncate(d, "/ts.txt", 8);
         cp_result_t *r = cp_apply_delta(v, d, 0);
@@ -405,17 +385,13 @@ static void test_apply_ensure_parents(void)
     vfs_t *v = vfs_create();
     CHECK(v != NULL);
 
-    /*
-     * Delta: CREATE_FILE /a/b/c.txt BEFORE MKDIR /a/b.
-     * The control plane must auto-create /a and /a/b first.
-     */
+    /* CREATE_FILE before its MKDIR: control plane must auto-create /a, /a/b */
     fs_delta_t *d = delta_create();
     delta_add_create_file(d, "/a/b/c.txt", (const uint8_t *)"data", 4);
     delta_add_mkdir(d, "/a/b");  /* out-of-order: parent already auto-created */
 
     cp_result_t *r = cp_apply_delta(v, d, 0);
     CHECK(r != NULL);
-    /* All ops should succeed. */
     CHECK(r->succeeded == 2 && r->failed == 0);
 
     vfs_stat_t st;
@@ -437,16 +413,11 @@ static void test_apply_rmdir_ordering(void)
     vfs_t *v = vfs_create();
     CHECK(v != NULL);
 
-    /* Build /a/b/c directory tree. */
     vfs_mkdir(v, "/a");
     vfs_mkdir(v, "/a/b");
     vfs_mkdir(v, "/a/b/c");
 
-    /*
-     * Delta lists RMDIRs shallowest-first: /a, /a/b, /a/b/c.
-     * If applied in that order: /a fails (ENOTEMPTY), /a/b fails, /a/b/c succeeds.
-     * The control plane MUST reorder to: /a/b/c, /a/b, /a.
-     */
+    /* RMDIRs listed shallowest-first; control plane must reorder deepest-first */
     fs_delta_t *d = delta_create();
     delta_add_rmdir(d, "/a");
     delta_add_rmdir(d, "/a/b");
@@ -475,20 +446,20 @@ static void test_apply_errors(void)
     vfs_mkdir(v, "/populated");
     vfs_create_file(v, "/populated/child.txt", (const uint8_t *)"x", 1);
 
-    /* DELETE_FILE on non-existent path → fail, rest continue. */
+    /* DELETE_FILE on missing path fails, rest continue */
     {
         fs_delta_t *d = delta_create();
         delta_add_delete_file(d, "/no_such_file.txt");
-        delta_add_mkdir(d, "/newdir");  /* should still succeed */
+        delta_add_mkdir(d, "/newdir");
         cp_result_t *r = cp_apply_delta(v, d, 0);
         CHECK(r->failed == 1 && r->succeeded == 1);
-        CHECK(r->results[0].error < 0);  /* ENOENT */
+        CHECK(r->results[0].error < 0);
         CHECK(r->results[1].error == 0);
         cp_result_free(r);
         delta_free(d);
     }
 
-    /* RMDIR on non-empty directory → fail. */
+    /* RMDIR on non-empty dir fails */
     {
         fs_delta_t *d = delta_create();
         delta_add_rmdir(d, "/populated");
@@ -499,7 +470,7 @@ static void test_apply_errors(void)
         delta_free(d);
     }
 
-    /* UPDATE_FILE on a directory → fail. */
+    /* UPDATE_FILE on a dir fails */
     {
         fs_delta_t *d = delta_create();
         delta_add_update_file(d, "/populated",
@@ -558,7 +529,7 @@ static void test_apply_truncate(void)
     vfs_stat_t st;
     CHECK(vfs_getattr(v, "/t.txt", &st) == 0 && st.size == 11);
 
-    /* Shrink to 5 bytes: content should be "Hello". */
+    /* shrink to 5: "Hello" */
     {
         fs_delta_t *d = delta_create();
         delta_add_truncate(d, "/t.txt", 5);
@@ -573,7 +544,7 @@ static void test_apply_truncate(void)
         delta_free(d);
     }
 
-    /* Extend to 10 bytes: bytes 5-9 must be zero. */
+    /* extend to 10: bytes 5-9 zero-filled */
     {
         fs_delta_t *d = delta_create();
         delta_add_truncate(d, "/t.txt", 10);
@@ -584,12 +555,12 @@ static void test_apply_truncate(void)
         size_t got = 0;
         vfs_read(v, "/t.txt", 0, 10, buf, &got);
         CHECK(got == 10);
-        CHECK(buf[5] == 0 && buf[9] == 0);  /* extension is zero-filled */
+        CHECK(buf[5] == 0 && buf[9] == 0);
         cp_result_free(r);
         delta_free(d);
     }
 
-    /* Truncate to 0 bytes. */
+    /* truncate to 0 */
     {
         fs_delta_t *d = delta_create();
         delta_add_truncate(d, "/t.txt", 0);
@@ -614,7 +585,6 @@ static void test_apply_dry_run(void)
     vfs_create_file(v, "/baseline.txt", (const uint8_t *)"base", 4);
     vfs_save_snapshot(v);  /* required before dry_run */
 
-    /* Delta creates a new file. */
     fs_delta_t *d = delta_create();
     delta_add_create_file(d, "/new.txt", (const uint8_t *)"new", 3);
 
@@ -622,11 +592,9 @@ static void test_apply_dry_run(void)
     CHECK(r != NULL);
     CHECK(r->succeeded == 1 && r->failed == 0);
 
-    /* After dry_run the VFS is restored: /new.txt must not exist. */
+    /* dry_run restores: /new.txt gone, baseline intact */
     vfs_stat_t st;
     CHECK(vfs_getattr(v, "/new.txt", &st) != 0);
-
-    /* Baseline file must still be present. */
     CHECK(vfs_getattr(v, "/baseline.txt", &st) == 0 && st.size == 4);
 
     cp_result_free(r);
@@ -643,13 +611,11 @@ static void test_apply_mutate_reset(void)
     vfs_t *v = vfs_create();
     CHECK(v != NULL);
 
-    /* Baseline: one file, one directory. */
     vfs_create_file(v, "/seed.txt", (const uint8_t *)"seed_content", 12);
     vfs_mkdir(v, "/docs");
     vfs_save_snapshot(v);
 
     for (int iter = 0; iter < 10; iter++) {
-        /* Build a delta that creates and modifies things. */
         char path[64];
         snprintf(path, sizeof path, "/docs/iter%d.txt", iter);
         const uint8_t content[] = "iteration data";
@@ -661,7 +627,6 @@ static void test_apply_mutate_reset(void)
         cp_result_t *r = cp_apply_delta(v, d, 0);
         CHECK(r->succeeded == 2 && r->failed == 0);
 
-        /* Verify mutations are visible. */
         vfs_stat_t st;
         CHECK(vfs_getattr(v, path, &st) == 0 && st.size == (sizeof content - 1));
         CHECK(vfs_getattr(v, "/seed.txt", &st) == 0 && st.size == 7);
@@ -669,10 +634,8 @@ static void test_apply_mutate_reset(void)
         cp_result_free(r);
         delta_free(d);
 
-        /* Reset to baseline for next iteration. */
         CHECK(vfs_reset_to_snapshot(v) == 0);
 
-        /* Verify baseline is restored. */
         CHECK(vfs_getattr(v, path, &st) != 0);           /* iter file gone */
         CHECK(vfs_getattr(v, "/seed.txt", &st) == 0);
         CHECK(st.size == 12);                              /* original content */
@@ -688,15 +651,10 @@ static void test_vfs_checksum(void)
 {
     printf("  vfs_checksum\n");
 
-    /*
-     * The checksum includes node timestamps.  Two VFS instances built by
-     * separate vfs_create_file / vfs_mkdir calls acquire different
-     * clock_gettime values, so they cannot be expected to agree unless we
-     * pin timestamps to the same value explicitly.
-     */
+    /* checksum includes timestamps, so pin them or two VFSes won't match */
     struct timespec t = { .tv_sec = 1234567890, .tv_nsec = 0 };
 
-    /* Same VFS state (same content + same timestamps) → same checksum. */
+    /* same state, same checksum */
     vfs_t *v1 = vfs_create();
     vfs_create_file(v1, "/f.txt", (const uint8_t *)"abc", 3);
     vfs_set_times(v1, "/f.txt", &t, &t);
@@ -713,10 +671,10 @@ static void test_vfs_checksum(void)
     uint64_t c2 = cp_vfs_checksum(v2);
     CHECK(c1 == c2);
 
-    /* Same VFS, called twice → stable (checksum does not mutate state). */
+    /* stable across calls */
     CHECK(cp_vfs_checksum(v1) == c1);
 
-    /* Different file content → different checksum. */
+    /* different content */
     vfs_t *v3 = vfs_create();
     vfs_create_file(v3, "/f.txt", (const uint8_t *)"xyz", 3);
     vfs_set_times(v3, "/f.txt", &t, &t);
@@ -724,7 +682,7 @@ static void test_vfs_checksum(void)
     vfs_set_times(v3, "/dir", &t, &t);
     CHECK(cp_vfs_checksum(v3) != c1);
 
-    /* Different node name → different checksum. */
+    /* different name */
     vfs_t *v4 = vfs_create();
     vfs_create_file(v4, "/g.txt", (const uint8_t *)"abc", 3);
     vfs_set_times(v4, "/g.txt", &t, &t);
@@ -732,7 +690,7 @@ static void test_vfs_checksum(void)
     vfs_set_times(v4, "/dir", &t, &t);
     CHECK(cp_vfs_checksum(v4) != c1);
 
-    /* Different timestamps → different checksum. */
+    /* different timestamps */
     vfs_t *v5 = vfs_create();
     vfs_create_file(v5, "/f.txt", (const uint8_t *)"abc", 3);
     struct timespec t2 = { .tv_sec = 9999, .tv_nsec = 0 };
@@ -741,7 +699,7 @@ static void test_vfs_checksum(void)
     vfs_set_times(v5, "/dir", &t, &t);
     CHECK(cp_vfs_checksum(v5) != c1);
 
-    /* Empty VFS checksum is valid and stable across calls. */
+    /* empty VFS is stable */
     vfs_t *v6 = vfs_create();
     uint64_t h6a = cp_vfs_checksum(v6);
     uint64_t h6b = cp_vfs_checksum(v6);

@@ -362,21 +362,21 @@ where
         let r = state.rand_mut().below(nz(100));
 
         if r < 20 {
-            // Self-loop
+            // self-loop
             let path = "/fuzz_loop";
             if input.ops.len() + 1 > MAX_OPS {
                 return Ok(MutationResult::Skipped);
             }
             input.ops.push(FsOp::create_symlink(path, path));
         } else if r < 40 {
-            // Two-cycle
+            // two-cycle
             if input.ops.len() + 2 > MAX_OPS {
                 return Ok(MutationResult::Skipped);
             }
             input.ops.push(FsOp::create_symlink("/fuzz_a", "/fuzz_b"));
             input.ops.push(FsOp::create_symlink("/fuzz_b", "/fuzz_a"));
         } else if r < 70 {
-            // Chain of N symlinks anchored at a crun-relevant path
+            // chain of N symlinks ending at a crun-relevant anchor
             let n = *pick(state.rand_mut(), CHAIN_LENGTHS);
             let anchors = ["/proc", "/dev", "/bin/true"];
             let anchor = *pick(state.rand_mut(), &anchors);
@@ -384,7 +384,7 @@ where
             if n > available {
                 return Ok(MutationResult::Skipped);
             }
-            // s0 -> s1 -> s2 -> ... -> anchor
+            // s0 -> s1 -> ... -> anchor
             for i in (1..n).rev() {
                 input
                     .ops
@@ -392,7 +392,7 @@ where
             }
             input.ops.push(FsOp::create_symlink("/s0", anchor));
         } else if r < 85 {
-            // Long target string near PATH_MAX
+            // long target near PATH_MAX
             let long_target = format!("{}{}", "../".repeat(20), "proc/self/exe");
             if input.ops.len() + 1 > MAX_OPS {
                 return Ok(MutationResult::Skipped);
@@ -401,7 +401,7 @@ where
                 .ops
                 .push(FsOp::create_symlink("/fuzz_long", &long_target));
         } else {
-            // Repeated slashes in target
+            // repeated slashes in target
             if input.ops.len() + 1 > MAX_OPS {
                 return Ok(MutationResult::Skipped);
             }
@@ -515,7 +515,6 @@ mod tests {
         let result = m.mutate(&mut state, &mut input).unwrap();
         assert_eq!(result, MutationResult::Mutated);
         assert!(input.ops.len() >= 2);
-        // All new ops from loop mutator must be CreateSymlink
         for op in &input.ops[1..] {
             assert_eq!(op.kind, FsOpKind::CreateSymlink);
         }
@@ -533,7 +532,6 @@ mod tests {
         assert_eq!(result, MutationResult::Mutated);
         let last = input.ops.last().unwrap();
         assert_eq!(last.kind, FsOpKind::CreateSymlink);
-        // Target must be one of the interesting exec targets
         assert!(!last.target.is_empty());
         unsafe { vfs_destroy(vfs) };
     }

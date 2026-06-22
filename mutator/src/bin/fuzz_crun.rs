@@ -42,25 +42,20 @@ use fs_mutator::{
 #[cfg(has_fuse3)]
 use fs_mutator::ffi::{fuse_vfs_lib_init, fuse_vfs_lib_is_mounted, fuse_vfs_lib_run};
 
-// #[link] attributes here are PER-BINARY — they don't affect other binaries in
-// the package. The SanCov-instrumented archives are linked exclusively here so
-// non-fuzzing binaries never see the SanCov symbol requirements.
+// #[link] attrs are per-binary, so non-fuzzing binaries never need SanCov symbols.
 
 #[cfg_attr(has_libcrun, link(name = "crun", kind = "static"))]
 #[cfg_attr(has_libcrun, link(name = "ocispec", kind = "static"))]
-// libyajl: prefer bundled static build; fall back to system dylib.
+// libyajl: prefer bundled static, fall back to system dylib
 #[cfg_attr(has_bundled_yajl, link(name = "yajl", kind = "static"))]
 #[cfg_attr(all(has_libcrun, not(has_bundled_yajl)), link(name = "yajl"))]
-// System libraries crun requires at link time.
+// crun's link-time system deps
 #[cfg_attr(has_libcrun, link(name = "cap"))]
 #[cfg_attr(has_libcrun, link(name = "seccomp"))]
 #[cfg_attr(has_libcrun, link(name = "systemd"))]
 extern "C" {
-    /// Run one container iteration in-process via libcrun.
-    /// config_json: NUL-terminated OCI config.json (root.path already set).
-    /// state_root:  crun state directory (unique per fuzzer instance).
-    /// id:          unique container ID per iteration.
-    /// Returns 0 on success, -1 on parse/validation error, container exit code otherwise.
+    /// Run one container in-process via libcrun. config_json is NUL-terminated.
+    /// Returns 0 on success, -1 on parse/validation error, else container exit code.
     fn fuzz_crun_run_container(
         config_json: *const std::os::raw::c_char,
         state_root: *const std::os::raw::c_char,
@@ -466,14 +461,12 @@ fn main() {
     let fuse_config_path = format!("{mountpoint}/config.json");
 
     let mut harness = |input: &FsDelta| -> ExitKind {
-        // Reset VFS to clean baseline
         unsafe { vfs_reset_to_snapshot(vfs) };
         let _ = apply_delta(vfs, input);
 
         let raw = std::fs::read(&fuse_config_path).unwrap_or_else(|_| baseline_config.clone());
 
-        // Patch root.path so crun always finds the FUSE rootfs regardless of
-        // what the mutator did to the config.
+        // pin root.path to the FUSE rootfs whatever the mutator did to the config
         let patched = patch_root_path(&raw, &fuse_rootfs_path);
 
         let Ok(config_cstr) = CString::new(patched) else {
@@ -486,9 +479,7 @@ fn main() {
             return ExitKind::Ok;
         };
 
-        // SanCov fires inside the call. Real crashes (SIGSEGV, SIGABRT, etc.)
-        // are caught by InProcessExecutor's signal handlers and reported as
-        // ExitKind::Crash; exit code -1 (parse/validation error) is expected.
+        // crashes are caught by InProcessExecutor's signal handlers; -1 (parse error) is expected
         let _ret = unsafe {
             fuzz_crun_run_container(
                 config_cstr.as_ptr(),
@@ -500,7 +491,7 @@ fn main() {
         ExitKind::Ok
     };
 
-    // 10 s timeout per iteration (namespace setup can be slow)
+    // 10s timeout: namespace setup can be slow
     let mut executor = InProcessExecutor::with_timeout(
         &mut harness,
         tuple_list!(edges_observer),
@@ -511,7 +502,6 @@ fn main() {
     )
     .expect("InProcessExecutor");
 
-    // Seed corpus
     let seed_start = std::time::Instant::now();
     for delta in &initial {
         fuzzer
@@ -526,7 +516,7 @@ fn main() {
     println!("  corpus  → corpus_crun/");
     println!("  crashes → solutions_crun/\n");
 
-    let start = Instant::now(); // reset after seeding so exec/sec counts only fuzz iterations
+    let start = Instant::now(); // so exec/sec excludes seeding
     let mut total: u64 = 0;
 
     loop {
@@ -538,12 +528,10 @@ fn main() {
 
         total += 1;
 
-        // maybe_report_progress fires every 2s and reports cumulative edge coverage.
-        // Flushing stdout ensures lines reach the log immediately when piped through tee.
         mgr.maybe_report_progress(&mut state, Duration::from_secs(2))
             .expect("progress report failed");
 
-        // Keep live_corpus in sync for SpliceDelta.
+        // keep live_corpus in sync for SpliceDelta
         let after = state.corpus().count();
         for idx in before..after {
             let cid = CorpusId::from(idx);

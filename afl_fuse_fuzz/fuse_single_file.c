@@ -1,10 +1,5 @@
 /*
- * fuse_single_file.c — minimal FUSE3 filesystem with exactly one file: "input".
- *
- * The file content lives in a fixed in-memory buffer.  Supports open/read/write/
- * truncate so the AFL++ harness can overwrite the file each fuzzing iteration and
- * the target can read it back through the same VFS path.
- *
+ * Minimal FUSE3 fs with one file "input" in a fixed in-memory buffer.
  * Mount:   ./fuse_single_file <mountpoint> [-s]
  * Unmount: fusermount3 -u <mountpoint>
  */
@@ -25,8 +20,6 @@
 
 static uint8_t g_buf[MAX_FILE_SIZE];
 static size_t  g_size = 0;
-
-/* ── getattr ─────────────────────────────────────────────────────────────── */
 
 static int sf_getattr(const char *path, struct stat *st,
                       struct fuse_file_info *fi)
@@ -50,8 +43,6 @@ static int sf_getattr(const char *path, struct stat *st,
     return -ENOENT;
 }
 
-/* ── readdir ─────────────────────────────────────────────────────────────── */
-
 static int sf_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                       off_t offset, struct fuse_file_info *fi,
                       enum fuse_readdir_flags flags)
@@ -66,8 +57,6 @@ static int sf_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     return 0;
 }
 
-/* ── open ────────────────────────────────────────────────────────────────── */
-
 static int sf_open(const char *path, struct fuse_file_info *fi)
 {
     (void)fi;
@@ -75,8 +64,6 @@ static int sf_open(const char *path, struct fuse_file_info *fi)
         return -ENOENT;
     return 0;
 }
-
-/* ── read ────────────────────────────────────────────────────────────────── */
 
 static int sf_read(const char *path, char *buf, size_t size, off_t offset,
                    struct fuse_file_info *fi)
@@ -94,8 +81,6 @@ static int sf_read(const char *path, char *buf, size_t size, off_t offset,
     return (int)size;
 }
 
-/* ── write ───────────────────────────────────────────────────────────────── */
-
 static int sf_write(const char *path, const char *buf, size_t size, off_t offset,
                     struct fuse_file_info *fi)
 {
@@ -107,15 +92,11 @@ static int sf_write(const char *path, const char *buf, size_t size, off_t offset
         size = MAX_FILE_SIZE - (size_t)offset;
 
     memcpy(g_buf + offset, buf, size);
-    /* Always update g_size to reflect the exact written extent.  If a short
-     * write follows a longer one without an intervening truncate, cap g_size
-     * so stale tail bytes aren't visible on the next read. */
+    /* cap g_size to written extent so a short write after a long one drops stale tail */
     g_size = (size_t)offset + size;
 
     return (int)size;
 }
-
-/* ── truncate ────────────────────────────────────────────────────────────── */
 
 static int sf_truncate(const char *path, off_t size,
                        struct fuse_file_info *fi)
@@ -132,8 +113,6 @@ static int sf_truncate(const char *path, off_t size,
     g_size = (size_t)size;
     return 0;
 }
-
-/* ── ops table ───────────────────────────────────────────────────────────── */
 
 static const struct fuse_operations sf_ops = {
     .getattr  = sf_getattr,

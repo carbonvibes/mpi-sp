@@ -456,7 +456,7 @@ int vfs_rename(vfs_t *vfs, const char *oldpath, const char *newpath)
     src->parent = new_parent;
     int r = dir_add_child(new_parent, newname, src);
     if (r < 0) {
-        /* reattach to avoid losing the node on alloc failure */
+        /* reattach so the node isn't lost on alloc failure */
         src->parent = old_parent;
         dir_add_child(old_parent, oldname, src);
         return r;
@@ -527,7 +527,7 @@ int vfs_reset_to_snapshot(vfs_t *vfs)
 {
     if (!vfs->snapshot) return -EINVAL;
 
-    /* copy so the snapshot itself stays immutable across resets */
+    /* copy so the snapshot stays immutable across resets */
     vfs_node_t *copy = node_deepcopy(vfs->snapshot, NULL);
     if (!copy) return -ENOMEM;
 

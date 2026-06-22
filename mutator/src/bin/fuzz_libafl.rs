@@ -32,8 +32,8 @@ use libafl_targets::coverage::MAX_EDGES_FOUND;
 use libafl_targets::cmps::{CmpLogObserver, CMPLOG_ENABLED};
 use serde::{Deserialize, Serialize};
 
-// Newtype so CmpLogObserver satisfies the Serialize+Deserialize bounds on InProcessExecutor.
-// The CmpLog map is global, so serializing as an empty map and reconstructing on deserialize is fine.
+// Newtype to give CmpLogObserver the Serialize+Deserialize bounds InProcessExecutor wants.
+// CmpLog map is global, so serialize empty and reconstruct on deserialize.
 #[derive(Debug)]
 struct SerializableCmpLogObserver {
     inner: CmpLogObserver,
@@ -492,8 +492,7 @@ fn main() {
     let monitor = SimpleMonitor::new(|msg| println!("{msg}"));
     let mut mgr = SimpleEventManager::new(monitor);
 
-    // i2s_stage runs FsDeltaI2SMutator in isolation so its substitution isn't overwritten
-    // by havoc before the harness executes. havoc_stage handles all structural mutations.
+    // i2s runs in its own stage so havoc doesn't overwrite its substitution first
     let i2s_scheduled = HavocScheduledMutator::new(tuple_list!(FsDeltaI2SMutator::new()));
     let i2s_stage     = StdMutationalStage::new(i2s_scheduled);
 

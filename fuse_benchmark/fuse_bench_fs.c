@@ -44,7 +44,7 @@ static void node_free(node_t *n)
     memset(n, 0, sizeof(*n));
 }
 
-/* "/foo/bar" → "/foo",  "/foo" → "/" — result in buf (MAX_PATH bytes) */
+/* "/foo/bar" -> "/foo", "/foo" -> "/" */
 static void parent_of(const char *path, char *buf)
 {
     const char *last = strrchr(path, '/');
@@ -99,7 +99,6 @@ static int fbfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
         parent_of(g_nodes[i].path, parent);
         if (strcmp(parent, path) != 0) continue;
 
-        /* Emit only the final component. */
         const char *name = strrchr(g_nodes[i].path, '/') + 1;
         filler(buf, name, NULL, 0, 0);
     }
@@ -145,7 +144,7 @@ static int fbfs_write(const char *path, const char *buf, size_t size,
     uint8_t *tmp = realloc(n->content, new_size);
     if (!tmp) return -ENOMEM;
 
-    /* Zero-fill any gap between old end and new offset. */
+    /* zero-fill gap between old end and new offset */
     if ((size_t)offset > n->size)
         memset(tmp + n->size, 0, (size_t)offset - n->size);
 
@@ -219,7 +218,7 @@ static int fbfs_rmdir(const char *path)
     if (!n) return -ENOENT;
     if (!n->is_dir) return -ENOTDIR;
 
-    /* Refuse if any node has this path as its parent. */
+    /* refuse if non-empty */
     for (int i = 0; i < MAX_NODES; i++) {
         if (!g_nodes[i].used || &g_nodes[i] == n) continue;
         char parent[MAX_PATH];

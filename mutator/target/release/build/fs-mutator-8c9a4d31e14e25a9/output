@@ -1,6 +1,8 @@
 cargo::rustc-check-cfg=cfg(has_libarchive)
 cargo::rustc-check-cfg=cfg(has_fuse3)
-make: 'libcontrol_plane.a' is up to date.
+gcc -std=c11 -Wall -Wextra -Wpedantic -g -D_DEFAULT_SOURCE -I..     -c control_plane.c -o control_plane.o
+gcc -std=c11 -Wall -Wextra -Wpedantic -g -D_DEFAULT_SOURCE -I..     -c ../vfs/vfs.c -o vfs.o
+ar rcs libcontrol_plane.a delta.o control_plane.o vfs.o
 cargo:rustc-link-search=native=../control_plane
 cargo:rustc-link-lib=static=control_plane
 cargo:rerun-if-changed=../vfs/vfs.c

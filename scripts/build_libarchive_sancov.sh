@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
-# Build libarchive 3.7.2 statically with clang -fsanitize-coverage=trace-pc-guard.
-#
-# The resulting libarchive.a is linked into fuzz_libafl instead of the system
-# shared library so that HitcountsMapObserver sees edges inside libarchive's
-# format parsers, not just the 3 edges in the thin harness wrapper.
-#
-# Run once from any directory:
-#   bash scripts/build_libarchive_sancov.sh
-#
-# Output: vendor/libarchive-sancov/{include,lib}
+# build libarchive 3.7.2 static with clang sancov trace-pc-guard.
+# the .a is linked into fuzz_libafl (not the system .so) so the observer sees
+# edges inside libarchive's parsers, not just the 3 in the harness wrapper.
+# run once from any dir: bash scripts/build_libarchive_sancov.sh
+# output: vendor/libarchive-sancov/{include,lib}
 
 set -euo pipefail
 

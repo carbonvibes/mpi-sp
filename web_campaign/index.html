@@ -412,7 +412,7 @@ function render(data) {
   cardsEl.innerHTML = campaigns.map(c => {
     const l = c.latest;
     const restarts = (c.restarts || []).length;
-    // per-binary edge total (ASAN/UBSan differ from base's 11072); fall back to base.
+    // per-binary edge total (ASAN/UBSan differ from base); fall back to 11072
     const edgesTotal = l.edges_total || 11072;
     const edgesPct = l.edges ? ((l.edges / edgesTotal) * 100).toFixed(1) : '0.0';
     const deadCls = c.running ? '' : ' dead';

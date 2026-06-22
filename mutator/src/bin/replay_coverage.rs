@@ -1,18 +1,13 @@
 //! replay_coverage — run every saved corpus entry through a coverage-instrumented
-//! crun binary using the exact same FUSE VFS pipeline the fuzzer uses.
-//!
-//! Each invocation of crun-harness-cov detects it has no AFL++ parent (forkserver
-//! FD not open), falls into dumb mode, runs the loop body once, and exits — writing
-//! a .profraw file.  After all entries are replayed, merge with llvm-profdata and
-//! generate the HTML report with llvm-cov.
+//! crun binary via the same FUSE VFS pipeline the fuzzer uses. Each run writes a
+//! .profraw; merge with llvm-profdata and report with llvm-cov afterward.
 //!
 //! MUST be run as root inside a mount namespace:
 //!   sudo unshare -m ./replay_coverage <corpus_dir> <grammar.py> <crun-harness-cov> [--profile-dir /tmp/cov_profiles]
 //!
-//! corpus_dir   — directory containing `combined_N` binary corpus files
-//!                (can be /tmp/c3_0/corpus or a merged dir of several campaigns)
-//! grammar.py   — Nautilus grammar (needed to convert NautilusInput → JSON)
-//! crun-harness-cov — path to the coverage-instrumented crun binary
+//! corpus_dir   — dir of `combined_N` binary corpus files
+//! grammar.py   — Nautilus grammar (NautilusInput → JSON)
+//! crun-harness-cov — coverage-instrumented crun binary
 
 use std::{
     ffi::CString,
@@ -43,8 +38,6 @@ const LLVM_PROFDATA: &str =
 const LLVM_COV: &str =
     "/nix/store/jp45dqzv8mjpqsvhj99c93pc4vlmhy16-llvm-21.1.8/bin/llvm-cov";
 
-// ── CombinedInput ─────────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug, Serialize, Deserialize, Hash)]
 struct CombinedInput {
     config: NautilusInput,
@@ -56,8 +49,6 @@ impl Input for CombinedInput {
         "replay_cov".into()
     }
 }
-
-// ── VFS baseline ──────────────────────────────────────────────────────────────
 
 unsafe fn init_vfs(vfs: *mut VfsT) {
     for dir in &[
@@ -86,8 +77,6 @@ unsafe fn init_vfs(vfs: *mut VfsT) {
     mkfile!(c"/etc/resolv.conf", b"nameserver 8.8.8.8\n");
 }
 
-// ── FUSE startup ──────────────────────────────────────────────────────────────
-
 #[cfg(has_fuse3)]
 fn start_fuse(vfs: *mut VfsT, mountpoint: &str) {
     unsafe { fuse_vfs_lib_init(vfs) };
@@ -111,10 +100,8 @@ fn start_fuse(_vfs: *mut VfsT, _mountpoint: &str) {
     std::process::exit(1);
 }
 
-// ── override_rootfs_path ──────────────────────────────────────────────────────
-// Same as fuzz_combined_afl.rs — forces root.path to FUSE mount AND injects
-// a mount namespace so container mounts don't escape into the host namespace.
-
+// forces root.path to the FUSE mount and injects a mount namespace so container
+// mounts don't escape to the host. matches fuzz_combined_afl.rs.
 fn override_rootfs_path(json: &[u8], fuse_rootfs: &str) -> Option<Vec<u8>> {
     let mut v: serde_json::Value = serde_json::from_slice(json).ok()?;
     let obj = v.as_object_mut()?;
@@ -143,8 +130,6 @@ fn override_rootfs_path(json: &[u8], fuse_rootfs: &str) -> Option<Vec<u8>> {
     serde_json::to_vec(&v).ok()
 }
 
-// ── main ──────────────────────────────────────────────────────────────────────
-
 fn main() {
     pyo3::prepare_freethreaded_python();
 
@@ -166,16 +151,15 @@ fn main() {
         .map(|w| PathBuf::from(&w[1]))
         .unwrap_or_else(|| PathBuf::from("/tmp/cov_profiles"));
 
-    // Optional: only replay entries discovered at or before this Unix timestamp.
-    // A corpus entry's mtime is when the fuzzer saved it, so this selects the
-    // "first N hours" of a campaign and skips the post-saturation tail.
+    // only replay entries with mtime (= save time) at or before this epoch;
+    // selects the first N hours of a campaign.
     let before_epoch: Option<u64> = args.windows(2)
         .find(|w| w[0] == "--before-epoch")
         .and_then(|w| w[1].parse().ok());
 
     std::fs::create_dir_all(&profile_dir).expect("failed to create profile dir");
 
-    // Working dir for harness — it creates rootfs/ here on each run
+    // harness creates rootfs/ here each run
     let workdir = PathBuf::from(format!("/tmp/cov_workdir_{}", std::process::id()));
     std::fs::create_dir_all(&workdir).expect("failed to create workdir");
 
@@ -184,28 +168,23 @@ fn main() {
     eprintln!("[cov] harness  : {harness}");
     eprintln!("[cov] profiles : {}", profile_dir.display());
 
-    // ── Load Nautilus context ─────────────────────────────────────────────────
     let context: &'static NautilusContext =
         Box::leak(Box::new(NautilusContext::from_file(100, &grammar_path).unwrap_or_else(|e| {
             eprintln!("Failed to load grammar: {e}");
             std::process::exit(1);
         })));
 
-    // ── Init VFS + save baseline snapshot ────────────────────────────────────
     let vfs = unsafe { vfs_create() };
     assert!(!vfs.is_null(), "vfs_create() returned null");
     unsafe { init_vfs(vfs) };
     unsafe { vfs_save_snapshot(vfs) };
 
-    // ── Mount FUSE ────────────────────────────────────────────────────────────
     let mountpoint = format!("/tmp/cov_fuse_{}", std::process::id());
     std::fs::create_dir_all(&mountpoint).expect("failed to create FUSE mountpoint");
     start_fuse(vfs, &mountpoint);
     eprintln!("[cov] FUSE mounted at {mountpoint}");
 
-    // ── Collect corpus files ──────────────────────────────────────────────────
-    // Binary corpus entries are named `combined_N` (no extension).
-    // Skip .json sidecars and metadata files.
+    // binary entries are `combined_N` (no extension); skip .json sidecars
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&corpus_dir)
         .expect("cannot read corpus dir")
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -217,7 +196,6 @@ fn main() {
         })
         .collect();
 
-    // Sort numerically by index
     entries.sort_by_key(|p| {
         p.file_stem()
             .and_then(|s| s.to_str())
@@ -226,7 +204,6 @@ fn main() {
             .unwrap_or(usize::MAX)
     });
 
-    // Apply the --before-epoch cutoff (keep entries saved at or before the cutoff).
     if let Some(cutoff) = before_epoch {
         let before = entries.len();
         entries.retain(|p| {
@@ -235,7 +212,7 @@ fn main() {
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() <= cutoff)
-                .unwrap_or(true) // keep if mtime unreadable rather than silently drop
+                .unwrap_or(true) // keep if mtime unreadable
         });
         eprintln!(
             "[cov] --before-epoch {cutoff}: kept {}/{} entries (dropped {})",
@@ -251,37 +228,31 @@ fn main() {
         std::process::exit(1);
     }
 
-    // ── Replay loop ───────────────────────────────────────────────────────────
     let mut ok = 0usize;
     let mut skip = 0usize;
     let mut timeout = 0usize;
 
     for (i, path) in entries.iter().enumerate() {
-        // Deserialize CombinedInput
         let input = match CombinedInput::from_file(path) {
             Ok(inp) => inp,
             Err(_) => { skip += 1; continue; }
         };
 
-        // Reset VFS to baseline, then apply this entry's FsDelta
         unsafe { vfs_reset_to_snapshot(vfs) };
         let _ = apply_delta(vfs, &input.rootfs);
 
-        // Convert NautilusInput → OCI config JSON
         let mut conv = NautilusBytesConverter::new(context);
         let raw = conv.to_target_bytes(&input.config);
 
-        // Override root.path to FUSE mount + inject mount namespace
         let cfg = match override_rootfs_path(&*raw, &mountpoint) {
             Some(c) => c,
             None => { skip += 1; continue; }
         };
 
-        // Write config to a per-entry temp file
         let cfg_path = workdir.join(format!("config_{i}.json"));
         if std::fs::write(&cfg_path, &cfg).is_err() { skip += 1; continue; }
 
-        // Profile output file — %p would require LLVM runtime support, use index
+        // index, not %p, since %p needs LLVM runtime support
         let prof_file = profile_dir.join(format!("crun_{i}.profraw"));
 
         let status = Command::new(harness)
@@ -319,7 +290,6 @@ fn main() {
     );
     eprintln!("  python3 -m http.server 8099 --directory /tmp/cov_report");
 
-    // ── Cleanup ───────────────────────────────────────────────────────────────
     std::fs::remove_dir_all(&workdir).ok();
-    // FUSE is torn down when the process exits (kernel releases the mount)
+    // FUSE torn down on process exit
 }

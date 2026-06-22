@@ -142,7 +142,7 @@ cp_result_t *cp_apply_delta(vfs_t *vfs, const fs_delta_t *d, int dry_run)
         }
 
         int r = apply_single_op(vfs, op);
-        /* EEXIST on MKDIR is fine — directory already exists */
+        /* MKDIR on existing dir is fine */
         if (r == -EEXIST && op->kind == FS_OP_MKDIR) r = 0;
 
         if (r == 0) {
@@ -207,8 +207,8 @@ cp_result_t *cp_apply_delta(vfs_t *vfs, const fs_delta_t *d, int dry_run)
 
         int sr = vfs_reset_to_snapshot(vfs);
         if (sr != 0) {
-            fprintf(stderr, "[dry-run] WARNING: no snapshot saved — "
-                            "delta was applied permanently (vfs_reset_to_snapshot: %d)\n", sr);
+            fprintf(stderr, "[dry-run] WARNING: no snapshot saved, "
+                            "delta applied permanently (vfs_reset_to_snapshot: %d)\n", sr);
         }
     }
 

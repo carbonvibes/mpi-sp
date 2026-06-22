@@ -5,23 +5,21 @@
 #   inst 6    : ASAN    — own corpus, READS the shared corpus, never exports
 #   inst 7    : UBSan   — own corpus, READS the shared corpus, never exports
 #   + SemSan  : one eBPF monitor watching every `crun` system-wide (all 8)
-# The ASAN/UBSan instances vet the base fleet's corpus under a sanitizer without
-# polluting it (--no-export), so a sanitizer find is a real bug, not coverage noise.
+# ASAN/UBSan read the base corpus but --no-export, so they never pollute it.
 
 CRUN_BASE=/nix/store/nm1sr5r2gzckh90y68avwa6fzp8hq83i-crun-harness-1.23.1/bin/crun        # no sanitizer
 CRUN_ASAN=/nix/store/4w5j3vmpd4rl71c0vxzkl5mwq4mqjnz7-crun-harness-asan-1.23.1/bin/crun    # ASAN, no false positives
-CRUN_UBSAN=/nix/store/hfqz6i88ll99j6ymab1jcj70hz0pzm64-crun-harness-ubsan-1.23.1/bin/crun  # nix build .#artifact-eval.crun-harness-ubsan (result-crun-ubsan symlink kept as a GC root)
+CRUN_UBSAN=/nix/store/hfqz6i88ll99j6ymab1jcj70hz0pzm64-crun-harness-ubsan-1.23.1/bin/crun  # nix build .#artifact-eval.crun-harness-ubsan
 
 FUZZ_BIN=/home/arjun/mpi-sp/mutator/target/release/fuzz_combined_afl
-GRAMMAR=/home/arjun/mpi-sp/SemanticSanitizer/case-studies/oci/grammar.py # Tier-1 fields + rebalance + golden + bind sources
+GRAMMAR=/home/arjun/mpi-sp/SemanticSanitizer/case-studies/oci/grammar.py
 
 SEMSAN_CLI=/home/arjun/mpi-sp/SemanticSanitizer/semsan-cli
 SEMSAN_CONFIG=/home/arjun/mpi-sp/semsan_crun.yaml
 SEMSAN_LOG=/tmp/semsan.log
 
-# UBSan must ABORT on a violation, else it prints+continues and the forkserver
-# never sees a crash. Tunable here without a rebuild (add suppressions=<file> if
-# crun's common path turns out to emit benign UB that floods the instance).
+# UBSan must abort on a violation, else it prints and continues and the
+# forkserver never sees the crash. Add suppressions=<file> if benign UB floods.
 UBSAN_OPTS="halt_on_error=1:abort_on_error=1:print_stacktrace=1"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -87,10 +85,8 @@ cleanup() {
     sleep 3
     wait 2>/dev/null || true
 
-    # SIGKILL any crun strays. Hung container children CATCH SIGTERM (crun installs
-    # signal handlers), so kill -TERM / plain pkill leave them sleeping forever —
-    # that's what leaks thousands of orphaned crun across runs. Only SIGKILL reaps
-    # them. Safe on a dedicated fuzzing host where every crun is ours.
+    # SIGKILL stray crun: hung children catch SIGTERM, so TERM/plain pkill leak
+    # them across runs. -9 reaps them; fine here since every crun is ours.
     echo "  Reaping crun strays (SIGKILL)..."
     sudo pkill -9 -x crun 2>/dev/null || true
 
@@ -123,15 +119,13 @@ cleanup() {
 
 trap cleanup INT TERM
 
-# Prime sudo once up front so the backgrounded sudo's (instances + SemSan) don't
-# each try to prompt on a tty they can't read.
+# prime sudo so the backgrounded sudo's don't each hit a password prompt
 sudo -v || { echo "sudo required"; exit 1; }
 
 for dir in "${CAMPAIGN_DIRS[@]}"; do mkdir -p "$dir"; done
 mkdir -p "$SYNC_DIR"
 
-# Tier-3: a real host directory bind/idmapped mounts can resolve to, so the bind
-# path (libcrun_container_do_bind_mount) actually runs instead of ENOENT-ing.
+# real host dir for bind/idmapped mounts to resolve against
 mkdir -p "$BIND_SRC/dir"
 printf 'fuzz bind source file\n' > "$BIND_SRC/file.txt"
 printf 'nested\n' > "$BIND_SRC/dir/nested.txt"

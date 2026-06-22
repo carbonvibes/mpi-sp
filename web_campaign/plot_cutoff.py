@@ -57,13 +57,12 @@ def load_plot_data(path, cutoff_h):
     t = np.array(times)
     corpus = np.array(corpus); execs = np.array(execs); edges = np.array(edges)
 
-    # keep only the last contiguous run (drop pre-restart segments)
+    # keep only the last run, drop pre-restart segments
     resets = np.where(np.diff(t) < 0)[0]
     if len(resets):
         s = resets[-1] + 1
         t, corpus, execs, edges = t[s:], corpus[s:], execs[s:], edges[s:]
 
-    # cap at the cutoff
     mask = t <= cutoff_h * 3600
     t, corpus, execs, edges = t[mask], corpus[mask], execs[mask], edges[mask]
     if len(t) == 0:

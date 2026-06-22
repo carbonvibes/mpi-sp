@@ -20,9 +20,9 @@ pub struct FsOp {
     /// Must start with '/'.
     pub path: String,
     pub content: Vec<u8>,
-    /// Content length for file ops, new size for Truncate, 0 otherwise.
+    /// content len for file ops, new size for Truncate, 0 otherwise
     pub size: usize,
-    // Kept separate from content so the JSON sidecar stays human-readable.
+    // separate from content so the JSON sidecar stays human-readable
     #[serde(default)]
     pub target: String,
     pub mtime_sec: i64,
@@ -171,7 +171,7 @@ impl FsDelta {
         self.ops.len()
     }
 
-    /// For any path with multiple CreateFile/UpdateFile ops, only the last one is kept.
+    /// for any path with multiple CreateFile/UpdateFile ops, keeps only the last
     pub fn dedup_content_ops(&self) -> Self {
         let mut last_content_idx: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
@@ -225,12 +225,12 @@ impl Input for FsDelta {
     }
 }
 
-// UpdateFile rather than CreateFile so it doesn't hit EEXIST on the baseline /input.
+// UpdateFile not CreateFile, else EEXIST on baseline /input
 pub fn generate_seed() -> FsDelta {
     FsDelta::new(vec![FsOp::update_file("/input", b"seed".to_vec())])
 }
 
-/// Structurally diverse seed deltas targeting known baseline paths.
+/// seed deltas targeting known baseline paths
 pub fn generate_seed_corpus(baseline_files: &[String]) -> Vec<FsDelta> {
     let primary = baseline_files
         .first()
@@ -267,7 +267,7 @@ pub fn generate_seed_corpus(baseline_files: &[String]) -> Vec<FsDelta> {
     ]
 }
 
-/// Donor pool for SpliceDelta before the corpus has grown.
+/// donor pool for SpliceDelta before the corpus grows
 pub fn initial_corpus_pool() -> Vec<FsDelta> {
     vec![
         FsDelta::new(vec![FsOp::update_file(

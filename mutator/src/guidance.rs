@@ -32,12 +32,8 @@ impl MutationGuidance {
     }
 }
 
-// ── Live guidance (populated by FuseLogObserver, read by mutators) ─────────
-//
-// The fuzzer is single-threaded from the mutators' perspective.
-// The FUSE daemon runs in a background thread but only writes to the log
-// while the target is running — before mutators are called. The Mutex
-// protects the brief overlap at active→inactive transition.
+// Live guidance: FuseLogObserver writes it in post_exec, mutators read it. The
+// Mutex only guards the brief FUSE-thread / main-thread overlap.
 
 static LIVE_GUIDANCE: OnceLock<Mutex<MutationGuidance>> = OnceLock::new();
 

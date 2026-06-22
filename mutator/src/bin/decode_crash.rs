@@ -36,7 +36,6 @@ fn main() {
             std::process::exit(1);
         })));
 
-    // postcard binary format, LibAFL default
     let input = CombinedInput::from_file(&crash_path).unwrap_or_else(|e| {
         eprintln!("Failed to decode {crash_path}: {e}");
         std::process::exit(1);

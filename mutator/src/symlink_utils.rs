@@ -1,7 +1,6 @@
 use crate::delta::FsOp;
 use crate::ffi::{enumerate_vfs_all_paths, enumerate_vfs_dir_paths, enumerate_vfs_symlink_paths, VfsT};
 
-/// Kind of a path in the baseline VFS snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PathKind {
     File,
@@ -9,25 +8,22 @@ pub enum PathKind {
     Symlink,
 }
 
-/// Metadata for a single path in the baseline VFS.
 #[derive(Clone, Debug)]
 pub struct PathInfo {
     pub path: String,
     pub kind: PathKind,
-    /// Direct children (non-recursive). Empty for File/Symlink.
+    /// direct children, non-recursive; empty for File/Symlink
     pub children: Vec<String>,
 }
 
-/// Pre-computed index of the baseline VFS tree.
-/// Built once from the VFS snapshot; used by mutators and seed generation
-/// without requiring live VFS access during fuzzing.
+/// pre-computed index of the baseline VFS tree, so mutators don't need live VFS access
 #[derive(Clone, Debug, Default)]
 pub struct BaselineIndex {
     pub entries: Vec<PathInfo>,
 }
 
 impl BaselineIndex {
-    /// Call once from startup; `vfs` must be a valid, initialized VFS pointer.
+    /// call once at startup; `vfs` must be a valid initialized pointer
     pub fn build(vfs: *mut VfsT) -> Self {
         let all = enumerate_vfs_all_paths(vfs);
         let dirs = enumerate_vfs_dir_paths(vfs);
@@ -56,7 +52,7 @@ impl BaselineIndex {
             })
             .collect();
 
-        // A path is a direct child if parent == dirname(path).
+        // direct child if parent == dirname(path)
         for i in 0..entries.len() {
             let path = entries[i].path.clone();
             let parent = parent_path(&path);
@@ -106,18 +102,12 @@ fn parent_path(path: &str) -> Option<String> {
     }
 }
 
-/// Expand `replace_with_symlink(path, target)` into the correct sequence of
-/// `FsOp`s based on what the baseline index says the path currently is.
-///
-/// - File or symlink: `delete_file(path)` + `create_symlink(path, target)`
-/// - Empty directory: `rmdir(path)` + `create_symlink(path, target)`
-/// - Non-empty directory: delete all children in postorder, `rmdir(path)`,
-///   then `create_symlink(path, target)`
-/// - Unknown path (not in baseline): just `create_symlink(path, target)`
+/// expands into the FsOps needed to turn `path` into a symlink, deleting whatever
+/// the baseline index says is there first (children deleted postorder for dirs)
 pub fn replace_with_symlink(path: &str, target: &str, index: &BaselineIndex) -> Vec<FsOp> {
     match index.get(path) {
         None => {
-            // Not in baseline — just create the symlink (may EEXIST but that's ok).
+            // not in baseline; just create (may EEXIST, fine)
             vec![FsOp::create_symlink(path, target)]
         }
         Some(info) => match info.kind {
@@ -137,8 +127,7 @@ pub fn replace_with_symlink(path: &str, target: &str, index: &BaselineIndex) -> 
     }
 }
 
-/// Recursively collect ops to delete all contents of a directory, then rmdir it.
-/// Children are removed depth-first (deepest first) so parents can be rmdir'd.
+/// deletes dir contents depth-first (deepest first) then rmdirs it
 fn delete_tree_ops(dir: &str, index: &BaselineIndex, ops: &mut Vec<FsOp>) {
     let children = index.children_of(dir);
     for child in &children {
@@ -169,13 +158,12 @@ mod tests {
     unsafe fn make_test_vfs() -> *mut VfsT {
         let vfs = vfs_create();
         assert!(!vfs.is_null());
-        // /etc/ (dir with children)
+        // dir with children
         vfs_mkdir(vfs, c"/etc".as_ptr());
         vfs_create_file(vfs, c"/etc/passwd".as_ptr(), b"root:x:0\n".as_ptr(), 9);
         vfs_create_file(vfs, c"/etc/group".as_ptr(), b"root:x:0:\n".as_ptr(), 10);
-        // /proc/ (empty dir — like rootfs baseline)
+        // empty dir
         vfs_mkdir(vfs, c"/proc".as_ptr());
-        // /input (regular file)
         vfs_create_file(vfs, c"/input".as_ptr(), b"seed".as_ptr(), 4);
         vfs_save_snapshot(vfs);
         vfs
@@ -252,21 +240,17 @@ mod tests {
         let idx = BaselineIndex::build(vfs);
 
         let ops = replace_with_symlink("/etc", "../../etc", &idx);
-        // ops: delete /etc/passwd, delete /etc/group, rmdir /etc, create_symlink /etc
         assert!(ops.len() >= 3, "non-empty dir needs child deletions + rmdir + symlink");
 
-        // Last op must be the symlink
         let last = ops.last().unwrap();
         assert_eq!(last.kind, FsOpKind::CreateSymlink);
         assert_eq!(last.path, "/etc");
         assert_eq!(last.target, "../../etc");
 
-        // Second-to-last must be rmdir
         let rmdir = &ops[ops.len() - 2];
         assert_eq!(rmdir.kind, FsOpKind::Rmdir);
         assert_eq!(rmdir.path, "/etc");
 
-        // All earlier ops must be DeleteFile for /etc children
         for op in &ops[..ops.len() - 2] {
             assert_eq!(op.kind, FsOpKind::DeleteFile);
             assert!(op.path.starts_with("/etc/"));

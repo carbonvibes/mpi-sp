@@ -60,7 +60,7 @@ struct FsDeltaConverter {
     vfs: *mut VfsT,
 }
 
-// VfsT is an opaque C pointer; we access it only from the fuzzing thread.
+// opaque C pointer, only touched from the fuzzing thread
 unsafe impl Send for FsDeltaConverter {}
 unsafe impl Sync for FsDeltaConverter {}
 
@@ -68,8 +68,7 @@ impl ToTargetBytes<FsDelta> for FsDeltaConverter {
     fn to_target_bytes<'a>(&mut self, input: &'a FsDelta) -> OwnedSlice<'a, u8> {
         unsafe { vfs_reset_to_snapshot(self.vfs) };
         let _ = apply_delta(self.vfs, input);
-        // crun reads config from argv[1], not stdin; return a placeholder byte
-        // so LibAFL's forkserver doesn't panic on a 0-length write.
+        // crun reads config from argv[1]; placeholder byte avoids a 0-length forkserver write
         OwnedSlice::from(vec![0u8])
     }
 }
@@ -132,7 +131,7 @@ unsafe fn init_vfs(vfs: *mut VfsT, bin_true: &[u8]) {
         c"/etc/passwd",
         b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/:/usr/sbin/nologin\n"
     );
-    // Needed for initgroups("root", 0) when process.user.username is set.
+    // needed for initgroups when process.user.username is set
     mkfile!(
         c"/etc/group",
         b"root:x:0:\ndaemon:x:1:\nbin:x:2:\nnobody:x:65534:\n"
@@ -567,8 +566,7 @@ fn main() {
         }
     }
 
-    // Prime live_corpus with seeds that made it into corpus.
-    // OnDiskCorpus drops input from memory on add(), so load from disk.
+    // OnDiskCorpus drops input from memory on add(), so reload from disk into live_corpus
     for idx in 0..state.corpus().count() {
         let cid = CorpusId::from(idx);
         if let Ok(input) = state.corpus().cloned_input_for_id(cid) {
@@ -592,7 +590,7 @@ fn main() {
         mgr.maybe_report_progress(&mut state, Duration::from_secs(2))
             .expect("progress report failed");
 
-        // Sync any newly-found corpus entries into live_corpus for SpliceDelta.
+        // sync new corpus entries into live_corpus for SpliceDelta
         let after = state.corpus().count();
         for idx in before..after {
             let cid = CorpusId::from(idx);

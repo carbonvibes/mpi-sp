@@ -126,7 +126,7 @@ pub struct FuseIterLog {
     pub n:       c_int,
 }
 
-// failed > 0 is normal fuzzer behaviour, not an error.
+// failed > 0 is normal fuzzer behaviour, not an error
 #[derive(Debug, Clone, Copy)]
 pub struct DeltaResult {
     pub succeeded: usize,
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn e2e_symlink_loop_does_not_hang() {
         let vfs = unsafe { make_baseline_vfs() };
-        // Self-loop: must not hang
+        // self-loop must not hang
         let delta = FsDelta::new(vec![FsOp::create_symlink("/loop", "/loop")]);
         let dr = apply_delta(vfs, &delta).expect("apply_delta returned Err");
         assert_eq!(

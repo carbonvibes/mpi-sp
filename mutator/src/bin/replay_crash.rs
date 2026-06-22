@@ -1,18 +1,13 @@
-//! replay_crash — replay a CombinedInput crash file against the crun harness
-//! using the exact same FUSE VFS pipeline the fuzzer uses.
-//!
-//! Two input modes:
+//! replay_crash — replay a crash file against the crun harness via the same
+//! FUSE VFS pipeline the fuzzer uses.
 //!
 //! Binary mode (saved LibAFL crash corpus entry):
 //!     sudo unshare -m ./replay_crash <crash_file> [grammar.py] [harness]
 //!
-//! JSON mode (last_input.json + sibling config.json from a campaign dir):
+//! JSON mode (file ends in .json): config.json is taken from the same dir as
+//! ops.json unless a second .json arg is given. No grammar.py needed.
 //!     sudo unshare -m ./replay_crash <ops.json> [config.json] [harness]
 //!     sudo unshare -m ./replay_crash /tmp/c3_0/last_input.json
-//!
-//! In JSON mode the file must end with .json.  config.json is taken from the
-//! same directory as ops.json unless a second .json argument is supplied.
-//! No grammar.py is needed — the OCI config is already rendered in config.json.
 
 use std::ffi::CString;
 use std::os::unix::process::ExitStatusExt;
@@ -38,9 +33,7 @@ const DEFAULT_GRAMMAR: &str =
 const DEFAULT_HARNESS: &str =
     "/nix/store/nm1sr5r2gzckh90y68avwa6fzp8hq83i-crun-harness-1.23.1/bin/crun";
 
-// ── CombinedInput ─────────────────────────────────────────────────────────────
-// Identical layout to the one in fuzz_combined_afl.rs and decode_crash.rs.
-
+// layout must match fuzz_combined_afl.rs and decode_crash.rs
 #[derive(Clone, Debug, Serialize, Deserialize, Hash)]
 struct CombinedInput {
     config: NautilusInput,
@@ -53,9 +46,7 @@ impl Input for CombinedInput {
     }
 }
 
-// ── VFS baseline ──────────────────────────────────────────────────────────────
-// Exact copy of init_vfs() from fuzz_combined_afl.rs so the baseline is identical.
-
+// must stay identical to init_vfs() in fuzz_combined_afl.rs
 unsafe fn init_vfs(vfs: *mut VfsT) {
     for dir in &[
         c"/bin", c"/proc", c"/dev", c"/sys", c"/tmp", c"/etc", c"/var", c"/run",
@@ -83,9 +74,6 @@ unsafe fn init_vfs(vfs: *mut VfsT) {
     mkfile!(c"/etc/resolv.conf", b"nameserver 8.8.8.8\n");
 }
 
-// ── FUSE startup ──────────────────────────────────────────────────────────────
-// Exact copy of start_fuse() from fuzz_combined_afl.rs.
-
 #[cfg(has_fuse3)]
 fn start_fuse(vfs: *mut VfsT, mountpoint: &str) {
     unsafe { fuse_vfs_lib_init(vfs) };
@@ -111,16 +99,12 @@ fn start_fuse(_vfs: *mut VfsT, _mountpoint: &str) {
     std::process::exit(1);
 }
 
-// ── config.json helper ────────────────────────────────────────────────────────
-// Exact copy of override_rootfs_path() from fuzz_combined_afl.rs.
-
 fn override_rootfs_path(json: &[u8], fuse_rootfs: &str) -> Option<Vec<u8>> {
     let mut v: serde_json::Value = serde_json::from_slice(json).ok()?;
     let obj = v.as_object_mut()?;
 
-    // Without a mount namespace crun performs mounts in the caller's own namespace.
-    // A symlink escape + grammar-generated mount can then shadow the FUSE mountpoint.
-    // Identical to fuzz_combined_afl.rs.
+    // inject a mount namespace, else crun mounts in the caller's namespace and a
+    // symlink escape + generated mount can shadow the FUSE mountpoint.
     {
         let linux = obj
             .entry("linux")
@@ -152,8 +136,6 @@ fn override_rootfs_path(json: &[u8], fuse_rootfs: &str) -> Option<Vec<u8>> {
     serde_json::to_vec(&v).ok()
 }
 
-// ── cleanup ───────────────────────────────────────────────────────────────────
-
 #[cfg(has_fuse3)]
 fn stop_fuse(mountpoint: &str) {
     unsafe { fuse_vfs_lib_stop() };
@@ -167,8 +149,6 @@ fn stop_fuse(mountpoint: &str) {
 #[cfg(not(has_fuse3))]
 fn stop_fuse(_mountpoint: &str) {}
 
-// ── main ──────────────────────────────────────────────────────────────────────
-
 fn main() {
     let mut args_iter = std::env::args().skip(1);
     let input_path = args_iter.next().unwrap_or_else(|| {
@@ -178,15 +158,13 @@ fn main() {
 
     let json_mode = input_path.ends_with(".json");
 
-    // ── Parse args depending on mode ─────────────────────────────────────────
     let (delta, cfg_raw, harness, label) = if json_mode {
-        // JSON mode: read FsDelta from ops.json, OCI config from sibling config.json
-        // (or an explicit second .json arg).
+        // FsDelta from ops.json, OCI config from sibling config.json (or 2nd .json arg)
         let second = args_iter.next();
         let (cfg_path, harness) = match second {
             Some(s) if s.ends_with(".json") => (s, args_iter.next().unwrap_or_else(|| DEFAULT_HARNESS.to_string())),
             Some(s)                          => {
-                // second arg is the harness binary, not a config file
+                // second arg is the harness binary, not a config
                 let dir = std::path::Path::new(&input_path)
                     .parent()
                     .unwrap_or(std::path::Path::new("."))
@@ -224,7 +202,7 @@ fn main() {
             .into_owned();
         (delta, cfg_raw, harness, label)
     } else {
-        // Binary mode: read CombinedInput postcard file, render config via grammar.
+        // binary mode: decode CombinedInput, render config via grammar
         let grammar_path = args_iter.next().unwrap_or_else(|| DEFAULT_GRAMMAR.to_string());
         let harness = args_iter.next().unwrap_or_else(|| DEFAULT_HARNESS.to_string());
 
@@ -251,12 +229,10 @@ fn main() {
         (input.rootfs, raw.to_vec(), harness, label)
     };
 
-    // ── Init VFS ──────────────────────────────────────────────────────────────
     let vfs = unsafe { vfs_create() };
     assert!(!vfs.is_null(), "vfs_create() returned null");
     unsafe { init_vfs(vfs) };
 
-    // ── Apply FsDelta ─────────────────────────────────────────────────────────
     let dr = apply_delta(vfs, &delta);
     let (ok, fail) = match &dr {
         Ok(r) => (r.succeeded, r.failed),
@@ -264,13 +240,11 @@ fn main() {
     };
     eprintln!("[replay] {} ops: {} succeeded, {} failed", delta.ops.len(), ok, fail);
 
-    // ── Mount FUSE ────────────────────────────────────────────────────────────
     let mountpoint = format!("/tmp/replay_fuse_{}", std::process::id());
     std::fs::create_dir_all(&mountpoint).expect("failed to create FUSE mountpoint dir");
     start_fuse(vfs, &mountpoint);
     eprintln!("[replay] FUSE mounted at {mountpoint}");
 
-    // ── Write config with updated root.path ───────────────────────────────────
     let cfg_bytes = override_rootfs_path(&cfg_raw, &mountpoint)
         .unwrap_or_else(|| cfg_raw.clone());
     let config_path = format!("/tmp/replay_config_{}.json", std::process::id());
@@ -278,13 +252,11 @@ fn main() {
     eprintln!("[replay] config.json → {config_path}");
     eprintln!("[replay] config contents:\n{}", String::from_utf8_lossy(&cfg_bytes));
 
-    // ── Run harness ───────────────────────────────────────────────────────────
     let output = Command::new(&harness)
         .arg(&config_path)
         .output()
         .expect("failed to spawn harness");
 
-    // ── Report ────────────────────────────────────────────────────────────────
     if !output.stderr.is_empty() {
         eprintln!("[replay] crun stderr:\n{}", String::from_utf8_lossy(&output.stderr));
     }
@@ -295,7 +267,6 @@ fn main() {
         println!("[{label}] ✗ No crash — exit code {}", output.status.code().unwrap_or(-1));
     }
 
-    // ── Cleanup ───────────────────────────────────────────────────────────────
     std::fs::remove_file(&config_path).ok();
     stop_fuse(&mountpoint);
     std::fs::remove_dir(&mountpoint).ok();

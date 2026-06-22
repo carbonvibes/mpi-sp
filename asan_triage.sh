@@ -1,19 +1,13 @@
 #!/usr/bin/env bash
-# Replay every recorded crash under the No-False-Positive ASAN crun build to
-# decide which recorded "crashes" are real memory bugs vs spurious/environmental.
-#
-# Run as root (FUSE mount + unshare -m + crun all need it):
-#     sudo bash /home/arjun/mpi-sp/asan_triage.sh
-#
-# Per-crash artifacts land in /tmp/asan_triage/reports/. A summary is printed at
-# the end and also written to /tmp/asan_triage/summary.tsv.
+# Replay each saved crash under the ASAN crun to tell real bugs from spurious.
+# Run as root:  sudo bash asan_triage.sh
+# Artifacts in /tmp/asan_triage/ (per-crash reports + summary.tsv).
 
 set -u
 
 ASAN=/nix/store/4w5j3vmpd4rl71c0vxzkl5mwq4mqjnz7-crun-harness-asan-1.23.1/bin/crun
 REPLAY=/home/arjun/mpi-sp/mutator/target/release/replay_crash
-# Must match the grammar the campaign used (the edited in-repo one), or the saved
-# Nautilus tree re-renders against the wrong rule table → unfaithful replay.
+# must match the campaign's grammar, or the saved tree re-renders wrong
 GRAMMAR=/home/arjun/mpi-sp/SemanticSanitizer/case-studies/oci/grammar.py
 CAMPAIGNS=(/tmp/c3_0 /tmp/c3_1 /tmp/c3_2 /tmp/c3_3 /tmp/c3_4 /tmp/c3_5)
 

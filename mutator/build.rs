@@ -4,7 +4,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_libarchive)");
     println!("cargo::rustc-check-cfg=cfg(has_fuse3)");
 
-    // ── Control plane (VFS + delta + control_plane → libcontrol_plane.a) ────
+    // control plane → libcontrol_plane.a
     let status = Command::new("make")
         .arg("libcontrol_plane.a")
         .current_dir("../control_plane")
@@ -30,10 +30,8 @@ fn main() {
         println!("cargo:rerun-if-changed={path}");
     }
 
-    // ── foobar demo target ────────────────────────────────────────────────────
-    // Must use clang: GCC does not support -fsanitize-coverage=trace-pc-guard.
-    // SanCov callbacks (__sanitizer_cov_trace_pc_guard*) are provided by
-    // libafl_targets at link time — no separate ASan runtime needed.
+    // foobar demo target. clang only: GCC lacks -fsanitize-coverage=trace-pc-guard.
+    // SanCov callbacks come from libafl_targets at link time.
     cc::Build::new()
         .compiler("clang")
         .file("../demo/foobar_target.c")
@@ -43,10 +41,8 @@ fn main() {
 
     println!("cargo:rerun-if-changed=../demo/foobar_target.c");
 
-    // ── libarchive harness (optional) ─────────────────────────────────────────
-    // Probe for libarchive-dev; skip gracefully if absent.
-    // The fuzz_libafl binary guards the libarchive campaign behind a runtime
-    // check, so the binary still builds without libarchive installed.
+    // libarchive harness (optional). fuzz_libafl runtime-guards the campaign,
+    // so it still builds without libarchive.
     let has_archive = Command::new("pkg-config")
         .args(["--exists", "libarchive"])
         .status()
@@ -54,8 +50,8 @@ fn main() {
         .unwrap_or(false);
 
     if has_archive {
-        // Prefer the SanCov-instrumented static build over the system .so.
-        // Build it once with: bash scripts/build_libarchive_sancov.sh
+        // Prefer SanCov static build over system .so.
+        // Build once with: bash scripts/build_libarchive_sancov.sh
         let sancov_dir = std::path::PathBuf::from("../vendor/libarchive-sancov");
         let sancov_lib = sancov_dir.join("lib/libarchive.a");
 
@@ -67,8 +63,7 @@ fn main() {
             .opt_level(1);
 
         if sancov_lib.exists() {
-            // Static SanCov build: edges inside libarchive's parsers are visible
-            // to HitcountsMapObserver.  Link the static archive plus its deps.
+            // edges inside libarchive's parsers are visible. link archive + deps.
             build.include(sancov_dir.join("include"));
             build.compile("libarchive_harness");
 
@@ -77,7 +72,7 @@ fn main() {
                 sancov_dir.join("lib").display()
             );
             println!("cargo:rustc-link-lib=static=archive");
-            // Transitive deps that libarchive.a requires at link time
+            // transitive deps for libarchive.a
             println!("cargo:rustc-link-lib=z");
             println!("cargo:rustc-link-lib=bz2");
             println!("cargo:rustc-link-lib=lzma");
@@ -86,9 +81,8 @@ fn main() {
             println!("cargo:rustc-link-lib=acl");
             println!("cargo:warning=libarchive: using SanCov-instrumented static build");
         } else {
-            // System .so fallback: only the 3 edges in the harness wrapper are
-            // visible — corpus will stall.  Run scripts/build_libarchive_sancov.sh
-            // once to get real coverage inside libarchive's format parsers.
+            // system .so fallback: only harness-wrapper edges visible, corpus stalls.
+            // run scripts/build_libarchive_sancov.sh for real parser coverage.
             build.compile("libarchive_harness");
             println!("cargo:rustc-link-lib=archive");
             println!("cargo:warning=libarchive: using system .so (no SanCov — run scripts/build_libarchive_sancov.sh for real coverage)");
@@ -102,10 +96,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=../demo/libarchive_harness.c");
 
-    // ── fuse_vfs library (FUSE mount for the harness loop) ───────────────────
-    // Compiled with -DFUSE_VFS_LIBRARY so the standalone main() is excluded.
-    // Provides: fuse_vfs_lib_init, fuse_vfs_lib_run, fuse_vfs_lib_is_mounted,
-    //           fuse_vfs_lib_stop.
+    // fuse_vfs library. -DFUSE_VFS_LIBRARY excludes the standalone main().
     let has_fuse3 = Command::new("pkg-config")
         .args(["--exists", "fuse3"])
         .status()
@@ -131,22 +122,15 @@ fn main() {
             .file("../fuse_vfs/fuse_vfs.c")
             .define("FUSE_VFS_LIBRARY", None)
             .define("FUSE_USE_VERSION", "31")
-            // fuse_vfs.c is harness infrastructure, NOT a fuzzing target.
-            // Its callbacks (fvfs_getattr, fvfs_open, fvfs_read, fvfs_readdir)
-            // execute the same code path on every single iteration — their SanCov
-            // slots saturate after iteration 1 and never produce new signal.
-            // Instrumenting harness code wastes map slots and dilutes the feedback
-            // signal from the actual targets (foobar_target.c, libarchive, runc).
+            // harness code, not a target: no SanCov or it dilutes the targets' signal.
             .opt_level(1);
 
-        // Pass -I/usr/include/fuse3 and any other cflags from pkg-config.
         for flag in fuse_cflags.split_whitespace() {
             build.flag(flag);
         }
 
         build.compile("fuse_vfs_lib");
 
-        // Link fuse3 (and pthread, which it needs).
         for token in fuse_libs.split_whitespace() {
             if let Some(lib) = token.strip_prefix("-l") {
                 println!("cargo:rustc-link-lib={lib}");
@@ -162,23 +146,15 @@ fn main() {
         println!("cargo:warning=Install with: apt install libfuse3-dev");
     }
 
-    // ── libcrun (SanCov-instrumented, in-process crun fuzzing) ───────────────
-    // Build crun from source once with:
+    // libcrun (SanCov, in-process crun fuzzing). Build crun once with:
     //   cd vendor/crun && ./autogen.sh
     //   CC=clang CFLAGS="-fsanitize-coverage=trace-pc-guard,trace-cmp -O1 -g" \
     //     ./configure --disable-shared --enable-static && make -j$(nproc)
     //
-    // LINKING DESIGN: libcrun.a is compiled with -fsanitize-coverage, so it
-    // calls __sanitizer_cov_trace_pc_guard* at runtime.  Those symbols are
-    // provided by libafl_targets — but only fuzzing binaries (fuzz_crun, …)
-    // link it.  If we emitted cargo:rustc-link-lib=static=crun here it would
-    // be package-wide, pulling libcrun.a into vfs_bench/fuzz which have no
-    // libafl_targets → link error.
-    //
-    // Solution: we only compile crun_harness.c and set link-search paths here.
-    // The actual cargo:rustc-link-lib directives for libcrun.a, libocispec.a,
-    // and libyajl.a live in fuzz_crun.rs as #[link] attributes — those are
-    // per-binary and do not affect other binaries.
+    // Only compile crun_harness.c and set link-search paths here. The actual
+    // link-lib directives are #[link] attrs in fuzz_crun.rs so they stay
+    // per-binary — package-wide would pull libcrun.a (needs SanCov symbols from
+    // libafl_targets) into vfs_bench/fuzz and break their link.
     println!("cargo::rustc-check-cfg=cfg(has_libcrun)");
     println!("cargo::rustc-check-cfg=cfg(has_bundled_yajl)");
 
@@ -186,9 +162,7 @@ fn main() {
     let libcrun_a = crun_dir.join(".libs/libcrun.a");
 
     if libcrun_a.exists() {
-        // crun_harness.c is harness infrastructure (thin FFI wrapper), NOT the
-        // fuzzing target.  Compile WITHOUT SanCov — its code paths are constant
-        // per iteration and would only dilute EDGES_MAP signal from libcrun.a.
+        // crun_harness.c is a thin FFI wrapper, not the target: no SanCov.
         cc::Build::new()
             .compiler("clang")
             .file("../demo/crun_harness.c")
@@ -198,7 +172,7 @@ fn main() {
             .include(crun_dir.join("libocispec/src"))
             .compile("crun_harness");
 
-        // Search paths for fuzz_crun.rs's #[link] attributes.
+        // search paths for fuzz_crun.rs's #[link] attrs
         println!(
             "cargo:rustc-link-search=native={}/.libs",
             crun_dir.display()

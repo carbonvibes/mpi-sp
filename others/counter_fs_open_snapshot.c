@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <fcntl.h>
 
-// This version increments once per open and keeps a stable snapshot per handle.
+// Increments once per open; snapshot held per handle.
 static uint64_t read_counter = 0;
 
 struct counter_file_handle {
@@ -36,7 +36,6 @@ static int counter_getattr(const char *path, struct stat *st,
     return -ENOENT;
 }
 
-// Called when someone opens a file
 static int counter_open(const char *path, struct fuse_file_info *fi) {
     if (strcmp(path, "/counter") != 0)
         return -ENOENT;
@@ -54,7 +53,6 @@ static int counter_open(const char *path, struct fuse_file_info *fi) {
     return 0;
 }
 
-// Called when someone reads a file
 static int counter_read(const char *path, char *buf, size_t size,
                          off_t offset, struct fuse_file_info *fi) {
     if (strcmp(path, "/counter") != 0)
@@ -73,7 +71,6 @@ static int counter_read(const char *path, char *buf, size_t size,
     return to_copy;
 }
 
-// Called when someone closes a file
 static int counter_release(const char *path, struct fuse_file_info *fi) {
     (void)path;
     free((void *)fi->fh);
@@ -81,7 +78,6 @@ static int counter_release(const char *path, struct fuse_file_info *fi) {
     return 0;
 }
 
-// Called when someone lists a directory
 static int counter_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                             off_t offset, struct fuse_file_info *fi,
                             enum fuse_readdir_flags flags) {

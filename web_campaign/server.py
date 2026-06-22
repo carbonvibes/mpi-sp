@@ -25,9 +25,7 @@ CAMPAIGNS = [
 SEMSAN_LOG = Path("/tmp/semsan.log")
 
 def read_semsan(max_recent=8):
-    """SemSan prints findings to stdout (redirected to /tmp/semsan.log by the
-    launcher). Each finding line is prefixed '[comm:tgid] ...'; status lines
-    ('Attaching ...', 'All sanitizers are running') are not."""
+    """Findings are /tmp/semsan.log lines prefixed '[comm:tgid]'; status lines aren't."""
     if not SEMSAN_LOG.exists():
         return {"present": False, "running": False, "findings": 0, "recent": []}
     try:
@@ -138,8 +136,7 @@ def get_campaign_data(c):
         "corpus":  int(stats.get("corpus_count",  0) or 0),
         "crashes": count_crashes(c["dir"]),
         "run_time": run_time,
-        # per-binary instrumented-edge total (denominator for the % — differs for
-        # ASAN/UBSan vs base). fuzzer_stats first, else the latest plot_data row.
+        # per-binary edge total (the % denominator); fuzzer_stats, else last plot row
         "edges_total": int(stats.get("total_edges", 0) or 0)
                        or (series[-1]["edges_total"] if series else 0),
     }

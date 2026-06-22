@@ -61,7 +61,7 @@ static int has_entry(const readdir_result_t *r, const char *name)
     return 0;
 }
 
-/* Read the full content of a VFS file into a freshly malloc'd buffer. */
+/* read full file content into a malloc'd buffer */
 static char *read_all(vfs_t *vfs, const char *path)
 {
     vfs_stat_t st;
@@ -85,45 +85,44 @@ static void test_path_parsing(void)
     vfs_t *vfs = vfs_create();
     CHECK_NOTNULL(vfs);
 
-    /* Create nodes used by trailing-slash and ENAMETOOLONG tests below. */
+    /* nodes for trailing-slash and ENAMETOOLONG cases below */
     CHECK_EQ(vfs_create_file(vfs, "/tfile", S("x"), 1), 0);
     CHECK_EQ(vfs_mkdir(vfs, "/tdir"), 0);
 
-    /* Root always resolves. */
     vfs_stat_t st;
     CHECK_EQ(vfs_getattr(vfs, "/", &st), 0);
     CHECK_EQ(st.kind, VFS_DIR);
 
-    /* Missing leading slash → EINVAL. */
+    /* missing leading slash */
     CHECK_EQ(vfs_getattr(vfs, "", &st), -EINVAL);
     CHECK_EQ(vfs_getattr(vfs, "foo", &st), -EINVAL);
     CHECK_EQ(vfs_getattr(vfs, "foo/bar", &st), -EINVAL);
 
-    /* "." and ".." components → EINVAL. */
+    /* "." and ".." components */
     CHECK_EQ(vfs_getattr(vfs, "/.", &st), -EINVAL);
     CHECK_EQ(vfs_getattr(vfs, "/..", &st), -EINVAL);
     CHECK_EQ(vfs_getattr(vfs, "/../bar", &st), -EINVAL);
     CHECK_EQ(vfs_getattr(vfs, "/./bar", &st), -EINVAL);
 
-    /* Double slash → EINVAL. */
+    /* double slash */
     CHECK_EQ(vfs_getattr(vfs, "//foo", &st), -EINVAL);
 
-    /* Trailing slash → EINVAL (requires an existing node to reach the slash). */
+    /* trailing slash (needs an existing node to reach the slash) */
     CHECK_EQ(vfs_getattr(vfs, "/tfile/", &st), -EINVAL);
     CHECK_EQ(vfs_getattr(vfs, "/tdir/", &st), -EINVAL);
 
-    /* Name longer than VFS_MAX_NAME (255) → ENAMETOOLONG. */
+    /* name > VFS_MAX_NAME (255) */
     char long_path[260];
     long_path[0] = '/';
     memset(long_path + 1, 'x', 256);
     long_path[257] = '\0';
     CHECK_EQ(vfs_getattr(vfs, long_path, &st), -ENAMETOOLONG);
 
-    /* Non-existent path → ENOENT. */
+    /* non-existent path */
     CHECK_EQ(vfs_getattr(vfs, "/nonexistent", &st), -ENOENT);
     CHECK_EQ(vfs_getattr(vfs, "/a/b/c", &st), -ENOENT);
 
-    /* NULL path → EINVAL. */
+    /* NULL path */
     CHECK_EQ(vfs_getattr(vfs, NULL, &st), -EINVAL);
 
     vfs_destroy(vfs);
@@ -645,18 +644,9 @@ static void test_invariants(void)
     vfs_destroy(vfs);
 }
 
-/* -------------------------------------------------------------------------
- * Randomized mutation-sequence test
- *
- * Applies a pseudo-random sequence of create/update/delete/mkdir/rmdir
- * operations, saves a snapshot at a random point, continues mutating,
- * then resets and verifies the state matches what was snapshotted.
- * ---------------------------------------------------------------------- */
+/* Randomized mutation test: random ops, snapshot, more ops, reset, verify. */
 
-/*
- * Compute a simple 32-bit hash of a string (FNV-1a variant).
- * Used only as a deterministic content fingerprint in the test.
- */
+/* FNV-1a, deterministic content fingerprint */
 static uint32_t fnv1a(const char *s)
 {
     uint32_t h = 2166136261u;
@@ -683,11 +673,7 @@ static void test_random_sequence(void)
 
     uint32_t seed = 0xdeadbeef;
 
-    /*
-     * step 1: apply 200 random operations
-     * We keep a parallel boolean array tracking which paths are files,
-     * which are dirs, and which are absent.
-     */
+    /* step 1: 200 random ops; state[] tracks file/dir/absent per path */
     enum { ABSENT, IS_FILE, IS_DIR } state[N_PATHS] = {0};
 
     for (int op = 0; op < 200; op++) {
@@ -749,8 +735,7 @@ static void test_random_sequence(void)
 
         case 4: /* rmdir (only if empty dir) */
             if (state[idx] == IS_DIR) {
-                /* These rand_paths are all at the root level with no children,
-                 * so rmdir should always succeed for an IS_DIR entry here. */
+                /* rand_paths are root-level with no children, so rmdir succeeds */
                 CHECK_EQ(vfs_rmdir(vfs, rand_paths[idx]), 0);
                 state[idx] = ABSENT;
             } else if (state[idx] == IS_FILE) {
@@ -762,7 +747,7 @@ static void test_random_sequence(void)
         }
     }
 
-    /* step 2: save snapshot, record what currently exists. */
+    /* step 2: snapshot and record current state */
     CHECK_EQ(vfs_save_snapshot(vfs), 0);
 
     int snapshot_state[N_PATHS];
@@ -803,7 +788,7 @@ static void test_random_sequence(void)
         }
     }
 
-    /* step 4: reset to snapshot and verify structure matches snapshot_state. */
+    /* step 4: reset and verify structure matches snapshot_state */
     CHECK_EQ(vfs_reset_to_snapshot(vfs), 0);
 
     vfs_stat_t st;

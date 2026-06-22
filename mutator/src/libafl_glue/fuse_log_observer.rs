@@ -13,15 +13,9 @@ use crate::{
     guidance::{update_live, MutationGuidance},
 };
 
-/// Observer that gates per-iteration FUSE access logging.
-///
-/// In `pre_exec`: clears the log and marks the target as running so FUSE
-/// callbacks start appending entries.
-/// In `post_exec`: stops logging, drains the log into `MutationGuidance`,
-/// and publishes it via `guidance::update_live` so mutators can read it.
-///
-/// The observer must be listed BEFORE other observers in `tuple_list!` so
-/// its `pre_exec` fires first and its `post_exec` fires last.
+/// Drains the per-iteration FUSE access log into MutationGuidance for the
+/// mutators. Must come first in the observer tuple so its pre_exec runs before
+/// the target and its post_exec after.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FuseLogObserver {
     name: Cow<'static, str>,

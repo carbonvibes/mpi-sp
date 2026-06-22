@@ -36,7 +36,7 @@ if len(sys.argv) < 2:
     print(f"Usage: {sys.argv[0]} <plot_data_file> [label] [plot_data2 label2 ...]")
     sys.exit(1)
 
-# Parse arguments: file1 label1 file2 label2 ...
+# args: file1 label1 file2 label2 ...
 campaigns = []
 i = 1
 while i < len(sys.argv):

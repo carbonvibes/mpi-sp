@@ -33,8 +33,7 @@ static void write_to_fuse(const unsigned char *data, size_t len)
                 FUSE_INPUT_PATH, strerror(errno));
         return;
     }
-    /* ftruncate instead of O_TRUNC: FUSE3 doesn't always call truncate for O_TRUNC,
-     * leaving g_size stale and making short inputs inherit bytes from longer ones. */
+    /* ftruncate, not O_TRUNC: FUSE3 may skip truncate for O_TRUNC, leaving g_size stale */
     if (ftruncate(fd, 0) < 0)
         fprintf(stderr, "write_to_fuse ftruncate: %s\n", strerror(errno));
     ssize_t w = write(fd, data, len);

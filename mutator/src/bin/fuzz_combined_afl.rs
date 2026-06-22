@@ -165,43 +165,20 @@ where
 }
 
 
-/// Re-execution gate that suppresses non-reproducible ("flaky") crashes before
-/// they ever reach the `CrashFeedback` objective.
-///
-/// Why this exists: a file lands in `crashes/` iff `WIFSIGNALED(status)` is true
-/// for the crun child (see libafl forkserver `run_target`). But the saved input
-/// (config JSON + FsDelta) is NOT a self-contained reproducer — the run also
-/// depended on the live in-process FUSE filesystem and accumulated kernel/mount
-/// residue across forks. So a signal that fired once due to a transient race is
-/// recorded as a "crash" even though replaying the bytes alone won't reproduce it.
-///
-/// This wrapper intercepts every `ExitKind::Crash`, re-runs the SAME input
-/// `reruns` more times (each re-run goes through the converter, i.e.
-/// `vfs_reset_to_snapshot` + `apply_delta`, so the intended rootfs is faithfully
-/// rebuilt), and only propagates the crash — letting `CrashFeedback` save it — if
-/// it reproduces in at least `threshold` of the `reruns + 1` total runs.
-/// Otherwise it reports `ExitKind::Ok`, so the flaky input is dropped.
-///
-/// Cost is paid only on the rare crash path (~1 in 10k execs), so steady-state
-/// throughput is unaffected.
+// Re-runs each crash and only forwards it if it reproduces. Saved inputs aren't
+// self-contained reproducers (they depend on live FUSE state + fork residue), so
+// a one-off signal death gets dropped instead of landing in crashes/.
 struct CalibratedExecutor<E> {
     inner:     E,
     reruns:    usize,
     threshold: usize,
-    /// Path to the rendered OCI config for the current input, so a SIGKILL/SIGSYS
-    /// can be checked against the config that produced it (see `is_real_crash`).
+    // current input's rendered config, re-read on a crash (see is_real_crash)
     config_path: PathBuf,
 }
 
-/// Reads the terminating signal of the most recent target run.
-///
-/// Implemented locally for `ForkserverExecutor` (orphan-rule OK: local trait,
-/// foreign type) so the calibration wrapper can tell a real fault crash apart
-/// from a config-driven kernel/seccomp kill. The forkserver records every
-/// `WIFSIGNALED` death as `ExitKind::Crash` but discards the signal number;
-/// this recovers it from the raw wait status it keeps.
+// ForkserverExecutor only hands back ExitKind, which collapses every signal
+// death into Crash — dig the actual signal out of its raw wait status.
 trait TermSignal {
-    /// `Some(signo)` if the last run was terminated by a signal, else `None`.
     fn term_signal(&self) -> Option<i32>;
 }
 
@@ -222,25 +199,18 @@ where
 
 impl<E> CalibratedExecutor<E> {
     fn new(inner: E, reruns: usize, threshold: usize, config_path: PathBuf) -> Self {
-        // threshold of 1 means "the first crash alone confirms" (no gating);
-        // clamp to >= 1 and never above the total number of runs.
         let total = reruns + 1;
         Self { inner, reruns, threshold: threshold.clamp(1, total), config_path }
     }
 }
 
-/// True if the rendered OCI config at `config_path` explicitly *asks* for a kill
-/// that would surface as `sig` — i.e. the kill is the input's doing, not a crun
-/// bug. A near-zero `RLIMIT_CPU` budget => SIGKILL; a seccomp KILL default action
-/// => SIGSYS. Crucially, a SIGKILL/SIGSYS *without* such a knob is a genuine
-/// resource-exhaustion / seccomp blowup in crun and must be kept, not filtered.
+// Did the config itself ask for the kill behind `sig`? Then it's not a crun bug.
+// A signal the config didn't request is kept — could be a real DoS.
 fn config_requested_kill(config_path: &Path, sig: i32) -> bool {
     let Ok(bytes) = std::fs::read(config_path) else { return false };
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
 
-    // True if process.rlimits has `rtype` with a near-zero (0..=2) hard OR soft
-    // budget — the value that makes the kernel signal the process. -1 is
-    // RLIM_INFINITY (unlimited) and must NOT count as near-zero.
+    // this rlimit set to a 0..=2 budget (-1 is unlimited, doesn't count)
     let rlimit_near_zero = |rtype: &str| -> bool {
         v.pointer("/process/rlimits")
             .and_then(|r| r.as_array())
@@ -256,12 +226,10 @@ fn config_requested_kill(config_path: &Path, sig: i32) -> bool {
     };
 
     match sig {
-        // RLIMIT_CPU: hard limit reached => SIGKILL, soft limit reached => SIGXCPU.
-        // (memory.limit can't OOM here — the harness clamps it to >= 128 MiB.)
+        // RLIMIT_CPU hard => SIGKILL, soft => SIGXCPU
         s if s == libc::SIGKILL || s == libc::SIGXCPU => rlimit_near_zero("RLIMIT_CPU"),
-        // RLIMIT_FSIZE: a write past a tiny file-size budget => SIGXFSZ.
         s if s == libc::SIGXFSZ => rlimit_near_zero("RLIMIT_FSIZE"),
-        // A seccomp KILL default action terminates the container => SIGSYS.
+        // seccomp KILL default action
         s if s == libc::SIGSYS => matches!(
             v.pointer("/linux/seccomp/defaultAction").and_then(|a| a.as_str()),
             Some("SCMP_ACT_KILL" | "SCMP_ACT_KILL_PROCESS" | "SCMP_ACT_KILL_THREAD")
@@ -271,20 +239,12 @@ fn config_requested_kill(config_path: &Path, sig: i32) -> bool {
 }
 
 impl<E: TermSignal> CalibratedExecutor<E> {
-    /// A `Crash` is a *real* (possibly bug-indicating) crash unless it is a
-    /// SIGKILL/SIGSYS that the config itself requested (near-zero RLIMIT_CPU, or
-    /// seccomp KILL). A signal-kill the config did NOT ask for is kept — it may
-    /// be a genuine resource-exhaustion / DoS bug in crun (e.g. unbounded
-    /// allocation from a pathological config), which a blanket signal filter
-    /// would silently hide.
     fn is_real_crash(&self, ek: ExitKind) -> bool {
         if ek != ExitKind::Crash {
             return false;
         }
+        // a resource/seccomp signal counts as real only if the config didn't ask for it
         match self.inner.term_signal() {
-            // Resource/seccomp signals the config can request: SIGKILL/SIGXCPU
-            // (RLIMIT_CPU), SIGXFSZ (RLIMIT_FSIZE), SIGSYS (seccomp KILL). Kept
-            // only if the config did NOT ask for them.
             Some(s)
                 if s == libc::SIGKILL
                     || s == libc::SIGXCPU
@@ -314,21 +274,14 @@ where
             return Ok(first);
         }
 
-        // Drop config-requested SIGKILL/SIGSYS before calibration: the input
-        // itself asked for the kill (near-zero RLIMIT_CPU, seccomp KILL), so it
-        // is not a crun bug and re-running just wastes the rerun budget. A
-        // signal-kill the config did NOT request falls through to calibration —
-        // it may be a genuine resource/DoS bug.
+        // config-requested kill: drop without wasting reruns
         if !self.is_real_crash(first) {
-            eprintln!(
-                "[signal-filter] crash DROPPED — config-requested kill (RLIMIT_CPU/seccomp), not a crun bug"
-            );
+            eprintln!("[signal-filter] crash DROPPED — config-requested kill, not a crun bug");
             return Ok(ExitKind::Ok);
         }
 
-        // Real fault crash; re-run to check reproducibility, counting only
-        // fault-signal crashes (a flaky input may SIGKILL on some runs and
-        // fault on others — only the faults count toward the threshold).
+        // re-run; only count fault-signal crashes (an input can flake between a
+        // real fault and a config kill across runs)
         let mut crashes = 1usize;
         for _ in 0..self.reruns {
             let ek = self.inner.run_target(fuzzer, state, mgr, input)?;
@@ -398,8 +351,7 @@ impl ToTargetBytes<CombinedInput> for CombinedConverter {
 
         let _ = std::fs::write(&self.config_path, &cfg);
 
-        // Written every iteration so if the forkserver dies mid-run this holds
-        // the exact input that was about to execute, not the pre-mutation base.
+        // keep current so a mid-run forkserver death leaves the exact input behind
         if let Ok(json) = serde_json::to_string_pretty(&input.rootfs) {
             let _ = std::fs::write(&self.last_input_path, json);
         }
@@ -413,9 +365,8 @@ fn override_rootfs_path(json: &[u8], fuse_rootfs: &str) -> Option<Vec<u8>> {
     let mut v: serde_json::Value = serde_json::from_slice(json).ok()?;
     let obj = v.as_object_mut()?;
 
-    // Without a mount namespace crun performs mounts in the fuzzer's own namespace.
-    // A symlink escape + grammar-generated mount can then shadow the FUSE mountpoint
-    // and kill the fuzzer process.
+    // force a mount namespace — without one crun mounts in our namespace, where a
+    // symlink+mount can shadow the FUSE mountpoint and take down the fuzzer
     {
         let linux = obj
             .entry("linux")
@@ -842,9 +793,7 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    // Read-only sync consumer: import peers' discoveries from --sync-dir but
-    // never export our own back. Used by the ASAN/UBSan instances so they vet
-    // the shared corpus of the base fleet without contributing to it.
+    // import from --sync-dir but never export (ASAN/UBSan read the base corpus)
     let no_export = args.iter().any(|a| a == "--no-export");
     let positional: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).collect();
     if positional.len() < 2 {
@@ -919,10 +868,8 @@ fn main() {
 
     let fallback_cfg = make_fallback_config(&mountpoint);
 
-    // `shmem` stays alive for the entire campaign; both the initial executor and any
-    // rebuilt executor use from_mut_ptr (raw pointer, no borrow), so `executor` can
-    // be reassigned on restart without changing the observer type. Historical
-    // coverage lives in MaxMapFeedback's virgin map on the heap and is unaffected.
+    // shmem must outlive every executor rebuild — observers map it by raw ptr, so
+    // the executor can be replaced on restart without disturbing the coverage map.
     let mut shmem_provider = UnixShMemProvider::new().unwrap();
     let mut shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();
     unsafe { shmem.write_to_env("__AFL_SHM_ID").unwrap() };
@@ -952,14 +899,9 @@ fn main() {
 
     let fuse_log_observer = FuseLogObserver::new();
 
-    // Corpus admission is edge-coverage only (MaxMapFeedback). TimeFeedback never
-    // admits — it has no is_interesting impl and falls through to the trait default
-    // (always false); it only attaches exec-time metadata. FsAccessFeedback was
-    // previously here, but it admits on any never-before-seen filesystem path — an
-    // unbounded, coverage-irrelevant dimension — which grew the corpus ~1100 entries
-    // per new edge after coverage saturated. It still drives mutation guidance via
-    // FuseLogObserver → update_live() → peek_live(), which is independent of corpus
-    // admission, so guidance is unaffected by removing it here.
+    // edge-coverage only. TimeFeedback just attaches timing, never admits.
+    // (FsAccessFeedback used to live here but bloated the corpus without buying
+    // edges; mutation guidance still comes from FuseLogObserver, not feedback.)
     let mut feedback = feedback_or!(
         MaxMapFeedback::new(&edges_observer),
         TimeFeedback::new(&time_observer),
@@ -1006,12 +948,8 @@ fn main() {
         .objective(objective)
         .build();
 
-    // Crash calibration: re-run each crashing input to filter non-reproducible
-    // ("flaky") crashes before they reach the objective corpus. Tunable per-run
-    // without rebuilding via env vars. Defaults reruns=4 + threshold=2 mean a
-    // crash is saved only if it reproduces in >=2 of 5 total runs — which drops
-    // essentially all one-off environmental signal-deaths while keeping any
-    // genuinely input-driven crash. Set CRASH_CAL_THRESHOLD=1 to disable gating.
+    // save a crash only if it reproduces >= threshold of (reruns+1) runs.
+    // CRASH_CAL_THRESHOLD=1 disables the gate.
     let crash_cal_reruns: usize = std::env::var("CRASH_CAL_RERUNS")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(4);
     let crash_cal_threshold: usize = std::env::var("CRASH_CAL_THRESHOLD")
@@ -1040,8 +978,7 @@ fn main() {
             .truncate(dynamic_map_size);
     }
 
-    // Wrap the raw forkserver in the calibration gate. All later uses
-    // (fuzz_one, add_input) drive it through the Executor trait.
+    // wrap the forkserver in the calibration gate
     let mut executor = CalibratedExecutor::new(executor, crash_cal_reruns, crash_cal_threshold, config_path.clone());
 
     let mut r_seeds = rootfs_seeds(BIN_TRUE);
@@ -1190,8 +1127,7 @@ fn main() {
                 kill_stray_crun_in_cwd();
                 thread::sleep(Duration::from_millis(500));
 
-                // SHM is owned by `shmem` on the stack, not the executor, so
-                // the buffer and __AFL_SHM_ID env var survive the drop.
+                // shmem outlives the executor, so the map + __AFL_SHM_ID survive this
                 drop(executor);
 
                 let new_time_observer = TimeObserver::new("time");
@@ -1217,7 +1153,6 @@ fn main() {
                         .truncate(dynamic_map_size);
                 }
 
-                // Re-wrap in the calibration gate (same settings as initial build).
                 executor = CalibratedExecutor::new(rebuilt, crash_cal_reruns, crash_cal_threshold, config_path.clone());
 
                 let ts = std::time::SystemTime::now()
@@ -1258,21 +1193,19 @@ fn main() {
                 if let Some(meta) = state.metadata_map_mut().get_mut::<NautilusChunksMetadata>() {
                     meta.cks.add_tree(input.config.tree.clone(), &context.ctx);
                 }
-                // Export to sync dir so peer instances can import this discovery
-                // — skipped for read-only consumers (--no-export: ASAN/UBSan).
+                // export for peers to import (skipped when --no-export)
                 if let Some(sd) = sync_dir.as_ref().filter(|_| !no_export) {
                     let fname = format!("i{instance_id}_{idx}.sync");
                     let path  = sd.join(&fname);
                     if let Ok(json) = serde_json::to_vec(&input) {
                         let _ = std::fs::write(&path, json);
                     }
-                    // Mark our own exports as seen so we never re-import them.
-                    seen_foreign.insert(fname);
+                    seen_foreign.insert(fname);  // don't re-import our own
                 }
             }
         }
 
-        // Every 256 iterations, scan the sync dir for entries from peer instances.
+        // every 256 iters, pull in peers' new entries
         sync_tick += 1;
         if sync_tick % 256 == 0 {
             if let Some(ref sd) = sync_dir {
@@ -1287,7 +1220,7 @@ fn main() {
                     .collect();
                 new_files.sort_by_key(|e| e.file_name());
 
-                // Cap at 32 per tick so a large backlog doesn't stall the loop.
+                // cap per tick so a backlog doesn't stall fuzzing
                 for entry in new_files.into_iter().take(32) {
                     let fname = entry.file_name().to_string_lossy().into_owned();
                     seen_foreign.insert(fname.clone());
@@ -1296,10 +1229,7 @@ fn main() {
                         eprintln!("[sync] failed to deserialize {fname}");
                         continue;
                     };
-                    // Run through executor + feedbacks: only add if it hits a new
-                    // edge in this instance's own virgin map (admission is now
-                    // edge-only). This is the same filter AFL++ applies when
-                    // syncing queues.
+                    // re-run locally; keep only if it hits a new edge here
                     match fuzzer.evaluate_input(&mut state, &mut executor, &mut mgr, &input) {
                         Ok((ExecuteInputResult::Corpus, Some(cid))) => {
                             let idx = usize::from(cid);

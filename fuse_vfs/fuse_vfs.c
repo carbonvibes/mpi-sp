@@ -14,15 +14,8 @@
 
 static vfs_t *g_vfs;
 
-/* ── Per-iteration FUSE access log ───────────────────────────────────────────
- * When g_target_running == 1, every FUSE callback appends an entry to g_log.
- * The fuzzer main thread reads and clears the log between iterations via the
- * exported fuse_log_* functions.  A mutex protects concurrent access because
- * FUSE callbacks run in a background thread.
- *
- * Deduplication: multiple WRITE calls to the same path collapse to one entry.
- * Capacity: 512 entries — more than enough for any single container run.
- */
+/* Per-iteration FUSE access log. Mutex-guarded: FUSE callbacks run on a
+ * background thread, main thread drains via fuse_log_* between iterations. */
 
 #define FUSE_LOG_CREATE      0
 #define FUSE_LOG_WRITE       1
@@ -56,7 +49,7 @@ static void log_event(const char *path, uint8_t kind)
     if (!g_target_running) return;
     pthread_mutex_lock(&g_log_mu);
     if (g_log.n < FUSE_LOG_MAX_ENTRIES) {
-        /* Deduplicate consecutive WRITEs to the same path. */
+        /* dedup WRITEs to same path */
         if (kind == FUSE_LOG_WRITE) {
             for (int i = 0; i < g_log.n; i++) {
                 if (g_log.entries[i].kind == FUSE_LOG_WRITE &&
@@ -134,8 +127,7 @@ static int readdir_bridge(void *ctx, const char *name, const vfs_stat_t *vs)
     readdir_ctx_t *rc = ctx;
     struct stat st;
     vfs_stat_to_stat(vs, &st);
-    /* filler returns 1 when the buffer is full; ignored because directories
-     * are small and we use the non-offset readdir mode. */
+    /* full-buffer return ignored: small dirs, non-offset readdir mode */
     rc->filler(rc->buf, name, &st, 0, 0);
     return 0;
 }
@@ -152,9 +144,8 @@ static int fvfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 static void *fvfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 {
     (void)conn;
-    /* Zero all cache timeouts so every read/stat goes through FUSE.
-     * Without this the kernel page cache serves stale bytes after apply_delta
-     * mutates the VFS in-place — the target sees the same content every iteration. */
+    /* Zero cache timeouts: kernel would serve stale bytes after apply_delta
+     * mutates the VFS in place, so the target sees identical content each iter. */
     cfg->attr_timeout     = 0;
     cfg->entry_timeout    = 0;
     cfg->negative_timeout = 0;
@@ -167,7 +158,7 @@ static int fvfs_open(const char *path, struct fuse_file_info *fi)
     int r = vfs_getattr(g_vfs, path, &vs);
     if (r != 0) return r;
     if (vs.kind == VFS_DIR) return -EISDIR;
-    fi->direct_io = 1;  /* bypass page cache so each fread() hits fvfs_read() fresh */
+    fi->direct_io = 1;  /* bypass page cache so each read hits fvfs_read fresh */
     return 0;
 }
 
@@ -204,13 +195,11 @@ static int fvfs_write(const char *path, const char *buf, size_t size,
     uint8_t *tmp = calloc(1, newlen > 0 ? newlen : 1);
     if (!tmp) return -ENOMEM;
 
-    /* Preserve existing bytes. */
     if (vs.size > 0) {
         size_t got;
         vfs_read(g_vfs, path, 0, vs.size, tmp, &got);
     }
 
-    /* Overlay the new bytes at offset. */
     memcpy(tmp + off, buf, size);
 
     r = vfs_update_file(g_vfs, path, tmp, newlen);
@@ -279,8 +268,7 @@ static int fvfs_rename(const char *oldpath, const char *newpath,
     return r;
 }
 
-/* FUSE argument order is (target, linkpath) — opposite of the intuitive order.
- * vfs_symlink takes (vfs, linkpath, target). */
+/* FUSE order is (target, linkpath); vfs_symlink wants (vfs, linkpath, target) */
 static int fvfs_symlink(const char *target, const char *linkpath)
 {
     int r = vfs_symlink(g_vfs, linkpath, target);
