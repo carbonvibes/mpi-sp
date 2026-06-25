@@ -1,12 +1,27 @@
 # SemSan config for the crun campaign — monitors every `crun` process
-# system-wide (so it covers all 6 fuzzer instances) and flags symlink-mount
-# escapes: when crun mounts through a symlink (the container-escape class our
-# rootfs symlink mutators target). These are semantic bugs that never crash, so
-# the coverage/crash fuzzer is blind to them — SemSan is the oracle.
+# system-wide (so it covers all 8 fuzzer instances) and flags semantic bugs
+# that never crash, so the coverage/crash fuzzer is blind to them. SemSan is
+# the oracle. Events print to stdout; the launch script redirects to
+# /tmp/semsan.log.
 #
-# Matches the SemSan authors' tested crun config
-# (SemanticSanitizer/nix/packages/by-name/artifact-eval/crun-campaign/fuzz-config.yaml).
+# Schema: SemanticSanitizer/internal/config/config.go (SanitizerConfig).
+# Only keys that exist there are valid; example-specs/*.yaml are bootstrap
+# codegen specs, NOT runtime --config files. Enabled sanitizers below are the
+# ones applicable to a container runtime (symlinkMount + dirOwnership family);
+# canary/syscalls/dangerousLibc need target-specific args we don't have here.
 # Run as root alongside the campaign:
 #   sudo SemanticSanitizer/semsan-cli attach --config semsan_crun.yaml
+
+# task comm to match (<=15 bytes); targets the crun runtime
 comm: 'crun'
+
+# symlink-mount escape: crun mounts through a symlink out of the rootfs.
+# crun's real escape-bug class — the one signal we want clean.
 symlinkMount: true
+
+# dirOwnership{,OpenNoFollow} disabled: in this harness they were 100% noise.
+# crun's routine cgroup-file chowns (cgroup.procs/threads/subtree_control/...)
+# plus our own per-iteration `rmdir rootfs` flooded the log — ~10k events, 0 real.
+# Re-enable only with a post-filter that drops /sys/fs/cgroup + the rootfs path.
+# dirOwnership: true
+# dirOwnershipOpenNoFollow: true

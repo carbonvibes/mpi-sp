@@ -1,0 +1,1 @@
+{"config":{"tree":{"rules":[{"Rule":0},{"Rule":592},{"Rule":50}],"sizes":[3,2,1],"paren":[0,0,1]}},"rootfs":{"ops":[{"kind":"Truncate","path":"/bin/true","content":[],"size":16,"target":"","mtime_sec":0,"mtime_nsec":0,"atime_sec":0,"atime_nsec":0}]}}

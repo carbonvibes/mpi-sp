@@ -1,0 +1,3 @@
+Attaching symlinkmount...
+All sanitizers are running
+[crun:933091] Symlink mount detected: proc -> proc

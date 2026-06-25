@@ -1,0 +1,1 @@
+{"config":{"tree":{"rules":[{"Rule":0},{"Rule":591},{"Rule":51},{"Rule":65}],"sizes":[4,3,1,1],"paren":[0,0,1,1]}},"rootfs":{"ops":[{"kind":"UpdateFile","path":"/etc/passwd","content":[46,46,47,46,46,47,46,46,47,101,116,99,47,112,97,115,115,119,100],"size":19,"target":"","mtime_sec":0,"mtime_nsec":0,"atime_sec":0,"atime_nsec":0}]}}

@@ -5,7 +5,7 @@
 
 set -u
 
-ASAN=/nix/store/4w5j3vmpd4rl71c0vxzkl5mwq4mqjnz7-crun-harness-asan-1.23.1/bin/crun
+ASAN=/nix/store/vif1fpiq9ckx0kw5qrdgab6bl1xdj5yd-crun-harness-asan-1.23.1/bin/crun
 REPLAY=/home/arjun/mpi-sp/mutator/target/release/replay_crash
 # must match the campaign's grammar, or the saved tree re-renders wrong
 GRAMMAR=/home/arjun/mpi-sp/SemanticSanitizer/case-studies/oci/grammar.py

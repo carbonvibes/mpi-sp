@@ -331,6 +331,7 @@ struct CombinedConverter {
     vfs:             *mut VfsT,
     config_path:     PathBuf,
     fuse_rootfs:     String,
+    strip_mem:       bool,
     fallback_cfg:    Vec<u8>,
     last_input_path: PathBuf,
 }
@@ -346,7 +347,7 @@ impl ToTargetBytes<CombinedInput> for CombinedConverter {
         let mut bytes_conv = NautilusBytesConverter::new(self.context);
         let raw = bytes_conv.to_target_bytes(&input.config);
 
-        let cfg = override_rootfs_path(&*raw, &self.fuse_rootfs)
+        let cfg = override_rootfs_path(&*raw, &self.fuse_rootfs, self.strip_mem)
             .unwrap_or_else(|| self.fallback_cfg.clone());
 
         let _ = std::fs::write(&self.config_path, &cfg);
@@ -361,7 +362,7 @@ impl ToTargetBytes<CombinedInput> for CombinedConverter {
 }
 
 /// Force "root.path" to the FUSE mountpoint. Returns None only if the JSON is completely unparseable.
-fn override_rootfs_path(json: &[u8], fuse_rootfs: &str) -> Option<Vec<u8>> {
+fn override_rootfs_path(json: &[u8], fuse_rootfs: &str, strip_mem: bool) -> Option<Vec<u8>> {
     let mut v: serde_json::Value = serde_json::from_slice(json).ok()?;
     let obj = v.as_object_mut()?;
 
@@ -396,6 +397,27 @@ fn override_rootfs_path(json: &[u8], fuse_rootfs: &str) -> Option<Vec<u8>> {
             serde_json::Value::String(fuse_rootfs.to_string()),
         );
     }
+
+    // A tiny RLIMIT_AS/DATA or cgroup memory cap starves ASAN's huge shadow
+    // allocation, so the sanitizer fakes an OOM "crash". Drop only the memory
+    // knobs — RLIMIT_CPU/FSIZE etc. stay so config_requested_kill still works.
+    if strip_mem {
+        const MEM_RLIMITS: [&str; 5] =
+            ["RLIMIT_AS", "RLIMIT_DATA", "RLIMIT_RSS", "RLIMIT_MEMLOCK", "RLIMIT_STACK"];
+        if let Some(rls) = v.pointer_mut("/process/rlimits").and_then(|r| r.as_array_mut()) {
+            rls.retain(|rl| {
+                rl.get("type").and_then(|t| t.as_str())
+                    .map_or(true, |t| !MEM_RLIMITS.contains(&t))
+            });
+        }
+        if let Some(res) = v.pointer_mut("/linux/resources").and_then(|r| r.as_object_mut()) {
+            res.remove("memory");
+        }
+        if let Some(unified) = v.pointer_mut("/linux/resources/unified").and_then(|u| u.as_object_mut()) {
+            unified.retain(|k, _| !k.starts_with("memory."));
+        }
+    }
+
     serde_json::to_vec(&v).ok()
 }
 
@@ -795,6 +817,8 @@ fn main() {
         .unwrap_or(0);
     // import from --sync-dir but never export (ASAN/UBSan read the base corpus)
     let no_export = args.iter().any(|a| a == "--no-export");
+    // strip cgroup memory.limit + memory rlimits so ASAN/UBSan don't OOM their shadow alloc
+    let strip_mem_limits = args.iter().any(|a| a == "--strip-mem-limits");
     let positional: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).collect();
     if positional.len() < 2 {
         eprintln!("Usage: {} <crun-afl-binary> <grammar.py> [--resume] [--sync-dir <path>] [--instance <N>]", args[0]);
@@ -803,6 +827,7 @@ fn main() {
         eprintln!("  --sync-dir <path>   shared dir for cross-instance corpus exchange");
         eprintln!("  --instance <N>      instance ID (0–N) used to name sync exports");
         eprintln!("  --no-export         import from --sync-dir but never export (read-only consumer)");
+        eprintln!("  --strip-mem-limits  strip cgroup memory.limit + memory rlimits so ASAN/UBSan don't OOM");
         std::process::exit(1);
     }
     let crun_binary  = positional[0];
@@ -816,6 +841,9 @@ fn main() {
     if let Some(ref sd) = sync_dir {
         println!("  sync-dir : {} ({})", sd.display(),
                  if no_export { "read-only: import, no export" } else { "read+write" });
+    }
+    if strip_mem_limits {
+        println!("  strip-mem: on (memory rlimits + cgroup memory limits removed)");
     }
 
     let cwd = std::env::current_dir()
@@ -936,6 +964,7 @@ fn main() {
         vfs,
         config_path:     config_path.clone(),
         fuse_rootfs:     mountpoint.clone(),
+        strip_mem:       strip_mem_limits,
         fallback_cfg:    fallback_cfg.clone(),
         last_input_path: last_input_path.clone(),
     };

@@ -6,10 +6,12 @@
 #   inst 7    : UBSan   — own corpus, READS the shared corpus, never exports
 #   + SemSan  : one eBPF monitor watching every `crun` system-wide (all 8)
 # ASAN/UBSan read the base corpus but --no-export, so they never pollute it.
+# They also get --strip-mem-limits: drops cgroup memory.limit + rlimits so the
+# sanitizer runtimes don't OOM. Base instances keep limits for cgroup-path cov.
 
-CRUN_BASE=/nix/store/nm1sr5r2gzckh90y68avwa6fzp8hq83i-crun-harness-1.23.1/bin/crun        # no sanitizer
-CRUN_ASAN=/nix/store/4w5j3vmpd4rl71c0vxzkl5mwq4mqjnz7-crun-harness-asan-1.23.1/bin/crun    # ASAN, no false positives
-CRUN_UBSAN=/nix/store/hfqz6i88ll99j6ymab1jcj70hz0pzm64-crun-harness-ubsan-1.23.1/bin/crun  # nix build .#artifact-eval.crun-harness-ubsan
+CRUN_BASE=/nix/store/mw0ahwgdmayvml2ch0hsi0j6kf5x49as-crun-harness-1.23.1/bin/crun        # no sanitizer
+CRUN_ASAN=/nix/store/vif1fpiq9ckx0kw5qrdgab6bl1xdj5yd-crun-harness-asan-1.23.1/bin/crun    # ASAN, no false positives
+CRUN_UBSAN=/nix/store/1p3qp63k86rbg3ifihiavp6c3q4ds9vm-crun-harness-ubsan-1.23.1/bin/crun  # nix build .#artifact-eval.crun-harness-ubsan
 
 FUZZ_BIN=/home/arjun/mpi-sp/mutator/target/release/fuzz_combined_afl
 GRAMMAR=/home/arjun/mpi-sp/SemanticSanitizer/case-studies/oci/grammar.py
@@ -147,8 +149,8 @@ for i in "${!CAMPAIGN_DIRS[@]}"; do
     pre=""          # optional env prefix
     extra=""        # extra fuzzer args
     case $i in
-        6) bin="$CRUN_ASAN";  arm="ASAN";  extra="--no-export" ;;
-        7) bin="$CRUN_UBSAN"; arm="UBSan"; extra="--no-export"; pre="env UBSAN_OPTIONS=$UBSAN_OPTS" ;;
+        6) bin="$CRUN_ASAN";  arm="ASAN";  extra="--no-export --strip-mem-limits" ;;
+        7) bin="$CRUN_UBSAN"; arm="UBSan"; extra="--no-export --strip-mem-limits"; pre="env UBSAN_OPTIONS=$UBSAN_OPTS" ;;
         *) bin="$CRUN_BASE";  arm="base" ;;
     esac
 

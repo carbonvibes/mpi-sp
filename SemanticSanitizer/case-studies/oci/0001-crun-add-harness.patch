@@ -1,15 +1,15 @@
-From cc27eaacfe7ab1b4939afbc53a0b41a6e3abbf42 Mon Sep 17 00:00:00 2001
+From eca0b2d14ac9fc099f15e5f719ca38b9bbddb734 Mon Sep 17 00:00:00 2001
 From: Moritz Sanft <58110325+msanft@users.noreply.github.com>
 Date: Mon, 28 Jul 2025 23:40:56 +0200
 Subject: [PATCH] crun: add harness
 
 Signed-off-by: Moritz Sanft <58110325+msanft@users.noreply.github.com>
 ---
- src/crun.c | 215 +++++++++++++++++++++++++++++++++++++++++++++++---------
- 1 file changed, 190 insertions(+), 25 deletions(-)
+ src/crun.c | 263 ++++++++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 239 insertions(+), 24 deletions(-)
 
 diff --git a/src/crun.c b/src/crun.c
-index 3825577f..6bbca4c1 100644
+index 3825577..08bbadd 100644
 --- a/src/crun.c
 +++ b/src/crun.c
 @@ -24,12 +24,21 @@
@@ -42,7 +42,7 @@ index 3825577f..6bbca4c1 100644
  static struct crun_global_arguments arguments;
  
  static struct custom_handler_manager_s *handler_manager;
-@@ -436,40 +446,187 @@ copy_args (char **argv, int argc)
+@@ -436,40 +446,245 @@ copy_args (char **argv, int argc)
    return buff;
  }
  
@@ -117,9 +117,7 @@ index 3825577f..6bbca4c1 100644
 -#ifdef DYNLOAD_LIBCRUN
 -  if (ensure_cloned_binary () < 0)
 +  if (S_ISDIR (st.st_mode))
-     {
--      fprintf (stderr, "Failed to re-execute libcrun via memory file descriptor\n");
--      _exit (EXIT_FAILURE);
++    {
 +      DIR *dir = opendir (path);
 +      if (! dir)
 +        return -1;
@@ -138,15 +136,27 @@ index 3825577f..6bbca4c1 100644
 +        }
 +      closedir (dir);
 +      return rmdir (path);
++    }
++  else
+     {
+-      fprintf (stderr, "Failed to re-execute libcrun via memory file descriptor\n");
+-      _exit (EXIT_FAILURE);
++      return unlink (path);
      }
 -  /* Resolve all libcrun weak dependencies.  */
 -  if (dlopen ("libcrun.so", RTLD_GLOBAL | RTLD_DEEPBIND | RTLD_LAZY) == NULL)
 -    error (EXIT_FAILURE, 0, "could not load `libcrun.so`: `%s`", dlerror ());
--#endif
-+  else
-+    {
-+      return unlink (path);
-+    }
++}
++
++// force-remove a container's state dir (/run/crun/<id>).  crun's own delete
++// normally does this, but a config that fails create after the dir is written
++// leaves it behind, and /run is tmpfs — leaked state dirs eat RAM until /run fills.
++static void
++cleanup_state_dir (const char *container_id)
++{
++  char path[PATH_MAX];
++  snprintf (path, sizeof (path), "/run/crun/%s", container_id);
++  rmdir_rec (path);
 +}
 +
 +#ifdef ENABLE_ASAN
@@ -169,8 +179,10 @@ index 3825577f..6bbca4c1 100644
 +{
 +  mkdir ("/tmp/asan_reports", 0755);
 +}
-+#endif
-+
+ #endif
+ 
+-  fill_handler_from_argv0 (argv[0], &arguments);
+-  argp_parse (&argp, argc, argv, ARGP_IN_ORDER, &first_argument, &arguments);
 +int
 +main (int argc, char **argv)
 +{
@@ -178,7 +190,10 @@ index 3825577f..6bbca4c1 100644
 +    return 1;
 +
 +  srand (time (NULL));
-+
+ 
+-  command = get_command (argv[first_argument]);
+-  if (command == NULL)
+-    libcrun_fail_with_error (0, "unknown command %s", argv[first_argument]);
 +  while (__AFL_LOOP (1))
 +    {
 +      rmdir_rec ("rootfs");
@@ -195,21 +210,19 @@ index 3825577f..6bbca4c1 100644
 +
 +      arguments.argc = argc;
 +      arguments.argv = argv;
- 
--  fill_handler_from_argv0 (argv[0], &arguments);
--  argp_parse (&argp, argc, argv, ARGP_IN_ORDER, &first_argument, &arguments);
++
 +      fill_handler_from_argv0 (argv[0], &arguments);
 +      argp_parse (&argp, argc, argv, ARGP_IN_ORDER, &first_argument, &arguments);
- 
--  command = get_command (argv[first_argument]);
--  if (command == NULL)
--    libcrun_fail_with_error (0, "unknown command %s", argv[first_argument]);
-+      crun_context.preserve_fds = 0;
-+      crun_context.listen_fds = 0;
  
 -  int command_argc = argc - first_argument;
 -  cleanup_free char **command_argv = copy_args (argv + first_argument, command_argc);
 -  command_argv[0] = argv[0];
++      crun_context.preserve_fds = 0;
++      crun_context.listen_fds = 0;
+ 
+-  ret = command->handler (&arguments, command_argc, command_argv, &err);
+-  if (ret && err)
+-    libcrun_fail_with_error (err->status, "%s", err->msg);
 +      char container_id[20];
 +      rand_str (container_id, sizeof (container_id) - 1);
 +
@@ -221,9 +234,7 @@ index 3825577f..6bbca4c1 100644
 +          continue;
 +        }
  
--  ret = command->handler (&arguments, command_argc, command_argv, &err);
--  if (ret && err)
--    libcrun_fail_with_error (err->status, "%s", err->msg);
+-  return ret;
 +      container = libcrun_container_load_from_file (argv[1], &err);
 +      if (container == NULL)
 +        {
@@ -231,7 +242,7 @@ index 3825577f..6bbca4c1 100644
 +          rmdir_rec ("rootfs");
 +          continue;
 +        }
-
++
 +      /* Clamp memory limit to 128 MiB minimum.  The grammar generates limits via
 +         [0-9]+ which produces values like 1 or 100 bytes; crun joins the container
 +         cgroup before exec so a tiny limit OOM-kills crun itself, crashing the
@@ -244,10 +255,56 @@ index 3825577f..6bbca4c1 100644
 +          && container->container_def->linux->resources->memory->limit < 128L * 1024 * 1024)
 +        container->container_def->linux->resources->memory->limit = 128L * 1024 * 1024;
 +
--  return ret;
-+      ret = libcrun_container_run (&crun_context, container, 0, &err);
-+      cleanup_cgroup (container_id);
++      /* Exercise a full container lifecycle instead of a single run: create
++         (detached) -> state -> kill -> delete.  This hits crun's create/state/
++         kill/delete code paths (setup, status lookup, teardown).  The container
++         payload is a static exit(0) blob, so the init exits immediately; that is
++         fine — the lifecycle still runs its full setup/lookup/teardown logic and
++         the error paths (e.g. kill on an already-exited container) are valuable
++         coverage too.  On any libcrun error we release the error, jump to the
++         cleanup backstops, and continue — never return/abort, which would tear
++         down the persistent AFL forkserver.  exec/update are deliberately
++         deferred (they need extra parsed inputs).
++
++         Mirrors the real command handlers:
++           - create: src/create.c -> libcrun_container_create (context, container,
++             options=0, err).  libcrun_container_create forces context->detach=1
++             internally; we set it explicitly to match `create`/`run -d` intent.
++           - state:  src/state.c  -> libcrun_container_state (context, id, stdout, err).
++           - kill:   src/kill.c   -> libcrun_container_kill (context, id, signal, err)
++             with signal as a string (str2sig).
++           - delete: src/delete.c -> libcrun_container_delete (context, def=NULL,
++             id, force, err); def=NULL makes delete read the config from the state
++             dir, and force=true tears down even a still-"running" container. */
++      crun_context.detach = true;
++
++      ret = libcrun_container_create (&crun_context, container, 0, &err);
++      if (UNLIKELY (ret < 0))
++        {
++          libcrun_error_release (&err);
++          goto cleanup;
++        }
++
++      ret = libcrun_container_state (&crun_context, container_id, stdout, &err);
++      if (UNLIKELY (ret < 0))
++        {
++          libcrun_error_release (&err);
++          goto cleanup;
++        }
++
++      ret = libcrun_container_kill (&crun_context, container_id, "SIGKILL", &err);
++      if (UNLIKELY (ret < 0))
++        libcrun_error_release (&err);
++
++    cleanup:
++      /* Always force-delete: proper teardown (hooks, cgroup, state dir) on the
++         happy path, a harmless no-op error when there's nothing to delete.  Then
++         hard backstops so a failed or partial delete can't leak — /run is tmpfs,
++         and a leaked /run/crun/<id> eats RAM until /run fills (we hit ~955k once). */
++      libcrun_container_delete (&crun_context, NULL, container_id, true, &err);
 +      libcrun_error_release (&err);
++      cleanup_state_dir (container_id);
++      cleanup_cgroup (container_id);
 +      rmdir_rec ("rootfs");
 +      libcrun_container_free (container);
 +      container = NULL;
@@ -256,5 +313,5 @@ index 3825577f..6bbca4c1 100644
 +  return 0;
  }
 -- 
-2.50.1
+2.43.0
 
